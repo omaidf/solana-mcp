@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime
+import math
 from typing import Dict, List, Any, Optional
 import logging
 
@@ -15,6 +16,355 @@ logger = get_logger(__name__)
 # Constants
 RAYDIUM_PROGRAM_ID = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 ORCA_PROGRAM_ID = "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP"
+RAYDIUM_LP_PROGRAM_ID = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+ORCA_SWAP_PROGRAM_ID = "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP"
+
+
+class LiquidityAnalyzer:
+    """Analyzer for liquidity pools on Solana, focusing on Raydium and Orca."""
+
+    def __init__(self, solana_client: SolanaClient):
+        """Initialize with a Solana client.
+        
+        Args:
+            solana_client: The Solana client
+        """
+        self.client = solana_client
+        self.logger = get_logger(__name__)
+        self.pool_analyzer = LiquidityPoolAnalyzer(solana_client)
+
+    @validate_solana_key
+    @handle_errors
+    async def analyze_pool(self, pool_address: str, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Analyze a specific liquidity pool.
+        
+        Args:
+            pool_address: The pool account address
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Pool analysis data
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Pool analysis requested for: {pool_address}",
+            request_id=request_id,
+            pool_address=pool_address
+        )
+        
+        # Get pool reserves first
+        reserves = await self.pool_analyzer.get_token_pair_reserves(pool_address, request_id=request_id)
+        
+        # Get account data to determine pool type
+        account_info = await self.client.get_account_info(pool_address)
+        owner = account_info.get("result", {}).get("owner", "Unknown")
+        
+        # Determine pool type
+        pool_type = "Unknown"
+        if owner == RAYDIUM_PROGRAM_ID:
+            pool_type = "Raydium"
+        elif owner == ORCA_PROGRAM_ID:
+            pool_type = "Orca"
+            
+        # Build analysis response
+        result = {
+            "pool_address": pool_address,
+            "pool_type": pool_type,
+            "token_a": reserves.get("token_a"),
+            "token_b": reserves.get("token_b"),
+            "reserves_a": reserves.get("reserves_a", 0),
+            "reserves_b": reserves.get("reserves_b", 0),
+            "liquidity_usd": 0,  # Would calculate based on token prices
+            "apr_estimate": 0,   # Would calculate based on fees and volume
+            "volume_24h": 0,     # Would get from external sources or events
+            "fees_24h": 0,       # Would calculate based on volume and fee rate
+            "last_updated": datetime.datetime.now().isoformat()
+        }
+        
+        # If one of the tokens is a stablecoin, use that for USD valuation
+        if (reserves.get("token_a") and reserves.get("token_a", {}).get("symbol") in ["USDC", "USDT", "DAI"]):
+            result["liquidity_usd"] = float(reserves.get("reserves_a", 0)) * 2  # Approximate
+        elif (reserves.get("token_b") and reserves.get("token_b", {}).get("symbol") in ["USDC", "USDT", "DAI"]):
+            result["liquidity_usd"] = float(reserves.get("reserves_b", 0)) * 2  # Approximate
+            
+        log_with_context(
+            logger,
+            "info",
+            f"Pool analysis completed for: {pool_address}",
+            request_id=request_id,
+            pool_address=pool_address,
+            pool_type=pool_type
+        )
+        
+        return result
+        
+    @validate_solana_key
+    @handle_errors
+    async def get_user_positions(self, wallet_address: str, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get liquidity positions for a user.
+        
+        Args:
+            wallet_address: The user's wallet address
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            User's liquidity positions
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"User liquidity positions requested for: {wallet_address}",
+            request_id=request_id,
+            wallet_address=wallet_address
+        )
+        
+        result = {
+            "wallet_address": wallet_address,
+            "position_count": 0,
+            "total_value_usd": 0,
+            "positions": [],
+            "last_updated": datetime.datetime.now().isoformat()
+        }
+        
+        try:
+            # For demonstration purposes, using placeholder data
+            # In a real implementation, would search for LP tokens owned by this wallet
+            
+            # Example placeholder position
+            position = {
+                "pool_address": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
+                "pool_type": "Raydium",
+                "token_a": {
+                    "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                    "symbol": "USDC",
+                    "name": "USD Coin"
+                },
+                "token_b": {
+                    "mint": "So11111111111111111111111111111111111111112",
+                    "symbol": "SOL",
+                    "name": "Wrapped SOL"
+                },
+                "share_percentage": 0.01,  # User's share of the pool
+                "value_usd": 250.0,        # Estimated USD value of position
+                "token_a_amount": 125.0,   # User's share of token A
+                "token_b_amount": 1.0      # User's share of token B
+            }
+            
+            # Add the placeholder position (would be actual positions in real implementation)
+            result["positions"].append(position)
+            result["position_count"] = len(result["positions"])
+            result["total_value_usd"] = sum(p.get("value_usd", 0) for p in result["positions"])
+            
+        except Exception as e:
+            logger.error(f"Error getting user positions for {wallet_address}: {str(e)}")
+            result["error"] = str(e)
+            
+        log_with_context(
+            logger,
+            "info",
+            f"User positions completed for: {wallet_address}",
+            request_id=request_id,
+            wallet_address=wallet_address,
+            position_count=result.get("position_count", 0)
+        )
+        
+        return result
+    
+    @handle_errors
+    async def get_top_pools(self, limit: int = 10, protocol: Optional[str] = None, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get top liquidity pools by TVL.
+        
+        Args:
+            limit: Maximum number of pools to return
+            protocol: Optional filter by protocol
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Top liquidity pools
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Top pools requested (limit: {limit}, protocol: {protocol or 'all'})",
+            request_id=request_id,
+            limit=limit,
+            protocol=protocol
+        )
+        
+        result = {
+            "pools": [],
+            "total_count": 0,
+            "protocol": protocol or "all",
+            "last_updated": datetime.datetime.now().isoformat()
+        }
+        
+        try:
+            # For demonstration purposes, using placeholder data
+            # In a real implementation, would fetch actual top pools from indexer or blockchain
+            
+            # Example placeholder pools
+            pools = [
+                {
+                    "pool_address": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
+                    "pool_type": "Raydium",
+                    "token_a": {
+                        "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                        "symbol": "USDC",
+                        "name": "USD Coin"
+                    },
+                    "token_b": {
+                        "mint": "So11111111111111111111111111111111111111112",
+                        "symbol": "SOL",
+                        "name": "Wrapped SOL"
+                    },
+                    "liquidity_usd": 25000000,
+                    "volume_24h": 5000000,
+                    "apy": 12.5
+                },
+                {
+                    "pool_address": "4RyJecykr9ivpjPvj1pRiLwz1MkVk7mK87q5vs4Zd7Qy",
+                    "pool_type": "Orca",
+                    "token_a": {
+                        "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                        "symbol": "USDC",
+                        "name": "USD Coin"
+                    },
+                    "token_b": {
+                        "mint": "9n4nbM75f5Ui33ZbPYXn59EwSgE8CGsHtAeTH5YFeJ9E",
+                        "symbol": "BTC",
+                        "name": "Wrapped Bitcoin"
+                    },
+                    "liquidity_usd": 18000000,
+                    "volume_24h": 3200000,
+                    "apy": 9.2
+                },
+                {
+                    "pool_address": "2q8KVKr7map9xc8UM9yJC3X8dVPJZ4R57THWXnvJ5jd4",
+                    "pool_type": "Raydium",
+                    "token_a": {
+                        "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                        "symbol": "USDC",
+                        "name": "USD Coin"
+                    },
+                    "token_b": {
+                        "mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+                        "symbol": "USDT",
+                        "name": "USDT"
+                    },
+                    "liquidity_usd": 15000000,
+                    "volume_24h": 8000000,
+                    "apy": 7.8
+                }
+            ]
+            
+            # Filter by protocol if specified
+            if protocol:
+                filtered_pools = [pool for pool in pools if pool["pool_type"].lower() == protocol.lower()]
+            else:
+                filtered_pools = pools
+                
+            # Sort by liquidity (descending) and limit
+            sorted_pools = sorted(filtered_pools, key=lambda x: x["liquidity_usd"], reverse=True)[:limit]
+            
+            result["pools"] = sorted_pools
+            result["total_count"] = len(filtered_pools)
+            
+        except Exception as e:
+            logger.error(f"Error getting top pools: {str(e)}")
+            result["error"] = str(e)
+            
+        log_with_context(
+            logger,
+            "info",
+            f"Top pools fetched (count: {len(result.get('pools', []))})",
+            request_id=request_id,
+            pool_count=len(result.get("pools", []))
+        )
+        
+        return result
+    
+    @handle_errors
+    async def calculate_impermanent_loss(
+        self, 
+        token_a_price_change: float, 
+        token_b_price_change: float, 
+        request_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Calculate impermanent loss for given price changes.
+        
+        Args:
+            token_a_price_change: Price change ratio for token A (1.0 = no change)
+            token_b_price_change: Price change ratio for token B (1.0 = no change)
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Impermanent loss calculation
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Impermanent loss calculation requested",
+            request_id=request_id,
+            token_a_price_change=token_a_price_change,
+            token_b_price_change=token_b_price_change
+        )
+        
+        result = {
+            "token_a_price_change": token_a_price_change,
+            "token_b_price_change": token_b_price_change,
+            "price_ratio_change": token_b_price_change / token_a_price_change,
+            "percentage_loss": 0.0,
+            "dollar_value_example": {
+                "initial_investment": 1000.0,
+                "hodl_value": 0.0,
+                "lp_value": 0.0,
+                "difference": 0.0
+            },
+            "last_updated": datetime.datetime.now().isoformat()
+        }
+        
+        try:
+            # Calculate impermanent loss
+            # Formula: IL = 2 * sqrt(price_ratio) / (1 + price_ratio) - 1
+            
+            # Normalize token prices to get the price ratio change
+            price_ratio_change = token_b_price_change / token_a_price_change
+            
+            # Calculate impermanent loss percentage
+            il_factor = (2 * math.sqrt(price_ratio_change)) / (1 + price_ratio_change) - 1
+            percentage_loss = il_factor * 100
+            
+            result["percentage_loss"] = abs(percentage_loss)
+            
+            # Example with dollar values (assuming 50/50 pool with $1000 initial investment)
+            initial_investment = 1000.0
+            token_a_initial = initial_investment / 2
+            token_b_initial = initial_investment / 2
+            
+            # Value if holding tokens separately
+            hodl_value = (token_a_initial * token_a_price_change) + (token_b_initial * token_b_price_change)
+            
+            # Value in liquidity pool (accounting for IL)
+            lp_value = hodl_value * (1 + il_factor)
+            
+            result["dollar_value_example"]["hodl_value"] = hodl_value
+            result["dollar_value_example"]["lp_value"] = lp_value
+            result["dollar_value_example"]["difference"] = hodl_value - lp_value
+            
+        except Exception as e:
+            logger.error(f"Error calculating impermanent loss: {str(e)}")
+            result["error"] = str(e)
+            
+        log_with_context(
+            logger,
+            "info",
+            f"Impermanent loss calculated: {result.get('percentage_loss', 0):.2f}%",
+            request_id=request_id,
+            percentage_loss=result.get("percentage_loss", 0)
+        )
+        
+        return result
 
 
 class LiquidityPoolAnalyzer:

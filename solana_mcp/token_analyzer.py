@@ -3,6 +3,7 @@
 import datetime
 from typing import Dict, List, Any, Optional
 import logging
+from dataclasses import dataclass
 
 from solana_mcp.solana_client import SolanaClient, InvalidPublicKeyError, SolanaRpcError
 from solana_mcp.logging_config import get_logger, log_with_context
@@ -41,6 +42,406 @@ MEME_KEYWORDS = [
     "yolo", "fomo", "dump", "pump", "diamond", "hand", "hodl", "hold", "sell",
     "buy", "bro", "bruh", "dude", "guy", "girl", "man", "woman", "wen", "ser"
 ]
+
+@dataclass
+class TokenAnalysis:
+    """Data class for token analysis results."""
+    token_mint: str
+    token_name: str
+    token_symbol: str
+    decimals: int
+    total_supply: str
+    circulation_supply: str
+    current_price_usd: float
+    launch_date: Optional[datetime.datetime]
+    age_days: Optional[int]
+    owner_can_mint: bool
+    owner_can_freeze: bool
+    total_holders: int
+    largest_holder_percentage: float
+    last_updated: datetime.datetime
+
+
+class TokenAnalyzer:
+    """Analyzer for Solana tokens with comprehensive analysis capabilities."""
+
+    def __init__(self, solana_client: SolanaClient):
+        """Initialize with a Solana client.
+        
+        Args:
+            solana_client: The Solana client
+        """
+        self.client = solana_client
+        self.logger = get_logger(__name__)
+        self.meme_analyzer = MemeTokenAnalyzer(solana_client)
+
+    @validate_solana_key
+    @handle_errors
+    async def analyze_token(self, mint: str, request_id: Optional[str] = None) -> TokenAnalysis:
+        """Perform comprehensive analysis of a token.
+        
+        Args:
+            mint: The token mint address
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Complete token analysis
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Comprehensive token analysis requested for: {mint}",
+            request_id=request_id,
+            mint=mint
+        )
+        
+        # Get token metadata
+        metadata = await self.get_token_metadata(mint, request_id=request_id)
+        token_name = metadata.get("name", "Unknown")
+        token_symbol = metadata.get("symbol", "UNKNOWN")
+        
+        # Get token supply and decimals
+        supply_info = await self.get_token_supply_and_decimals(mint, request_id=request_id)
+        decimals = supply_info.get("value", {}).get("decimals", 0)
+        total_supply = supply_info.get("value", {}).get("uiAmountString", "0")
+        
+        # Get holders data
+        holders_data = await self.get_token_largest_holders(mint, request_id=request_id)
+        total_holders = holders_data.get("total_holders", 0)
+        largest_holder_percentage = holders_data.get("largest_holder_percentage", 0)
+        
+        # Get age data
+        age_data = await self.get_token_age(mint, request_id=request_id)
+        launch_date_str = age_data.get("launch_date")
+        launch_date = datetime.datetime.fromisoformat(launch_date_str) if launch_date_str else None
+        age_days = age_data.get("age_days")
+        
+        # Get authority data
+        auth_data = await self.get_token_mint_authority(mint, request_id=request_id)
+        owner_can_mint = auth_data.get("has_mint_authority", False)
+        owner_can_freeze = auth_data.get("has_freeze_authority", False)
+        
+        # Get price data
+        price_data = await self.get_token_price(mint, request_id=request_id)
+        current_price_usd = price_data.get("price_usd", 0.0)
+        
+        # Create analysis result
+        analysis = TokenAnalysis(
+            token_mint=mint,
+            token_name=token_name,
+            token_symbol=token_symbol,
+            decimals=decimals,
+            total_supply=total_supply,
+            circulation_supply=total_supply,  # Simplified, could be calculated based on locked tokens
+            current_price_usd=current_price_usd,
+            launch_date=launch_date,
+            age_days=age_days,
+            owner_can_mint=owner_can_mint,
+            owner_can_freeze=owner_can_freeze,
+            total_holders=total_holders,
+            largest_holder_percentage=largest_holder_percentage,
+            last_updated=datetime.datetime.now()
+        )
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Comprehensive token analysis completed for: {mint}",
+            request_id=request_id,
+            mint=mint,
+            token_name=token_name,
+            token_symbol=token_symbol
+        )
+        
+        return analysis
+
+    @validate_solana_key
+    @handle_errors
+    async def get_token_metadata(self, mint: str, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get token metadata.
+        
+        Args:
+            mint: The token mint address
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Token metadata
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Token metadata requested for: {mint}",
+            request_id=request_id,
+            mint=mint
+        )
+        
+        # Use the client to get token metadata
+        metadata = await self.client.get_token_metadata(mint)
+        
+        # Add meme token categorization
+        meme_metadata = await self.meme_analyzer.get_token_metadata_with_category(mint, request_id=request_id)
+        metadata["is_meme_token"] = meme_metadata.get("is_meme_token", False)
+        metadata["category"] = meme_metadata.get("category", "Other")
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Token metadata completed for: {mint}",
+            request_id=request_id,
+            mint=mint
+        )
+        
+        return metadata
+
+    @validate_solana_key
+    @handle_errors
+    async def get_token_supply_and_decimals(self, mint: str, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get token supply and decimals.
+        
+        Args:
+            mint: The token mint address
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Supply information including decimals
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Token supply requested for: {mint}",
+            request_id=request_id,
+            mint=mint
+        )
+        
+        supply_info = await self.client.get_token_supply(mint)
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Token supply completed for: {mint}",
+            request_id=request_id,
+            mint=mint,
+            supply=supply_info.get("value", {}).get("amount", "0") if "value" in supply_info else "N/A"
+        )
+        
+        return supply_info
+
+    @validate_solana_key
+    @handle_errors
+    async def get_token_price(self, mint: str, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get token price.
+        
+        Args:
+            mint: The token mint address
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Price information
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Token price requested for: {mint}",
+            request_id=request_id,
+            mint=mint
+        )
+        
+        # This would typically call an external API or DEX aggregator
+        # For now, return a placeholder
+        price_data = {
+            "price_usd": 0.0,
+            "price_sol": 0.0,
+            "liquidity_usd": 0.0,
+            "market_cap_usd": 0.0,
+            "volume_24h_usd": 0.0,
+            "change_24h_percent": 0.0,
+            "dex_info": [],
+            "last_updated": datetime.datetime.now().isoformat()
+        }
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Token price completed for: {mint} (placeholder data)",
+            request_id=request_id,
+            mint=mint
+        )
+        
+        return price_data
+
+    @validate_solana_key
+    @handle_errors
+    async def get_token_largest_holders(self, mint: str, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get token largest holders.
+        
+        Args:
+            mint: The token mint address
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Holder distribution information
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Token holders requested for: {mint}",
+            request_id=request_id,
+            mint=mint
+        )
+        
+        # Use the meme analyzer to get holder distribution
+        holder_data = await self.meme_analyzer.analyze_holder_distribution(mint, request_id=request_id)
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Token holders completed for: {mint}",
+            request_id=request_id,
+            mint=mint,
+            total_holders=holder_data.get("total_holders", 0)
+        )
+        
+        return holder_data
+
+    @validate_solana_key
+    @handle_errors
+    async def get_token_age(self, mint: str, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get token age information.
+        
+        Args:
+            mint: The token mint address
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Age information
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Token age requested for: {mint}",
+            request_id=request_id,
+            mint=mint
+        )
+        
+        # Use creation date function from meme analyzer
+        creation_data = await self.meme_analyzer.get_creation_date(mint, request_id=request_id)
+        
+        # Rename fields to match expected API response
+        age_data = {
+            "token_mint": creation_data.get("token_mint"),
+            "token_name": creation_data.get("token_name"),
+            "token_symbol": creation_data.get("token_symbol"),
+            "launch_date": creation_data.get("creation_date"),
+            "creation_signature": creation_data.get("creation_signature"),
+            "creation_block": creation_data.get("creation_block"),
+            "age_days": creation_data.get("age_days"),
+            "last_updated": creation_data.get("last_updated")
+        }
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Token age completed for: {mint}",
+            request_id=request_id,
+            mint=mint,
+            age_days=age_data.get("age_days", "N/A")
+        )
+        
+        return age_data
+
+    @validate_solana_key
+    @handle_errors
+    async def get_token_mint_authority(self, mint: str, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get token mint authority information.
+        
+        Args:
+            mint: The token mint address
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Authority information
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Token authority requested for: {mint}",
+            request_id=request_id,
+            mint=mint
+        )
+        
+        result = {
+            "token_mint": mint,
+            "has_mint_authority": False,
+            "mint_authority": None,
+            "has_freeze_authority": False,
+            "freeze_authority": None,
+            "is_mutable": False,
+            "last_updated": datetime.datetime.now().isoformat()
+        }
+        
+        try:
+            # Get token account info
+            account_info = await self.client.get_account_info(mint)
+            
+            # Check if account exists
+            if account_info and "result" in account_info and account_info["result"]:
+                # Process mint account data
+                # Note: This is simplified; in a real implementation, you'd parse the SPL token account data
+                # to extract mint authority, freeze authority, etc.
+                result["is_mutable"] = True
+                result["has_mint_authority"] = True
+                result["has_freeze_authority"] = True
+                
+        except Exception as e:
+            logger.error(f"Error getting token authority for {mint}: {str(e)}")
+            result["error"] = str(e)
+            
+        log_with_context(
+            logger,
+            "info",
+            f"Token authority completed for: {mint}",
+            request_id=request_id,
+            mint=mint,
+            has_mint_authority=result.get("has_mint_authority", False),
+            has_freeze_authority=result.get("has_freeze_authority", False)
+        )
+        
+        return result
+
+    @validate_solana_key
+    @handle_errors
+    async def get_token_holders_count(self, mint: str, request_id: Optional[str] = None) -> int:
+        """Get count of token holders.
+        
+        Args:
+            mint: The token mint address
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Number of token holders
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Token holders count requested for: {mint}",
+            request_id=request_id,
+            mint=mint
+        )
+        
+        # Get holder distribution data
+        holder_data = await self.get_token_largest_holders(mint, request_id=request_id)
+        count = holder_data.get("total_holders", 0)
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Token holders count completed for: {mint}",
+            request_id=request_id,
+            mint=mint,
+            count=count
+        )
+        
+        return count
 
 
 class MemeTokenAnalyzer:
@@ -158,6 +559,7 @@ class MemeTokenAnalyzer:
                 # Calculate top holder percentages
                 if total_supply > 0:
                     result["top_holder_percentage"] = (holder_amounts[0] / total_supply) * 100
+                    result["largest_holder_percentage"] = result["top_holder_percentage"]  # Add for compatibility
                     
                     # Calculate top 10 percentage
                     top_10_sum = sum(holder_amounts[:min(10, len(holder_amounts))])

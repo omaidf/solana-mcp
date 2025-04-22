@@ -2,6 +2,8 @@
 
 # Standard library imports
 import os
+import sys
+import argparse
 from typing import Dict, Any
 
 # Third-party library imports
@@ -88,12 +90,24 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
-def run_server():
+def run_server(port=None):
     """Run the server from command line.
+    
+    Args:
+        port: Optional port override
     
     This function is used as an entry point in setup.py.
     """
     config = get_server_config()
+    
+    # Override port if specified
+    if port is not None:
+        try:
+            config.port = int(port)
+        except ValueError:
+            logger.error(f"Invalid port number: {port}")
+            sys.exit(1)
+    
     logger.info(
         f"Starting Solana MCP Server on {config.host}:{config.port} (Environment: {config.environment})"
     )
@@ -108,4 +122,8 @@ def run_server():
 
 if __name__ == "__main__":
     """Run the server directly when script is executed."""
-    run_server() 
+    parser = argparse.ArgumentParser(description="Solana MCP Server")
+    parser.add_argument("--port", type=int, help="Server port")
+    args = parser.parse_args()
+    
+    run_server(port=args.port) 
