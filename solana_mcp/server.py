@@ -1264,20 +1264,20 @@ async def rest_chain_analysis(request):
 # -------------------------------------------
 
 @app.resource("solana://account/{address}")
-async def get_account(ctx: Context, address: str) -> str:
+async def get_account(address: str) -> str:
     """Get Solana account information.
     
     Args:
-        ctx: The request context
         address: The account address
         
     Returns:
         Account information as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
     try:
-        account_info = await solana_client.get_account_info(address, encoding="jsonParsed")
-        return json.dumps(account_info, indent=2)
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            account_info = await solana_client.get_account_info(address, encoding="jsonParsed")
+            return json.dumps(account_info, indent=2)
     except InvalidPublicKeyError as e:
         return json.dumps({"error": str(e)})
     except SolanaRpcError as e:
@@ -1287,25 +1287,25 @@ async def get_account(ctx: Context, address: str) -> str:
 
 
 @app.resource("solana://balance/{address}")
-async def get_balance(ctx: Context, address: str) -> str:
+async def get_balance(address: str) -> str:
     """Get Solana account balance.
     
     Args:
-        ctx: The request context
         address: The account address
         
     Returns:
         Account balance in SOL
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
     try:
-        balance_lamports = await solana_client.get_balance(address)
-        balance_sol = balance_lamports / 1_000_000_000  # Convert lamports to SOL
-        return json.dumps({
-            "lamports": balance_lamports,
-            "sol": balance_sol,
-            "formatted": f"{balance_sol} SOL ({balance_lamports} lamports)"
-        }, indent=2)
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            balance_lamports = await solana_client.get_balance(address)
+            balance_sol = balance_lamports / 1_000_000_000  # Convert lamports to SOL
+            return json.dumps({
+                "lamports": balance_lamports,
+                "sol": balance_sol,
+                "formatted": f"{balance_sol} SOL ({balance_lamports} lamports)"
+            }, indent=2)
     except InvalidPublicKeyError as e:
         return json.dumps({"error": str(e)})
     except SolanaRpcError as e:
@@ -1319,20 +1319,20 @@ async def get_balance(ctx: Context, address: str) -> str:
 # -------------------------------------------
 
 @app.resource("solana://tokens/{owner}")
-async def get_token_accounts(ctx: Context, owner: str) -> str:
+async def get_token_accounts(owner: str) -> str:
     """Get token accounts owned by an address.
     
     Args:
-        ctx: The request context
         owner: The owner address
         
     Returns:
         Token account information as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
     try:
-        token_accounts = await solana_client.get_token_accounts_by_owner(owner)
-        return json.dumps(token_accounts, indent=2)
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            token_accounts = await solana_client.get_token_accounts_by_owner(owner)
+            return json.dumps(token_accounts, indent=2)
     except InvalidPublicKeyError as e:
         return json.dumps({"error": str(e)})
     except SolanaRpcError as e:
@@ -1342,40 +1342,40 @@ async def get_token_accounts(ctx: Context, owner: str) -> str:
 
 
 @app.resource("solana://token/{mint}")
-async def get_token_info(ctx: Context, mint: str) -> str:
+async def get_token_info(mint: str) -> str:
     """Get token information.
     
     Args:
-        ctx: The request context
         mint: The token mint address
         
     Returns:
         Token information as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
     try:
-        # Get token supply
-        supply = await solana_client.get_token_supply(mint)
-        
-        # Get token metadata
-        metadata = await solana_client.get_token_metadata(mint)
-        
-        # Get largest token accounts
-        largest_accounts = await solana_client.get_token_largest_accounts(mint)
-        
-        # Get market price data if available
-        price_data = await solana_client.get_market_price(mint)
-        
-        # Compile all information
-        token_info = {
-            "mint": mint,
-            "supply": supply,
-            "metadata": metadata,
-            "largest_accounts": largest_accounts,
-            "price_data": price_data
-        }
-        
-        return json.dumps(token_info, indent=2)
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            # Get token supply
+            supply = await solana_client.get_token_supply(mint)
+            
+            # Get token metadata
+            metadata = await solana_client.get_token_metadata(mint)
+            
+            # Get largest token accounts
+            largest_accounts = await solana_client.get_token_largest_accounts(mint)
+            
+            # Get market price data if available
+            price_data = await solana_client.get_market_price(mint)
+            
+            # Compile all information
+            token_info = {
+                "mint": mint,
+                "supply": supply,
+                "metadata": metadata,
+                "largest_accounts": largest_accounts,
+                "price_data": price_data
+            }
+            
+            return json.dumps(token_info, indent=2)
     except InvalidPublicKeyError as e:
         return json.dumps({"error": str(e)})
     except SolanaRpcError as e:
@@ -1385,44 +1385,44 @@ async def get_token_info(ctx: Context, mint: str) -> str:
 
 
 @app.resource("solana://token/{mint}/holders")
-async def get_token_holders(ctx: Context, mint: str) -> str:
+async def get_token_holders(mint: str) -> str:
     """Get token holders for a mint.
     
     Args:
-        ctx: The request context
         mint: The token mint address
         
     Returns:
         Token holders information as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
     try:
-        # Get largest accounts for this token
-        largest_accounts = await solana_client.get_token_largest_accounts(mint)
-        
-        # For each account, get the owner
-        holders = []
-        for account in largest_accounts:
-            # Get the account info to find the owner
-            account_info = await solana_client.get_account_info(
-                account["address"], 
-                encoding="jsonParsed"
-            )
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            # Get largest accounts for this token
+            largest_accounts = await solana_client.get_token_largest_accounts(mint)
             
-            # Extract owner and balance information
-            if "parsed" in account_info.get("data", {}):
-                parsed_data = account_info["data"]["parsed"]
-                if "info" in parsed_data:
-                    info = parsed_data["info"]
-                    holders.append({
-                        "owner": info.get("owner"),
-                        "address": account["address"],
-                        "amount": info.get("tokenAmount", {}).get("amount"),
-                        "decimals": info.get("tokenAmount", {}).get("decimals"),
-                        "uiAmount": info.get("tokenAmount", {}).get("uiAmount")
-                    })
-        
-        return json.dumps({"mint": mint, "holders": holders}, indent=2)
+            # For each account, get the owner
+            holders = []
+            for account in largest_accounts:
+                # Get the account info to find the owner
+                account_info = await solana_client.get_account_info(
+                    account["address"], 
+                    encoding="jsonParsed"
+                )
+                
+                # Extract owner and balance information
+                if "parsed" in account_info.get("data", {}):
+                    parsed_data = account_info["data"]["parsed"]
+                    if "info" in parsed_data:
+                        info = parsed_data["info"]
+                        holders.append({
+                            "owner": info.get("owner"),
+                            "address": account["address"],
+                            "amount": info.get("tokenAmount", {}).get("amount"),
+                            "decimals": info.get("tokenAmount", {}).get("decimals"),
+                            "uiAmount": info.get("tokenAmount", {}).get("uiAmount")
+                        })
+            
+            return json.dumps({"mint": mint, "holders": holders}, indent=2)
     except InvalidPublicKeyError as e:
         return json.dumps({"error": str(e)})
     except SolanaRpcError as e:
@@ -1436,20 +1436,20 @@ async def get_token_holders(ctx: Context, mint: str) -> str:
 # -------------------------------------------
 
 @app.resource("solana://transaction/{signature}")
-async def get_transaction_details(ctx: Context, signature: str) -> str:
+async def get_transaction_details(signature: str) -> str:
     """Get transaction details.
     
     Args:
-        ctx: The request context
         signature: The transaction signature
         
     Returns:
         Transaction details as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
     try:
-        tx_details = await solana_client.get_transaction(signature)
-        return json.dumps(tx_details, indent=2)
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            tx_details = await solana_client.get_transaction(signature)
+            return json.dumps(tx_details, indent=2)
     except ValueError as e:  # Invalid signature format
         return json.dumps({"error": str(e)})
     except SolanaRpcError as e:
@@ -1459,40 +1459,36 @@ async def get_transaction_details(ctx: Context, signature: str) -> str:
 
 
 @app.resource("solana://transactions/{address}")
-async def get_address_transactions(
-    ctx: Context, 
-    address: str,
-    limit: int = 20,
-    before: str = None
-) -> str:
+async def get_address_transactions(address: str) -> str:
     """Get transaction history for an address.
     
     Args:
-        ctx: The request context
         address: The account address
-        limit: Maximum number of transactions to return
-        before: Signature to search backwards from
         
     Returns:
         Transaction history as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
+    limit = 20  # Default value
+    before = None  # Default value
+    
     try:
-        # Get signatures
-        signatures = await solana_client.get_signatures_for_address(
-            address, 
-            before=before, 
-            limit=limit
-        )
-        
-        # For detailed view, we could get full transaction details
-        # But that would be a lot of RPC calls
-        # Instead just return the signatures with metadata
-        
-        return json.dumps({
-            "address": address,
-            "transactions": signatures
-        }, indent=2)
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            # Get signatures
+            signatures = await solana_client.get_signatures_for_address(
+                address, 
+                before=before, 
+                limit=limit
+            )
+            
+            # For detailed view, we could get full transaction details
+            # But that would be a lot of RPC calls
+            # Instead just return the signatures with metadata
+            
+            return json.dumps({
+                "address": address,
+                "transactions": signatures
+            }, indent=2)
     except InvalidPublicKeyError as e:
         return json.dumps({"error": str(e)})
     except SolanaRpcError as e:
@@ -1506,31 +1502,31 @@ async def get_address_transactions(
 # -------------------------------------------
 
 @app.resource("solana://program/{program_id}")
-async def get_program_info(ctx: Context, program_id: str) -> str:
+async def get_program_info(program_id: str) -> str:
     """Get program information.
     
     Args:
-        ctx: The request context
         program_id: The program ID
         
     Returns:
         Program information as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
     try:
-        # Get the program account itself
-        program_account = await solana_client.get_account_info(program_id, encoding="jsonParsed")
-        
-        # Prepare result
-        program_info = {
-            "program_id": program_id,
-            "account": program_account,
-            "is_executable": program_account.get("executable", False),
-            "owner": program_account.get("owner"),
-            "lamports": program_account.get("lamports", 0)
-        }
-        
-        return json.dumps(program_info, indent=2)
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            # Get the program account itself
+            program_account = await solana_client.get_account_info(program_id, encoding="jsonParsed")
+            
+            # Prepare result
+            program_info = {
+                "program_id": program_id,
+                "account": program_account,
+                "is_executable": program_account.get("executable", False),
+                "owner": program_account.get("owner"),
+                "lamports": program_account.get("lamports", 0)
+            }
+            
+            return json.dumps(program_info, indent=2)
     except InvalidPublicKeyError as e:
         return json.dumps({"error": str(e)})
     except SolanaRpcError as e:
@@ -1540,62 +1536,57 @@ async def get_program_info(ctx: Context, program_id: str) -> str:
 
 
 @app.resource("solana://program/{program_id}/accounts")
-async def get_program_account_list(
-    ctx: Context, 
-    program_id: str,
-    limit: int = 10,  # Default to 10 to avoid large responses
-    offset: int = 0,
-    memcmp: str = None,  # JSON-encoded memcmp filter
-    datasize: int = None  # Filter by data size
-) -> str:
+async def get_program_account_list(program_id: str) -> str:
     """Get accounts owned by a program.
     
     Args:
-        ctx: The request context
         program_id: The program ID
-        limit: Maximum number of accounts to return
-        offset: Offset to start from
-        memcmp: JSON-encoded memcmp filter (e.g. '{"offset":0,"bytes":"base58bytes"}')
-        datasize: Filter by exact data size
         
     Returns:
         Program accounts as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
+    # Default values
+    limit = 10  # Default to 10 to avoid large responses
+    offset = 0
+    memcmp = None  # JSON-encoded memcmp filter
+    datasize = None  # Filter by data size
+    
     try:
-        filters = []
-        
-        # Add memcmp filter if provided
-        if memcmp:
-            try:
-                memcmp_filter = json.loads(memcmp)
-                filters.append({"memcmp": memcmp_filter})
-            except json.JSONDecodeError:
-                return json.dumps({"error": "Invalid memcmp JSON format"})
-        
-        # Add datasize filter if provided
-        if datasize is not None:
-            filters.append({"dataSize": datasize})
-        
-        # Get program accounts with pagination
-        accounts = await solana_client.get_program_accounts(
-            program_id,
-            filters=filters if filters else None,
-            encoding="jsonParsed",
-            limit=limit,
-            offset=offset
-        )
-        
-        # Count total found
-        account_count = len(accounts)
-        
-        return json.dumps({
-            "program_id": program_id,
-            "count": account_count,
-            "limit": limit,
-            "offset": offset,
-            "accounts": accounts
-        }, indent=2)
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            filters = []
+            
+            # Add memcmp filter if provided
+            if memcmp:
+                try:
+                    memcmp_filter = json.loads(memcmp)
+                    filters.append({"memcmp": memcmp_filter})
+                except json.JSONDecodeError:
+                    return json.dumps({"error": "Invalid memcmp JSON format"})
+            
+            # Add datasize filter if provided
+            if datasize is not None:
+                filters.append({"dataSize": datasize})
+            
+            # Get program accounts with pagination
+            accounts = await solana_client.get_program_accounts(
+                program_id,
+                filters=filters if filters else None,
+                encoding="jsonParsed",
+                limit=limit,
+                offset=offset
+            )
+            
+            # Count total found
+            account_count = len(accounts)
+            
+            return json.dumps({
+                "program_id": program_id,
+                "count": account_count,
+                "limit": limit,
+                "offset": offset,
+                "accounts": accounts
+            }, indent=2)
     except InvalidPublicKeyError as e:
         return json.dumps({"error": str(e)})
     except SolanaRpcError as e:
@@ -1609,27 +1600,25 @@ async def get_program_account_list(
 # -------------------------------------------
 
 @app.resource("solana://network/epoch")
-async def get_network_epoch(ctx: Context) -> str:
+async def get_network_epoch() -> str:
     """Get current epoch information.
     
-    Args:
-        ctx: The request context
-        
     Returns:
         Epoch information as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
     try:
-        epoch_info = await solana_client.get_epoch_info()
-        inflation_rate = await solana_client.get_inflation_rate()
-        
-        # Combine information
-        network_info = {
-            "epoch_info": epoch_info,
-            "inflation_rate": inflation_rate
-        }
-        
-        return json.dumps(network_info, indent=2)
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            epoch_info = await solana_client.get_epoch_info()
+            inflation_rate = await solana_client.get_inflation_rate()
+            
+            # Combine information
+            network_info = {
+                "epoch_info": epoch_info,
+                "inflation_rate": inflation_rate
+            }
+            
+            return json.dumps(network_info, indent=2)
     except SolanaRpcError as e:
         return json.dumps({"error": str(e), "details": e.error_data})
     except Exception as e:
@@ -1637,22 +1626,20 @@ async def get_network_epoch(ctx: Context) -> str:
 
 
 @app.resource("solana://network/validators")
-async def get_network_validators(ctx: Context) -> str:
+async def get_network_validators() -> str:
     """Get information about validators.
     
-    Args:
-        ctx: The request context
-        
     Returns:
         Validator information as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
     try:
-        nodes = await solana_client.get_cluster_nodes()
-        
-        return json.dumps({
-            "validators": nodes
-        }, indent=2)
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            nodes = await solana_client.get_cluster_nodes()
+            
+            return json.dumps({
+                "validators": nodes
+            }, indent=2)
     except SolanaRpcError as e:
         return json.dumps({"error": str(e), "details": e.error_data})
     except Exception as e:
@@ -1664,45 +1651,45 @@ async def get_network_validators(ctx: Context) -> str:
 # -------------------------------------------
 
 @app.resource("solana://nft/{mint}")
-async def get_nft_info(ctx: Context, mint: str) -> str:
+async def get_nft_info(mint: str) -> str:
     """Get NFT information.
     
     Args:
-        ctx: The request context
         mint: The NFT mint address
         
     Returns:
         NFT information as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
     try:
-        # Get token metadata
-        metadata = await solana_client.get_token_metadata(mint)
-        
-        # Get token account to find the owner
-        largest_accounts = await solana_client.get_token_largest_accounts(mint)
-        
-        # Get the current owner if possible
-        owner = None
-        if largest_accounts and len(largest_accounts) > 0:
-            # Get the account with the highest balance
-            largest_account = largest_accounts[0]["address"]
-            account_info = await solana_client.get_account_info(largest_account, encoding="jsonParsed")
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            # Get token metadata
+            metadata = await solana_client.get_token_metadata(mint)
             
-            if "parsed" in account_info.get("data", {}):
-                parsed_data = account_info["data"]["parsed"]
-                if "info" in parsed_data:
-                    owner = parsed_data["info"].get("owner")
-        
-        # Compile NFT information
-        nft_info = {
-            "mint": mint,
-            "metadata": metadata,
-            "owner": owner,
-            "token_standard": "Unknown"  # In a real implementation, determine if it's NFT/SFT
-        }
-        
-        return json.dumps(nft_info, indent=2)
+            # Get token account to find the owner
+            largest_accounts = await solana_client.get_token_largest_accounts(mint)
+            
+            # Get the current owner if possible
+            owner = None
+            if largest_accounts and len(largest_accounts) > 0:
+                # Get the account with the highest balance
+                largest_account = largest_accounts[0]["address"]
+                account_info = await solana_client.get_account_info(largest_account, encoding="jsonParsed")
+                
+                if "parsed" in account_info.get("data", {}):
+                    parsed_data = account_info["data"]["parsed"]
+                    if "info" in parsed_data:
+                        owner = parsed_data["info"].get("owner")
+                
+            # Compile NFT information
+            nft_info = {
+                "mint": mint,
+                "metadata": metadata,
+                "owner": owner,
+                "token_standard": "Unknown"  # In a real implementation, determine if it's NFT/SFT
+            }
+            
+            return json.dumps(nft_info, indent=2)
     except InvalidPublicKeyError as e:
         return json.dumps({"error": str(e)})
     except SolanaRpcError as e:
@@ -2085,48 +2072,6 @@ def solana_query() -> types.Prompt:
     )
 
 
-@app.get_prompt()
-def get_solana_query_prompt(
-    name: str, arguments: Dict[str, str]
-) -> types.GetPromptResult:
-    """Get the Solana query prompt.
-    
-    Args:
-        name: The prompt name
-        arguments: The prompt arguments
-        
-    Returns:
-        The prompt result
-    """
-    if name != "solana_query":
-        raise ValueError(f"Unknown prompt: {name}")
-    
-    query_type = arguments.get("query_type", "")
-    address = arguments.get("address", "")
-    
-    messages = [
-        types.PromptMessage(
-            role="system",
-            content=types.TextContent(
-                type="text",
-                text="You are a Solana blockchain assistant. You help users query and understand Solana blockchain data."
-            ),
-        ),
-        types.PromptMessage(
-            role="user",
-            content=types.TextContent(
-                type="text",
-                text=f"Please help me get {query_type} information for the Solana address {address}."
-            ),
-        ),
-    ]
-    
-    return types.GetPromptResult(
-        messages=messages,
-        description=f"Prompt for querying {query_type} information for {address}"
-    )
-
-
 @app.prompt()
 def token_analysis() -> types.Prompt:
     """Define a prompt for analyzing tokens."""
@@ -2140,47 +2085,6 @@ def token_analysis() -> types.Prompt:
                 required=True,
             ),
         ],
-    )
-
-
-@app.get_prompt()
-def get_token_analysis_prompt(
-    name: str, arguments: Dict[str, str]
-) -> types.GetPromptResult:
-    """Get the token analysis prompt.
-    
-    Args:
-        name: The prompt name
-        arguments: The prompt arguments
-        
-    Returns:
-        The prompt result
-    """
-    if name != "token_analysis":
-        raise ValueError(f"Unknown prompt: {name}")
-    
-    mint = arguments.get("mint", "")
-    
-    messages = [
-        types.PromptMessage(
-            role="system",
-            content=types.TextContent(
-                type="text",
-                text="You are a Solana token analyst. You analyze token data and provide insights about tokens on the Solana blockchain."
-            ),
-        ),
-        types.PromptMessage(
-            role="user",
-            content=types.TextContent(
-                type="text",
-                text=f"Please analyze the Solana token with mint address {mint}. Include information about token supply, holders, and any price data available."
-            ),
-        ),
-    ]
-    
-    return types.GetPromptResult(
-        messages=messages,
-        description=f"Prompt for analyzing token {mint}"
     )
 
 
@@ -2645,9 +2549,7 @@ def run_server(
             async with sse.connect_sse(
                 request.scope, request.receive, request._send
             ) as streams:
-                await app.run(
-                    streams[0], streams[1], app.create_initialization_options()
-                )
+                await app.run_sse_async(streams[0], streams[1])
         
         # Set up REST API endpoints alongside SSE
         # Create Starlette app with CORS middleware
@@ -2740,15 +2642,18 @@ def run_server(
         )
     else:
         # Default to stdio
-        from mcp.server.stdio import stdio_server
+        app.run(transport="stdio")
         
-        async def arun():
-            async with stdio_server() as streams:
-                await app.run(
-                    streams[0], streams[1], app.create_initialization_options()
-                )
-        
-        anyio.run(arun)
+        # The following code is not needed anymore since we're using the synchronous run method
+        # from mcp.server.stdio import stdio_server
+        # 
+        # async def arun():
+        #     async with stdio_server() as streams:
+        #         await app.run(
+        #             streams[0], streams[1], app.create_initialization_options()
+        #         )
+        # 
+        # anyio.run(arun)
 
 
 if __name__ == "__main__":
