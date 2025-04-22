@@ -241,6 +241,195 @@ curl -X GET "http://localhost:8000/token-analysis/holders-count/EPjFWdd5AufqSSqe
 }
 ```
 
+### Liquidity Pool Analysis
+
+#### Analyze Pool
+
+Get comprehensive analysis for a specific liquidity pool.
+
+**Endpoint:** `GET /liquidity-analysis/pool/{pool_address}`
+
+**Parameters:**
+- `pool_address` (path parameter, required): The Solana liquidity pool address
+
+**Example Request:**
+```bash
+curl -X GET "http://localhost:8000/liquidity-analysis/pool/7quA1MV2rnHSDgfkfGaESQ1VjgQTqY9k9QUTaAaLhHrA"
+```
+
+**Response:**
+```json
+{
+  "pool_address": "7quA1MV2rnHSDgfkfGaESQ1VjgQTqY9k9QUTaAaLhHrA",
+  "protocol": "raydium",
+  "pool_data": {
+    "tokenA": {
+      "mint": "So11111111111111111111111111111111111111112",
+      "symbol": "SOL",
+      "amount": 1000000
+    },
+    "tokenB": {
+      "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "symbol": "USDC",
+      "amount": 2000000
+    },
+    "fees": {
+      "fee_tier": 0.0025
+    }
+  },
+  "metrics": {
+    "volume_24h": 1000000,
+    "volume_7d": 5000000,
+    "fees_24h": 2500,
+    "fees_7d": 12500,
+    "apy": 12.5,
+    "price_impact_1000usd": 0.05,
+    "liquidity_usd": 2000000
+  },
+  "last_updated": "2024-01-15T12:34:56"
+}
+```
+
+#### User Positions
+
+Get liquidity positions for a specific user wallet.
+
+**Endpoint:** `GET /liquidity-analysis/user-positions/{wallet_address}`
+
+**Parameters:**
+- `wallet_address` (path parameter, required): The user's wallet address
+
+**Example Request:**
+```bash
+curl -X GET "http://localhost:8000/liquidity-analysis/user-positions/FG4Y3yX4AAchp1HvNZ7LfzFTew5pRpfwAzCiJ1Z9gwBN"
+```
+
+**Response:**
+```json
+{
+  "wallet_address": "FG4Y3yX4AAchp1HvNZ7LfzFTew5pRpfwAzCiJ1Z9gwBN",
+  "positions": {
+    "raydium": [
+      {
+        "pool_address": "7quA1MV2rnHSDgfkfGaESQ1VjgQTqY9k9QUTaAaLhHrA",
+        "token_a": "SOL",
+        "token_b": "USDC",
+        "lp_token_amount": 10.5,
+        "share_percentage": 0.01,
+        "value_usd": 5000,
+        "apy": 15.2,
+        "rewards": [
+          {
+            "token": "RAY",
+            "amount": 2.5,
+            "value_usd": 50
+          }
+        ]
+      }
+    ],
+    "orca": [
+      {
+        "pool_address": "9vgYWRnxJ7zK8AzFKuEFfRv3mRK3FJPspZKXAa3XNUJs",
+        "token_a": "SOL",
+        "token_b": "USDT",
+        "lp_token_amount": 20.2,
+        "share_percentage": 0.005,
+        "value_usd": 2500,
+        "apy": 18.7,
+        "rewards": [
+          {
+            "token": "ORCA",
+            "amount": 5,
+            "value_usd": 75
+          }
+        ]
+      }
+    ],
+    "other": []
+  },
+  "total_value_locked": 7500,
+  "position_count": 2,
+  "last_updated": "2024-01-15T12:34:56"
+}
+```
+
+#### Top Pools
+
+Get top liquidity pools by Total Value Locked (TVL).
+
+**Endpoint:** `GET /liquidity-analysis/top-pools`
+
+**Parameters:**
+- `limit` (query parameter, optional): Maximum number of pools to return (default: 10)
+- `protocol` (query parameter, optional): Filter by protocol (e.g., 'raydium', 'orca')
+
+**Example Request:**
+```bash
+curl -X GET "http://localhost:8000/liquidity-analysis/top-pools?limit=5&protocol=raydium"
+```
+
+**Response:**
+```json
+{
+  "pools": [
+    {
+      "pool_address": "7quA1MV2rnHSDgfkfGaESQ1VjgQTqY9k9QUTaAaLhHrA",
+      "protocol": "raydium",
+      "token_a": "SOL",
+      "token_b": "USDC",
+      "tvl": 50000000,
+      "volume_24h": 10000000,
+      "apy": 12.5
+    },
+    {
+      "pool_address": "CdKPtCb5fBRaGFS4bJgytfReeHuFyhpe9YUyWHPnEWZG",
+      "protocol": "raydium",
+      "token_a": "RAY",
+      "token_b": "USDC",
+      "tvl": 25000000,
+      "volume_24h": 5000000,
+      "apy": 18.7
+    }
+  ],
+  "total_count": 2,
+  "total_tvl": 75000000,
+  "last_updated": "2024-01-15T12:34:56"
+}
+```
+
+#### Calculate Impermanent Loss
+
+Calculate impermanent loss for given price changes.
+
+**Endpoint:** `POST /liquidity-analysis/impermanent-loss`
+
+**Request Body:**
+```json
+{
+  "token_a_price_change": 1.5,
+  "token_b_price_change": 1.0
+}
+```
+
+**Example Request:**
+```bash
+curl -X POST "http://localhost:8000/liquidity-analysis/impermanent-loss" \
+  -H "Content-Type: application/json" \
+  -d '{"token_a_price_change": 1.5, "token_b_price_change": 1.0}'
+```
+
+**Response:**
+```json
+{
+  "token_a_price_change": 1.5,
+  "token_b_price_change": 1.0,
+  "price_ratio": 1.5,
+  "impermanent_loss": -0.0202,
+  "percentage_loss": -2.02,
+  "explanation": "If you held the tokens instead of providing liquidity, your portfolio would be 2.02% higher"
+}
+```
+
 ## Rate Limiting
 
 Currently, there are no rate limits implemented, but excessive usage may be throttled in the future to ensure service availability.

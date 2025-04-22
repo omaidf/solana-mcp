@@ -15,6 +15,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from solana_mcp.config import get_server_config
 from solana_mcp.logging_config import setup_logging, get_logger, RequestIdMiddleware
 from solana_mcp.api_routes.token_analysis import router as token_analysis_router
+from solana_mcp.api_routes.liquidity_analysis import router as liquidity_analysis_router
+from solana_mcp.api_routes.token_risk_analysis import router as token_risk_router
 
 # Setup logging
 setup_logging()
@@ -41,6 +43,8 @@ app.add_middleware(RequestIdMiddleware)
 
 # Include routers
 app.include_router(token_analysis_router)
+app.include_router(liquidity_analysis_router)
+app.include_router(token_risk_router)
 
 # Health check endpoint
 @app.get("/health")
