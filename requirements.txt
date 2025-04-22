@@ -4,6 +4,7 @@ cachetools
 click
 fastapi
 httpx
+itsdangerous
 mcp
 prometheus-client
 pydantic
