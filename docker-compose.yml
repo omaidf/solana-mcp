@@ -1,35 +1,21 @@
 version: '3.8'
 
 services:
-  solana-mcp-server:
+  solana-mcp:
     build:
       context: .
       dockerfile: Dockerfile
-    image: solana-mcp-server:latest
-    container_name: solana-mcp-server
     restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
-      - SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
-      - SOLANA_COMMITMENT=confirmed
-      - SOLANA_TIMEOUT=30
-      - HOST=0.0.0.0
-      - PORT=8000
-      - LOG_LEVEL=INFO
-      - LOG_FORMAT=json
-      - ENVIRONMENT=production
-      - METADATA_CACHE_SIZE=100
-      - METADATA_CACHE_TTL=300
-      - PRICE_CACHE_SIZE=500
-      - PRICE_CACHE_TTL=60
+      - LOG_LEVEL=info
     volumes:
-      - ./logs:/app/logs
-      - ./config:/app/config
+      - ./.env:/app/.env:ro
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
-      timeout: 3s
+      timeout: 10s
       retries: 3
       start_period: 5s
 
@@ -66,7 +52,7 @@ services:
       - '--web.console.templates=/etc/prometheus/consoles'
       - '--web.enable-lifecycle'
     depends_on:
-      - solana-mcp-server
+      - solana-mcp
 
   # Optional Grafana dashboard
   grafana:
