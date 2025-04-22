@@ -1,1 +1,0 @@
-web: python -m solana_mcp 
