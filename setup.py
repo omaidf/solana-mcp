@@ -33,16 +33,16 @@ setup(
         "Intended Audience :: Developers",
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "Framework :: FastAPI",
         "Topic :: Software Development :: Libraries :: Python Modules",
         "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
         "Topic :: Cryptocurrency :: Blockchain",
     ],
-    python_requires=">=3.9",
+    python_requires=">=3.10",
     entry_points={
         "console_scripts": [
             "solana-mcp=solana_mcp.__main__:main",
