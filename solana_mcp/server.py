@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, AsyncIterator, Union, Tuple, Set
 import datetime
 import threading
+import logging
 
 from mcp.server.fastmcp import Context, FastMCP
 import mcp.types as types
@@ -28,11 +29,18 @@ from solana_mcp.solana_client import (
     SolanaClient, get_solana_client, SolanaRpcError, InvalidPublicKeyError,
     TOKEN_PROGRAM_ID, METADATA_PROGRAM_ID
 )
+from solana_mcp.semantic_search import (
+    get_account_balance, get_account_details, get_token_accounts_for_owner,
+    get_token_details, get_transaction_history_for_address, get_nft_details,
+    parse_natural_language_query, semantic_transaction_search
+)
 
 # Global session store with thread safety - replace the existing SESSION_STORE declaration
 _session_store_lock = threading.Lock()
 SESSION_STORE = {}
 SESSION_EXPIRY = 30  # Session expiry in minutes
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Session:
@@ -96,8 +104,36 @@ class Session:
         return datetime.datetime.now() > expiry_time
 
 
+# Use asyncio lock for thread-safety in async context
+_session_store_async_lock = asyncio.Lock()
+
+async def get_or_create_session_async(session_id: Optional[str] = None) -> Session:
+    """Get an existing session or create a new one with async support.
+    
+    Args:
+        session_id: Optional session ID
+        
+    Returns:
+        The session
+    """
+    # Clean expired sessions asynchronously
+    await clean_expired_sessions_async()
+    
+    async with _session_store_async_lock:
+        # Create new session if ID not provided or not found
+        if not session_id or session_id not in SESSION_STORE:
+            new_session = Session(id=str(uuid.uuid4()))
+            SESSION_STORE[new_session.id] = new_session
+            return new_session
+        
+        # Update access time for existing session
+        session = SESSION_STORE[session_id]
+        session.update_access_time()
+        return session
+
+
 def get_or_create_session(session_id: Optional[str] = None) -> Session:
-    """Get an existing session or create a new one.
+    """Get an existing session or create a new one (synchronous version).
     
     Args:
         session_id: Optional session ID
@@ -121,8 +157,19 @@ def get_or_create_session(session_id: Optional[str] = None) -> Session:
         return session
 
 
+async def clean_expired_sessions_async():
+    """Remove expired sessions from the store (async version)."""
+    async with _session_store_async_lock:
+        expired_sessions = [
+            session_id for session_id, session in SESSION_STORE.items() 
+            if session.is_expired()
+        ]
+        for session_id in expired_sessions:
+            del SESSION_STORE[session_id]
+
+
 def clean_expired_sessions():
-    """Remove expired sessions from the store."""
+    """Remove expired sessions from the store (sync version)."""
     with _session_store_lock:
         expired_sessions = [
             session_id for session_id, session in SESSION_STORE.items() 
@@ -136,7 +183,7 @@ async def periodic_session_cleanup():
     """Periodically clean up expired sessions."""
     while True:
         try:
-            clean_expired_sessions()
+            await clean_expired_sessions_async()
         except Exception as e:
             print(f"Error cleaning sessions: {str(e)}")
         
@@ -161,19 +208,43 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     Yields:
         The application context.
     """
-    # Start session cleanup task
-    cleanup_task = asyncio.create_task(periodic_session_cleanup())
+    # Initialize resources, tasks and connections
+    solana_client = None
+    cleanup_task = None
+    logger.info("Starting Solana MCP server lifespan...")
     
     try:
+        # Start session cleanup task
+        cleanup_task = asyncio.create_task(periodic_session_cleanup())
+        cleanup_task.set_name("session_cleanup")
+        
+        # Initialize Solana client
         async with get_solana_client() as solana_client:
+            logger.info("Solana client initialized successfully")
+            
+            # Yield the application context
             yield AppContext(solana_client=solana_client)
+            
+    except Exception as e:
+        logger.error(f"Error during application startup: {str(e)}", exc_info=True)
+        # Re-raise to prevent application from starting with incomplete initialization
+        raise
     finally:
-        # Cancel cleanup task when shutting down
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
+        logger.info("Cleaning up application resources...")
+        
+        # Cancel cleanup task
+        if cleanup_task and not cleanup_task.done():
+            logger.info("Cancelling session cleanup task")
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"Error during cleanup task cancellation: {str(e)}")
+        
+        # Close any other resources if needed
+        logger.info("Application shutdown complete")
 
 
 # Create the FastMCP server with Solana lifespan
@@ -2326,6 +2397,33 @@ async def rest_get_nft_info(request):
 async def health_check(request):
     """Health check endpoint"""
     return JSONResponse({"status": "healthy", "service": "solana-mcp"})
+
+
+def explain_solana_error(error_message: str) -> str:
+    """Convert Solana error messages to user-friendly explanations.
+    
+    Args:
+        error_message: The error message from the Solana client
+        
+    Returns:
+        A user-friendly explanation of the error
+    """
+    error_message = error_message.lower()
+    
+    if "invalid public key" in error_message:
+        return "The address provided is not a valid Solana account address."
+    elif "not found" in error_message or "does not exist" in error_message:
+        return "The requested account or data does not exist on the Solana blockchain."
+    elif "insufficient funds" in error_message:
+        return "The account does not have enough SOL to perform this operation."
+    elif "rate limited" in error_message:
+        return "The request was rate limited by the Solana RPC node. Please try again later."
+    elif "timed out" in error_message:
+        return "The request timed out. The Solana network might be experiencing high load."
+    elif "rpc error" in error_message:
+        return "There was an error communicating with the Solana blockchain."
+    else:
+        return "An error occurred while processing your request on the Solana blockchain."
 
 
 async def api_docs(request):

@@ -2,15 +2,158 @@
 
 # Standard library imports
 import os
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union, cast
 from dataclasses import dataclass, field
 from functools import lru_cache
+import re
 
 # Third-party library imports
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+
+def get_env_var(key: str, default: Any = None, required: bool = False, 
+               validator: Optional[callable] = None) -> Any:
+    """Get and validate environment variable.
+    
+    Args:
+        key: Environment variable name
+        default: Default value if not present
+        required: If True, raises ValueError when not found
+        validator: Optional validation function
+        
+    Returns:
+        The environment variable value or default
+        
+    Raises:
+        ValueError: If required and not found, or fails validation
+    """
+    value = os.environ.get(key)
+    
+    if value is None:
+        if required:
+            raise ValueError(f"Required environment variable '{key}' not found")
+        return default
+    
+    if validator and value is not None:
+        try:
+            return validator(value)
+        except Exception as e:
+            raise ValueError(f"Invalid value for environment variable '{key}': {str(e)}")
+    
+    return value
+
+
+def bool_validator(value: str) -> bool:
+    """Validate and convert string to boolean.
+    
+    Args:
+        value: String value to convert
+        
+    Returns:
+        Boolean value
+    """
+    return value.lower() in ("true", "1", "yes", "y", "on")
+
+
+def int_validator(value: str) -> int:
+    """Validate and convert string to integer.
+    
+    Args:
+        value: String value to convert
+        
+    Returns:
+        Integer value
+        
+    Raises:
+        ValueError: If not a valid integer
+    """
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"'{value}' is not a valid integer")
+
+
+def url_validator(value: str) -> str:
+    """Validate URL format.
+    
+    Args:
+        value: URL to validate
+        
+    Returns:
+        The validated URL
+        
+    Raises:
+        ValueError: If not a valid URL format
+    """
+    url_pattern = re.compile(
+        r'^(https?):\/\/'  # http:// or https://
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # domain
+        r'localhost|'  # localhost
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # or IPv4
+        r'(?::\d+)?'  # optional port
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    
+    if not url_pattern.match(value):
+        raise ValueError(f"'{value}' is not a valid URL")
+    return value
+
+
+def commitment_validator(value: str) -> str:
+    """Validate Solana commitment level.
+    
+    Args:
+        value: Commitment level to validate
+        
+    Returns:
+        The validated commitment level
+        
+    Raises:
+        ValueError: If not a valid commitment level
+    """
+    valid_commitments = ("processed", "confirmed", "finalized")
+    if value.lower() not in valid_commitments:
+        raise ValueError(f"Commitment must be one of: {', '.join(valid_commitments)}")
+    return value.lower()
+
+
+def log_level_validator(value: str) -> str:
+    """Validate log level.
+    
+    Args:
+        value: Log level to validate
+        
+    Returns:
+        The validated log level
+        
+    Raises:
+        ValueError: If not a valid log level
+    """
+    valid_levels = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+    upper_value = value.upper()
+    if upper_value not in valid_levels:
+        raise ValueError(f"Log level must be one of: {', '.join(valid_levels)}")
+    return upper_value
+
+
+def environment_validator(value: str) -> str:
+    """Validate environment name.
+    
+    Args:
+        value: Environment name to validate
+        
+    Returns:
+        The validated environment name
+        
+    Raises:
+        ValueError: If not a valid environment name
+    """
+    valid_environments = ("development", "testing", "staging", "production")
+    if value.lower() not in valid_environments:
+        raise ValueError(f"Environment must be one of: {', '.join(valid_environments)}")
+    return value.lower()
+
 
 @dataclass
 class SolanaConfig:
@@ -40,13 +183,18 @@ def get_solana_config() -> SolanaConfig:
     
     Returns:
         SolanaConfig instance
+        
+    Raises:
+        ValueError: If environment variables fail validation
     """
     return SolanaConfig(
-        rpc_url=os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
-        rpc_user=os.getenv("SOLANA_RPC_USER"),
-        rpc_password=os.getenv("SOLANA_RPC_PASSWORD"),
-        commitment=os.getenv("SOLANA_COMMITMENT", "confirmed"),
-        timeout=int(os.getenv("SOLANA_TIMEOUT", "30"))
+        rpc_url=get_env_var("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com", 
+                            validator=url_validator),
+        rpc_user=get_env_var("SOLANA_RPC_USER"),
+        rpc_password=get_env_var("SOLANA_RPC_PASSWORD"),
+        commitment=get_env_var("SOLANA_COMMITMENT", "confirmed", 
+                              validator=commitment_validator),
+        timeout=get_env_var("SOLANA_TIMEOUT", 30, validator=int_validator)
     )
 
 
@@ -59,6 +207,7 @@ class ServerConfig:
     debug: bool = False
     environment: str = "development"
     log_level: str = "INFO"
+    transport: str = "stdio"  # "stdio" or "sse"
     
     @property
     def bind_address(self) -> str:
@@ -76,6 +225,9 @@ class ServerConfig:
         
         if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             raise ValueError(f"Invalid log_level: {self.log_level}")
+            
+        if self.transport not in ("stdio", "sse"):
+            raise ValueError(f"Invalid transport: {self.transport}")
 
 
 @lru_cache()
@@ -84,13 +236,17 @@ def get_server_config() -> ServerConfig:
     
     Returns:
         ServerConfig instance
+        
+    Raises:
+        ValueError: If environment variables fail validation
     """
     return ServerConfig(
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", "8000")),
-        debug=os.getenv("DEBUG", "").lower() in ("true", "1", "yes"),
-        environment=os.getenv("ENVIRONMENT", "development"),
-        log_level=os.getenv("LOG_LEVEL", "INFO")
+        host=get_env_var("HOST", "0.0.0.0"),
+        port=get_env_var("PORT", 8000, validator=int_validator),
+        debug=get_env_var("DEBUG", False, validator=bool_validator),
+        environment=get_env_var("ENVIRONMENT", "development", validator=environment_validator),
+        log_level=get_env_var("LOG_LEVEL", "INFO", validator=log_level_validator),
+        transport=get_env_var("TRANSPORT", "stdio")
     )
 
 
@@ -147,13 +303,12 @@ class APIConfig:
 class AppConfig:
     """Comprehensive application configuration."""
     
-    solana: SolanaConfig = field(default_factory=SolanaConfig)
-    server: ServerConfig = field(default_factory=ServerConfig)
+    solana: SolanaConfig = field(default_factory=get_solana_config)
+    server: ServerConfig = field(default_factory=get_server_config)
     session: SessionConfig = field(default_factory=SessionConfig)
     api: APIConfig = field(default_factory=APIConfig)
     
     # Feature flags
-    enable_websockets: bool = os.environ.get("ENABLE_WEBSOCKETS", "").lower() in ("true", "1", "yes")
     enable_monitoring: bool = os.environ.get("ENABLE_MONITORING", "").lower() in ("true", "1", "yes")
     enable_cache: bool = os.environ.get("ENABLE_CACHE", "").lower() in ("true", "1", "yes")
     

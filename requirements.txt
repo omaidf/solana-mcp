@@ -2,18 +2,22 @@
 fastapi>=0.95.0,<0.96.0
 uvicorn>=0.21.0,<0.22.0
 starlette>=0.26.0,<0.27.0
+itsdangerous>=2.0.0,<2.2.0
 
 # HTTP client and utilities
 httpx>=0.24.0,<0.25.0
 requests==2.31.0
 
 # Pydantic for data validation
-pydantic>=1.10.0,<1.11.0
-pydantic-settings==2.0.3
+pydantic>=1.10.0,<2.0.0
+pydantic-settings>=1.0.0,<2.0.0
 
 # Solana tools
 base58==2.1.1
 solana==0.30.2
+
+# MCP (Model Context Protocol)
+mcp>=1.6.0
 
 # Utilities
 python-dotenv>=1.0.0,<1.1.0

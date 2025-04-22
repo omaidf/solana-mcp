@@ -9,7 +9,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 # Get version from package
 about = {}
-with open(os.path.join("solana-mcp-server", "solana_mcp", "__init__.py"), "r", encoding="utf-8") as f:
+with open(os.path.join("solana_mcp", "__init__.py"), "r", encoding="utf-8") as f:
     exec(f.read(), about)
 
 # Get dependencies from requirements.txt
@@ -44,7 +44,7 @@ setup(
     python_requires=">=3.9",
     entry_points={
         "console_scripts": [
-            "solana-mcp-server=solana_mcp.main:run_server",
+            "solana-mcp=solana_mcp.__main__:main",
         ],
     },
 ) 

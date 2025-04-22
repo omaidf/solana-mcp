@@ -28,6 +28,9 @@ dev = [
     "pytest-asyncio",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["solana_mcp"]
+
 [tool.black]
 line-length = 88
 target-version = ["py310"]

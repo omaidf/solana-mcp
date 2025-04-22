@@ -1,4 +1,4 @@
-"""Command-line entry point for Solana MCP server."""
+"""Main entry point for the Solana MCP server."""
 
 from solana_mcp.server import run_server
 

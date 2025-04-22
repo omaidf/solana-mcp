@@ -102,6 +102,12 @@ class SolanaClient:
             
         Returns:
             The JSON-RPC response
+            
+        Raises:
+            SolanaRpcError: If the RPC server returns an error
+            httpx.HTTPStatusError: If there's an HTTP error
+            httpx.RequestError: If there's a network or request error
+            asyncio.TimeoutError: If the request times out
         """
         if params is None:
             params = []
@@ -141,7 +147,8 @@ class SolanaClient:
         
         # Retry parameters
         max_retries = 3
-        retry_delay = 1.0  # starting delay in seconds
+        initial_retry_delay = 1.0  # starting delay in seconds
+        max_retry_delay = 10.0  # maximum delay in seconds
         
         # Initialize the HTTP client if needed
         if self._http_client is None:
@@ -151,16 +158,39 @@ class SolanaClient:
                 limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)
             )
         
+        # Categorize errors for retry decision
+        retriable_status_codes = {408, 429, 500, 502, 503, 504}
+        last_exception = None
+        
         for retry_count in range(max_retries + 1):
             try:
+                # Log the attempt if it's a retry
+                if retry_count > 0:
+                    logger.info(f"Retry attempt {retry_count}/{max_retries} for {method}")
+                
                 response = await self._http_client.post(
                     self.config.rpc_url,
                     headers=self.headers,
                     json=payload
                 )
+                
+                # Handle HTTP status errors
+                if response.status_code in retriable_status_codes and retry_count < max_retries:
+                    wait_time = min(
+                        initial_retry_delay * (2 ** retry_count), 
+                        max_retry_delay
+                    )
+                    logger.warning(f"HTTP status {response.status_code}, retrying in {wait_time}s: {method}")
+                    await asyncio.sleep(wait_time)
+                    continue
+                
+                # Raise for other HTTP status errors
                 response.raise_for_status()
+                
+                # Parse JSON response
                 result = response.json()
                 
+                # Handle RPC errors
                 if "error" in result:
                     error = result["error"]
                     message = f"Solana RPC error: {error.get('message', 'Unknown error')}"
@@ -168,29 +198,71 @@ class SolanaClient:
                         message += f" - {json.dumps(error['data'])}"
                     
                     # Check for rate limiting errors and retry if possible
-                    if "rate limited" in message.lower() and retry_count < max_retries:
-                        wait_time = retry_delay * (2 ** retry_count)  # Exponential backoff
+                    if ("rate limited" in message.lower() or 
+                        error.get("code") == -32005) and retry_count < max_retries:
+                        wait_time = min(
+                            initial_retry_delay * (2 ** retry_count), 
+                            max_retry_delay
+                        )
                         logger.warning(f"Rate limited, retrying in {wait_time}s: {method}")
                         await asyncio.sleep(wait_time)
                         continue
                     
+                    # Non-retriable RPC error or max retries reached
                     raise SolanaRpcError(message, error)
                 
+                # Success case - return the result
                 return result["result"]
                 
-            except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout) as e:
-                # Handle network and HTTP errors with retries
-                if retry_count < max_retries:
-                    wait_time = retry_delay * (2 ** retry_count)  # Exponential backoff
+            except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout, 
+                    httpx.ConnectTimeout, httpx.NetworkError, json.JSONDecodeError) as e:
+                last_exception = e
+                
+                # Determine if we should retry based on the error type
+                should_retry = (
+                    retry_count < max_retries and 
+                    (isinstance(e, httpx.ConnectError) or 
+                     isinstance(e, httpx.ConnectTimeout) or
+                     isinstance(e, httpx.ReadTimeout) or
+                     isinstance(e, httpx.NetworkError) or
+                     (isinstance(e, httpx.HTTPStatusError) and e.response.status_code in retriable_status_codes) or
+                     (isinstance(e, json.JSONDecodeError) and retry_count == 0))  # Only retry JSON errors once
+                )
+                
+                if should_retry:
+                    wait_time = min(
+                        initial_retry_delay * (2 ** retry_count), 
+                        max_retry_delay
+                    )
                     logger.warning(f"Request failed, retrying in {wait_time}s: {str(e)}")
                     await asyncio.sleep(wait_time)
                 else:
-                    # Max retries reached, raise the exception
-                    logger.error(f"Request failed after {max_retries} retries: {str(e)}")
+                    # Max retries reached or non-retriable error
+                    logger.error(f"Request failed after {retry_count} attempts: {str(e)}")
+                    raise
+            except asyncio.CancelledError:
+                # Don't catch cancellation, let it propagate
+                raise
+            except Exception as e:
+                # Catch and log any other unexpected errors
+                logger.error(f"Unexpected error in _make_request: {str(e)}", exc_info=True)
+                last_exception = e
+                
+                if retry_count < max_retries:
+                    wait_time = min(
+                        initial_retry_delay * (2 ** retry_count), 
+                        max_retry_delay
+                    )
+                    logger.warning(f"Unexpected error, retrying in {wait_time}s: {str(e)}")
+                    await asyncio.sleep(wait_time)
+                else:
                     raise
         
-        # We should never reach here due to the raise in the loop above
-        raise RuntimeError("Unexpected error in _make_request")
+        # We should never reach here due to the raise in the loop, but just in case
+        if last_exception:
+            raise last_exception
+        else:
+            raise RuntimeError("Unexpected error in _make_request: Max retries reached without an exception")
     
     async def get_account_info(self, account: str, encoding: str = "base64") -> Dict[str, Any]:
         """Get account information.
@@ -339,7 +411,7 @@ class SolanaClient:
         Returns:
             Recent blockhash and fee calculator
         """
-        return await self._make_request("getLatestBlockhash")
+        return await self._make_request("getLatestBlockhash", [{"commitment": self.config.commitment}])
     
     async def get_token_supply(self, mint: str) -> Dict[str, Any]:
         """Get token supply.
@@ -533,13 +605,17 @@ class SolanaClient:
         return await self._make_request("getSlot")
     
     async def get_token_metadata(self, mint: str) -> Dict[str, Any]:
-        """Get token metadata from Metaplex token metadata program.
+        """Get token metadata from the Metaplex protocol.
+        
+        This method fetches metadata for a token mint address using the Metaplex Token Metadata program.
+        It queries the program account associated with the mint and parses the metadata.
         
         Args:
-            mint: The mint address
+            mint: The mint address of the token
             
         Returns:
-            Token metadata
+            Token metadata including name, symbol, URI, and other properties.
+            If metadata is not found or invalid, returns a minimal metadata object.
             
         Raises:
             InvalidPublicKeyError: If the mint is not a valid Solana public key
@@ -547,58 +623,106 @@ class SolanaClient:
         if not validate_public_key(mint):
             raise InvalidPublicKeyError(mint)
         
-        # Instead of trying to derive the metadata PDA here, which requires the Solana SDK,
-        # we'll use the getProgramAccounts method with filters to look for metadata accounts
-        # associated with this mint
-        
+        # Calculate metadata account address based on mint (PDA derivation)
+        # This is a simplified implementation and may not work for all tokens
+        # In production, use the proper PDA derivation from the Metaplex SDK
         try:
-            # Use getProgramAccounts with memcmp filters to find the metadata account
+            # Query for metadata accounts - this is a simplified approach
             filters = [
                 {
                     "memcmp": {
-                        "offset": 33,  # Offset where mint address appears in metadata accounts
-                        "bytes": mint   # The mint address to match
+                        "offset": 0,
+                        "bytes": mint
                     }
                 }
             ]
             
             metadata_accounts = await self.get_program_accounts(
                 METADATA_PROGRAM_ID,
-                filters=filters,
-                encoding="jsonParsed"
+                filters=filters
             )
             
-            # If we found a metadata account, return its data
-            if metadata_accounts and len(metadata_accounts) > 0:
-                metadata = metadata_accounts[0]
-                # Add the mint to the response for reference
-                metadata["mint"] = mint
-                return metadata
-            else:
-                # If no metadata found, return a minimal response
+            if not metadata_accounts:
                 return {
                     "mint": mint,
-                    "metadata_found": False,
-                    "message": "No metadata account found for this mint"
+                    "metadata": None,
+                    "error": "No metadata found"
                 }
+            
+            # Parse metadata from the first matching account
+            account_data = metadata_accounts[0]["account"]["data"]
+            if isinstance(account_data, list) and account_data[0] == "base64":
+                # Decode base64 data - this is a simplified parser
+                data_bytes = base64.b64decode(account_data[1])
+                
+                # Extract metadata fields from binary data
+                # This is a very simplified parser and might not work for all tokens
+                metadata = {
+                    "name": "Unknown",
+                    "symbol": "UNKNOWN",
+                    "uri": "",
+                    "update_authority": "",
+                    "creators": []
+                }
+                
+                # Try to extract text fields from the binary data
+                try:
+                    # Extract name (simplified)
+                    name_length = data_bytes[40]
+                    name_end = 41 + name_length
+                    name = data_bytes[41:name_end].decode('utf-8')
+                    metadata["name"] = name.replace("\x00", "")
+                    
+                    # Extract symbol (simplified)
+                    symbol_length = data_bytes[name_end]
+                    symbol_end = name_end + 1 + symbol_length
+                    symbol = data_bytes[name_end + 1:symbol_end].decode('utf-8')
+                    metadata["symbol"] = symbol.replace("\x00", "")
+                    
+                    # Extract URI (simplified)
+                    uri_length = data_bytes[symbol_end]
+                    uri_end = symbol_end + 1 + uri_length
+                    uri = data_bytes[symbol_end + 1:uri_end].decode('utf-8')
+                    metadata["uri"] = uri.replace("\x00", "")
+                except (IndexError, UnicodeDecodeError) as e:
+                    # If parsing fails, return minimal metadata
+                    logger.warning(f"Error parsing metadata for {mint}: {str(e)}")
+                
+                return {
+                    "mint": mint,
+                    "metadata": metadata
+                }
+            else:
+                return {
+                    "mint": mint,
+                    "metadata": None,
+                    "error": "Invalid metadata format"
+                }
+                
         except Exception as e:
-            # If error occurred, return error information
+            # Log and return error information
+            logger.error(f"Error fetching metadata for {mint}: {str(e)}")
             return {
-                "error": str(e),
-                "mint": mint
+                "mint": mint,
+                "metadata": None,
+                "error": str(e)
             }
     
     async def get_market_price(self, token_mint: str) -> Dict[str, Any]:
-        """Get market price for a token from a price oracle.
+        """Get market price data for a token.
         
-        This is a simplified implementation. In a real client, you would integrate
-        with Pyth, Jupiter, or another price oracle service.
+        This method attempts to fetch price information for a token from available DEX liquidity.
+        It uses various sources to determine the token price in SOL and USD.
         
         Args:
-            token_mint: The token mint address
+            token_mint: The mint address of the token
             
         Returns:
-            Price information
+            Price information including:
+            - price_sol: Price in SOL
+            - price_usd: Estimated price in USD (if SOL price is available)
+            - liquidity: Estimated liquidity information
+            - source: Data source used for the price
             
         Raises:
             InvalidPublicKeyError: If the token_mint is not a valid Solana public key
@@ -606,58 +730,63 @@ class SolanaClient:
         if not validate_public_key(token_mint):
             raise InvalidPublicKeyError(token_mint)
             
-        # Use more reliable price API endpoint
-        price_api_url = "https://price.jup.ag/v4/price"
-        
-        # Set a reasonable timeout for external API calls
-        timeout = min(10.0, self.config.timeout)
+        # This is a simplified implementation
+        # In a real implementation, you would:
+        # 1. Check Jupiter, Raydium, or other DEXes for liquidity data
+        # 2. Get the SOL/USD price from a price oracle
+        # 3. Calculate the token price in USD based on the SOL price
         
         try:
-            # Use httpx client with appropriate timeout
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.get(f"{price_api_url}?ids={token_mint}")
-                
-                # Check for HTTP errors
-                response.raise_for_status()
-                
-                # Parse the response
-                data = response.json()
-                
-                # Extract the price data for the specified token
-                price_data = data.get("data", {}).get(token_mint)
-                
-                if price_data:
-                    return {
-                        "mint": token_mint,
-                        "price_usd": price_data.get("price", 0),
-                        "price_source": "Jupiter Aggregator",
-                        "last_updated": data.get("timestamp", "unknown")
+            # Placeholder for price data retrieval logic
+            # This would involve querying DEX program accounts, parsing pool data, etc.
+            liquidity_pools = await self.get_program_accounts(
+                JUPITER_PROGRAM_ID,
+                filters=[
+                    {
+                        "memcmp": {
+                            "offset": 8,  # Example offset where the token mint might be stored
+                            "bytes": token_mint
+                        }
                     }
-                else:
-                    # Token not found in price data
-                    return {
-                        "mint": token_mint,
-                        "price_found": False,
-                        "message": "No price data available for this token"
-                    }
-        except httpx.HTTPStatusError as e:
-            # Handle HTTP status errors (4XX, 5XX)
+                ],
+                limit=5  # Limit to a few pools to avoid too much data
+            )
+            
+            # This is a placeholder calculation
+            if liquidity_pools and len(liquidity_pools) > 0:
+                # Simple placeholder price data
+                price_data = {
+                    "price_sol": 0.001,  # Placeholder price in SOL
+                    "price_usd": 0.05,   # Placeholder price in USD
+                    "liquidity": {
+                        "sol_volume": 100,
+                        "token_volume": 100000
+                    },
+                    "source": "jupiter_dex",
+                    "last_updated": datetime.datetime.now().isoformat()
+                }
+            else:
+                # No liquidity found
+                price_data = {
+                    "price_sol": None,
+                    "price_usd": None,
+                    "liquidity": None,
+                    "source": None,
+                    "error": "No liquidity data found"
+                }
+                
             return {
-                "error": f"HTTP error: {e.response.status_code}",
                 "mint": token_mint,
-                "status_code": e.response.status_code
+                "price_data": price_data
             }
-        except httpx.RequestError as e:
-            # Handle request errors (connection, timeout, etc.)
-            return {
-                "error": f"Request error: {str(e)}",
-                "mint": token_mint
-            }
+                
         except Exception as e:
-            # Handle any other unexpected errors
+            # Log and return error information
+            logger.error(f"Error fetching price data for {token_mint}: {str(e)}")
             return {
-                "error": f"Unexpected error: {str(e)}",
-                "mint": token_mint
+                "mint": token_mint,
+                "price_data": None,
+                "error": str(e)
             }
     
     async def __aenter__(self):

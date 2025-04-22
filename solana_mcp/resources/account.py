@@ -1,24 +1,40 @@
 """Account resources for the Solana MCP server."""
 
 import json
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from mcp.server.fastmcp import Context
 
 from solana_mcp.solana_client import SolanaClient, InvalidPublicKeyError, SolanaRpcError
 
 
-async def get_account(ctx: Context, address: str) -> str:
+async def get_account(address: str, *, ctx: Optional[Context] = None) -> str:
     """Get Solana account information.
     
     Args:
-        ctx: The request context
         address: The account address
+        ctx: The request context (injected by MCP)
         
     Returns:
         Account information as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
+    # Get client from context or create new one
+    if ctx:
+        solana_client = ctx.request_context.lifespan_context.solana_client
+    else:
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            try:
+                account_info = await solana_client.get_account_info(address, encoding="jsonParsed")
+                return json.dumps(account_info, indent=2)
+            except InvalidPublicKeyError as e:
+                return json.dumps({"error": str(e)})
+            except SolanaRpcError as e:
+                return json.dumps({"error": str(e), "details": e.error_data})
+            except Exception as e:
+                return json.dumps({"error": f"Unexpected error: {str(e)}"})
+    
+    # If we got here, we're using the context's client
     try:
         account_info = await solana_client.get_account_info(address, encoding="jsonParsed")
         return json.dumps(account_info, indent=2)
@@ -30,17 +46,38 @@ async def get_account(ctx: Context, address: str) -> str:
         return json.dumps({"error": f"Unexpected error: {str(e)}"})
 
 
-async def get_balance(ctx: Context, address: str) -> str:
+async def get_balance(address: str, *, ctx: Optional[Context] = None) -> str:
     """Get Solana account balance.
     
     Args:
-        ctx: The request context
         address: The account address
+        ctx: The request context (injected by MCP)
         
     Returns:
         Account balance in SOL
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
+    # Get client from context or create new one
+    if ctx:
+        solana_client = ctx.request_context.lifespan_context.solana_client
+    else:
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            try:
+                balance_lamports = await solana_client.get_balance(address)
+                balance_sol = balance_lamports / 1_000_000_000  # Convert lamports to SOL
+                return json.dumps({
+                    "lamports": balance_lamports,
+                    "sol": balance_sol,
+                    "formatted": f"{balance_sol} SOL ({balance_lamports} lamports)"
+                }, indent=2)
+            except InvalidPublicKeyError as e:
+                return json.dumps({"error": str(e)})
+            except SolanaRpcError as e:
+                return json.dumps({"error": str(e), "details": e.error_data})
+            except Exception as e:
+                return json.dumps({"error": f"Unexpected error: {str(e)}"})
+    
+    # If we got here, we're using the context's client
     try:
         balance_lamports = await solana_client.get_balance(address)
         balance_sol = balance_lamports / 1_000_000_000  # Convert lamports to SOL
@@ -57,17 +94,31 @@ async def get_balance(ctx: Context, address: str) -> str:
         return json.dumps({"error": f"Unexpected error: {str(e)}"})
 
 
-async def get_account_with_programs(ctx: Context, address: str) -> str:
+async def get_account_with_programs(address: str, *, ctx: Optional[Context] = None) -> str:
     """Get Solana account information with program details.
     
     Args:
-        ctx: The request context
         address: The account address
+        ctx: The request context (injected by MCP)
         
     Returns:
         Enhanced account information as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
+    # Get client from context or create new one
+    if ctx:
+        solana_client = ctx.request_context.lifespan_context.solana_client
+    else:
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            # Continue with the same logic as before, just using the client directly
+            return await _get_account_with_programs_impl(solana_client, address)
+    
+    # If we got here, we're using the context's client
+    return await _get_account_with_programs_impl(solana_client, address)
+
+
+async def _get_account_with_programs_impl(solana_client: SolanaClient, address: str) -> str:
+    """Implementation for get_account_with_programs."""
     try:
         # Get basic account info
         account_info = await solana_client.get_account_info(address, encoding="jsonParsed")
@@ -111,18 +162,32 @@ async def get_account_with_programs(ctx: Context, address: str) -> str:
         return json.dumps({"error": f"Unexpected error: {str(e)}"})
 
 
-async def get_associated_accounts(ctx: Context, address: str, account_type: str = "all") -> str:
+async def get_associated_accounts(address: str, account_type: str = "all", *, ctx: Optional[Context] = None) -> str:
     """Get accounts associated with an address.
     
     Args:
-        ctx: The request context
         address: The account address
         account_type: Type of accounts to return (all, token, nft)
+        ctx: The request context (injected by MCP)
         
     Returns:
         Associated accounts as JSON string
     """
-    solana_client = ctx.request_context.lifespan_context.solana_client
+    # Get client from context or create new one
+    if ctx:
+        solana_client = ctx.request_context.lifespan_context.solana_client
+    else:
+        from solana_mcp.solana_client import get_solana_client
+        async with get_solana_client() as solana_client:
+            # Continue with the same logic as before, just using the client directly
+            return await _get_associated_accounts_impl(solana_client, address, account_type)
+    
+    # If we got here, we're using the context's client
+    return await _get_associated_accounts_impl(solana_client, address, account_type)
+
+
+async def _get_associated_accounts_impl(solana_client: SolanaClient, address: str, account_type: str) -> str:
+    """Implementation for get_associated_accounts."""
     try:
         result = {"address": address, "associated_accounts": []}
         
@@ -193,8 +258,23 @@ def register_resources(app):
     Args:
         app: The FastMCP app instance
     """
-    app.resource("solana://account/{address}")(get_account)
-    app.resource("solana://balance/{address}")(get_balance)
-    app.resource("solana://account/{address}/enhanced")(get_account_with_programs)
-    app.resource("solana://account/{address}/associated")(get_associated_accounts)
-    app.resource("solana://account/{address}/associated/{account_type}")(get_associated_accounts) 
+    # Define wrapper functions that match the URI parameter exactly without ctx
+    @app.resource("solana://account/{address}")
+    async def account_resource(address: str) -> str:
+        return await get_account(address, ctx=None)
+        
+    @app.resource("solana://balance/{address}")
+    async def balance_resource(address: str) -> str:
+        return await get_balance(address, ctx=None)
+        
+    @app.resource("solana://account/{address}/enhanced")
+    async def enhanced_account_resource(address: str) -> str:
+        return await get_account_with_programs(address, ctx=None)
+        
+    @app.resource("solana://account/{address}/associated")
+    async def associated_accounts_resource(address: str) -> str:
+        return await get_associated_accounts(address, ctx=None)
+        
+    @app.resource("solana://account/{address}/associated/{account_type}")
+    async def associated_accounts_by_type_resource(address: str, account_type: str) -> str:
+        return await get_associated_accounts(address, account_type, ctx=None) 

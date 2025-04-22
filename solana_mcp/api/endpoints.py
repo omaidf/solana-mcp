@@ -91,6 +91,136 @@ async def rest_get_balance(request: Request) -> JSONResponse:
 
 
 @with_error_handling
+@rate_limit(requests_per_minute=60)
+async def rest_get_token_info(request: Request) -> JSONResponse:
+    """REST API endpoint for getting token information.
+    
+    Args:
+        request: The HTTP request
+        
+    Returns:
+        Token information as JSON
+    """
+    mint = request.path_params.get("mint")
+    if not mint:
+        return JSONResponse({
+            "error": "Missing mint parameter",
+            "error_explanation": "The token mint address must be provided in the URL path."
+        }, status_code=400)
+        
+    solana_client = request.app.state.solana_client
+    
+    # Get token metadata
+    metadata = await solana_client.get_token_metadata(mint)
+    
+    # Get token supply
+    supply = await solana_client.get_token_supply(mint)
+    
+    # Get token price if available
+    price_data = await solana_client.get_market_price(mint)
+    
+    # Combine data
+    token_info = {
+        "mint": mint,
+        "metadata": metadata,
+        "supply": supply,
+        "price": price_data
+    }
+    
+    return JSONResponse(token_info)
+
+
+@with_error_handling
+@rate_limit(requests_per_minute=30)
+async def rest_get_transactions(request: Request) -> JSONResponse:
+    """REST API endpoint for getting transaction history.
+    
+    Args:
+        request: The HTTP request
+        
+    Returns:
+        Transaction information as JSON
+    """
+    address = request.path_params.get("address")
+    if not address:
+        return JSONResponse({
+            "error": "Missing address parameter",
+            "error_explanation": "The account address must be provided in the URL path."
+        }, status_code=400)
+    
+    # Get optional query parameters
+    limit = request.query_params.get("limit")
+    if limit:
+        try:
+            limit = int(limit)
+            if limit < 1 or limit > 100:
+                return JSONResponse({
+                    "error": "Invalid limit parameter",
+                    "error_explanation": "Limit must be between 1 and 100."
+                }, status_code=400)
+        except ValueError:
+            return JSONResponse({
+                "error": "Invalid limit parameter",
+                "error_explanation": "Limit must be an integer."
+            }, status_code=400)
+    else:
+        limit = 20  # Default
+    
+    solana_client = request.app.state.solana_client
+    
+    # Get signatures for address
+    signatures = await solana_client.get_signatures_for_address(address, limit=limit)
+    
+    # Return list of signatures
+    return JSONResponse({
+        "address": address,
+        "signatures": signatures
+    })
+
+
+@with_error_handling
+@rate_limit(requests_per_minute=30)
+async def rest_get_nft_info(request: Request) -> JSONResponse:
+    """REST API endpoint for getting NFT information.
+    
+    Args:
+        request: The HTTP request
+        
+    Returns:
+        NFT information as JSON
+    """
+    mint = request.path_params.get("mint")
+    if not mint:
+        return JSONResponse({
+            "error": "Missing mint parameter",
+            "error_explanation": "The NFT mint address must be provided in the URL path."
+        }, status_code=400)
+        
+    solana_client = request.app.state.solana_client
+    
+    # Get token metadata
+    metadata = await solana_client.get_token_metadata(mint)
+    
+    # Determine if it's an NFT (supply of 1, etc.)
+    supply = await solana_client.get_token_supply(mint)
+    
+    # Check if this is an NFT
+    is_nft = False
+    if "value" in supply and supply["value"]["amount"] == "1" and supply["value"]["decimals"] == 0:
+        is_nft = True
+    
+    # Return NFT info
+    nft_info = {
+        "mint": mint,
+        "is_nft": is_nft,
+        "metadata": metadata,
+        "supply": supply
+    }
+    
+    return JSONResponse(nft_info)
+
+
+@with_error_handling
 @with_validation(NlpQueryRequest)
 @rate_limit(requests_per_minute=30)  # More restrictive for expensive operations
 async def rest_nlp_query(request: Request, validated_data: NlpQueryRequest) -> JSONResponse:
