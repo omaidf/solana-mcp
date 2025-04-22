@@ -1,5 +1,6 @@
 anyio
 base58
+cachetools
 click
 fastapi
 httpx
