@@ -223,30 +223,37 @@ class TokenRiskAnalyzer:
                 if isinstance(data, list) and len(data) >= 2 and data[1] == "base64":
                     decoded_data = base64.b64decode(data[0])
                     
-                    # Parse the SPL Token mint data
-                    # Real implementation would use proper layout parsing
-                    # For a simplified version, we're checking specific bytes
+                    # Parse the SPL Token mint data using proper layout
+                    # SPL Token Mint Layout:
+                    # - mint_authority: PublicKey or null option (1 + 32 bytes)
+                    # - supply: u64 (8 bytes)
+                    # - decimals: u8 (1 byte)
+                    # - is_initialized: bool (1 byte)
+                    # - freeze_authority: PublicKey or null option (1 + 32 bytes)
                     
                     # Check if mint authority is present (not null)
-                    # In SPL Token, mint authority is at offset 0 (after header)
-                    has_mint_authority = not all(b == 0 for b in decoded_data[4:36])
-                    
-                    # Freeze authority is after mint authority
-                    has_freeze_authority = not all(b == 0 for b in decoded_data[36:68])
+                    # Option<Pubkey> is encoded as a byte followed by the pubkey bytes if present
+                    mint_authority_option = decoded_data[0]
+                    has_mint_authority = mint_authority_option == 1
                     
                     result["has_mint_authority"] = has_mint_authority
-                    result["has_freeze_authority"] = has_freeze_authority
                     
-                    # If authorities exist, extract their addresses
+                    # Get mint authority if present
                     if has_mint_authority:
-                        # Extract mint authority public key from bytes
-                        mint_auth_bytes = decoded_data[4:36]
+                        mint_auth_bytes = decoded_data[1:33]
                         mint_auth_address = str(PublicKey(bytes(mint_auth_bytes)))
                         result["mint_authority"] = mint_auth_address
-                        
+                    
+                    # Skip supply (8 bytes), decimals (1 byte), and is_initialized (1 byte)
+                    # to get to freeze authority option at offset 33 + 8 + 1 + 1 = 43
+                    freeze_authority_option = decoded_data[43]
+                    has_freeze_authority = freeze_authority_option == 1
+                    
+                    result["has_freeze_authority"] = has_freeze_authority
+                    
+                    # Get freeze authority if present
                     if has_freeze_authority:
-                        # Extract freeze authority public key from bytes
-                        freeze_auth_bytes = decoded_data[36:68]
+                        freeze_auth_bytes = decoded_data[44:76]
                         freeze_auth_address = str(PublicKey(bytes(freeze_auth_bytes)))
                         result["freeze_authority"] = freeze_auth_address
                     
