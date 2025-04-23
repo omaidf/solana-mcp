@@ -3,13 +3,14 @@
 # Standard library imports
 import functools
 from typing import List, Dict, Any, Optional
+import base64
 
 # Third-party library imports
 from fastapi import APIRouter, HTTPException, Depends, Query, Request, Path
 
 # Internal imports
 from solana_mcp.token_risk_analyzer import TokenRiskAnalyzer
-from solana_mcp.solana_client import get_solana_client, InvalidPublicKeyError
+from solana_mcp.solana_client import get_solana_client, InvalidPublicKeyError, PublicKey
 from solana_mcp.logging_config import get_logger, log_with_context
 from solana_mcp.api_routes.token_analysis import handle_token_exceptions
 
@@ -262,6 +263,8 @@ async def get_meme_tokens(
     request: Request,
     category: Optional[str] = Query(None, description="Filter by token category (Animal, Food, Tech, Meme, Other)"),
     limit: int = Query(10, ge=1, le=100, description="Maximum number of tokens to return"),
+    min_holders: int = Query(0, ge=0, description="Minimum number of holders"),
+    min_liquidity: float = Query(0, ge=0, description="Minimum liquidity in USD"),
     request_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Get a list of meme tokens.
@@ -270,6 +273,8 @@ async def get_meme_tokens(
         request: FastAPI request object
         category: Optional category filter
         limit: Maximum number of tokens to return
+        min_holders: Minimum number of holders
+        min_liquidity: Minimum liquidity in USD
         request_id: Optional request ID for tracing
         
     Returns:
@@ -284,124 +289,171 @@ async def get_meme_tokens(
         limit=limit
     )
     
-    # This would be a real implementation with a token database
-    # For now, we'll use hardcoded examples
-    
-    meme_tokens = [
-        {
-            "mint": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
-            "name": "Bonk",
-            "symbol": "BONK",
-            "category": "Animal",
-            "price_usd": 0.000012,
-            "market_cap": 750000000,
-            "holders": 125000
-        },
-        {
-            "mint": "5tN42n9vMi6ubp67Uy4NnmM5DMZYN8aS8GeB3bEDHr6E",
-            "name": "Popcat",
-            "symbol": "POPCAT",
-            "category": "Animal",
-            "price_usd": 0.000003,
-            "market_cap": 3000000,
-            "holders": 12000
-        },
-        {
-            "mint": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
-            "name": "Bork",
-            "symbol": "BORK",
-            "category": "Animal",
-            "price_usd": 0.0000025,
-            "market_cap": 2500000,
-            "holders": 8500
-        },
-        {
-            "mint": "9nEqaUcb16sQ3Tn1psbkWqyhPdLmfHWjKGymREjsAgTE",
-            "name": "Mochi",
-            "symbol": "MOCHI",
-            "category": "Food",
-            "price_usd": 0.0000015,
-            "market_cap": 1500000,
-            "holders": 4200
-        },
-        {
-            "mint": "E1zCt2RzV4qQvXi6XWqQXDKGh7NLwd4nXyfYYKkUXYdE",
-            "name": "Wojak",
-            "symbol": "WOJAK",
-            "category": "Meme",
-            "price_usd": 0.000008,
-            "market_cap": 8000000,
-            "holders": 15000
-        },
-        {
-            "mint": "F4vMh8WONrUKaP3XrivHQT3MQ3F5EMqSYNL5JGzV4q9T",
-            "name": "Solana Pizza",
-            "symbol": "PIZZA",
-            "category": "Food",
-            "price_usd": 0.000005,
-            "market_cap": 5000000,
-            "holders": 9800
-        },
-        {
-            "mint": "7HCXYsQJ1J2rNhz87WQvL1NWz5RZ5N5eLrKoYxL7nkLj",
-            "name": "Moonbot",
-            "symbol": "MBOT",
-            "category": "Tech",
-            "price_usd": 0.00019,
-            "market_cap": 19000000,
-            "holders": 22000
-        },
-        {
-            "mint": "9nt2QCrZbJJnbHWQQe2uKxR1BKMBpGfhNKgHYngKA46W",
-            "name": "Crypto Ape",
-            "symbol": "CAPE",
-            "category": "Animal",
-            "price_usd": 0.000045,
-            "market_cap": 4500000,
-            "holders": 7300
-        },
-        {
-            "mint": "6c4L6fGYDbM5wJdSaeFH2edNdmXnvM6ohnNL2yjrTXEM",
-            "name": "SolDoge",
-            "symbol": "SOGE",
-            "category": "Animal",
-            "price_usd": 0.000018,
-            "market_cap": 1800000,
-            "holders": 5400
-        },
-        {
-            "mint": "8RJgU7hzRbS2kCL98PETR2da121eTvBhZpz3GHLTcRST",
-            "name": "Solana Based",
-            "symbol": "BASED",
-            "category": "Meme",
-            "price_usd": 0.0000075,
-            "market_cap": 750000,
-            "holders": 2100
+    async with get_solana_client() as client:
+        analyzer = TokenRiskAnalyzer(client)
+        
+        # Get popular token mints dynamically
+        popular_token_mints = []
+        
+        # Try to get popular tokens from client
+        try:
+            # Get top tokens by volume, market cap, and social activity
+            popular_tokens = await client.get_popular_tokens(limit=30)
+            popular_token_mints = [token["mint"] for token in popular_tokens if "mint" in token]
+            
+            logger.info(f"Retrieved {len(popular_token_mints)} popular tokens from client API")
+        except Exception as e:
+            logger.warning(f"Error retrieving popular tokens: {str(e)}")
+            
+            # Fallback list only if client API fails - using well-known tokens
+            # This is just a safety measure and should rarely be used
+            popular_token_mints = [
+                "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",  # BONK
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+                "5tN42n9vMi6ubp67Uy4NnmM5DMZYN8aS8GeB3bEDHr6E",  # POPCAT
+                "KiTASSNKG8KQhTj2Go5kJH6yw53poXz8NFMHJmFTGLn",   # DOGE
+                "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",  # BORK
+                "9nEqaUcb16sQ3Tn1psbkWqyhPdLmfHWjKGymREjsAgTE",  # MOCHI
+                "E1zCt2RzV4qQvXi6XWqQXDKGh7NLwd4nXyfYYKkUXYdE",  # WOJAK
+                "F4vMh8WONrUKaP3XrivHQT3MQ3F5EMqSYNL5JGzV4q9T",  # PIZZA
+                "dogSmMYV9G4Qyd22LkuRKLnuZVBJiKNQw7qgRWfSoZg"    # WIF
+            ]
+            logger.warning("Using fallback list of popular tokens")
+        
+        # Analyze each token to collect information
+        tokens_data = []
+        analyzed_count = 0
+        
+        for mint in popular_token_mints:
+            # Limit the number of tokens to analyze to avoid long processing time
+            if analyzed_count >= min(30, limit * 2):
+                break
+                
+            try:
+                # Get basic token data
+                token_metadata = await client.get_token_metadata(mint)
+                token_name = token_metadata.get("metadata", {}).get("name", "Unknown")
+                token_symbol = token_metadata.get("metadata", {}).get("symbol", "UNKNOWN")
+                
+                # Skip tokens with no name or symbol
+                if token_name == "Unknown" or token_symbol == "UNKNOWN":
+                    continue
+                
+                # Determine token category
+                token_category = analyzer._categorize_token(token_name, token_symbol)
+                
+                # Skip non-meme tokens if category specified
+                if category and token_category != category:
+                    continue
+                
+                # Get token market data
+                market_data = await client.get_market_price(mint)
+                price_usd = market_data.get("price_data", {}).get("price_usd", 0)
+                liquidity = market_data.get("price_data", {}).get("liquidity", {}).get("total_usd", 0)
+                
+                # Skip tokens with too little liquidity
+                if liquidity < min_liquidity:
+                    continue
+                
+                # Get token supply
+                supply_info = await client.get_token_supply(mint)
+                total_supply = float(supply_info.get("value", {}).get("uiAmountString", "0"))
+                
+                # Calculate market cap
+                market_cap = price_usd * total_supply
+                
+                # Get holder data (simplified)
+                holder_data = {"total_holders": 0}
+                try:
+                    token_accounts = await client.get_token_largest_accounts(mint)
+                    if "value" in token_accounts:
+                        holder_data["total_holders"] = len(token_accounts["value"])
+                except Exception as e:
+                    logger.warning(f"Error getting token holders for {mint}: {str(e)}")
+                
+                # Skip tokens with too few holders
+                if holder_data["total_holders"] < min_holders:
+                    continue
+                
+                # Add token to results
+                tokens_data.append({
+                    "mint": mint,
+                    "name": token_name,
+                    "symbol": token_symbol,
+                    "category": token_category,
+                    "price_usd": price_usd,
+                    "market_cap": market_cap,
+                    "liquidity_usd": liquidity,
+                    "holders": holder_data["total_holders"]
+                })
+                
+                analyzed_count += 1
+                
+            except Exception as e:
+                logger.warning(f"Error analyzing token {mint}: {str(e)}")
+        
+        # If we couldn't find enough tokens dynamically, use a more dynamic query approach
+        if not tokens_data:
+            logger.warning("Could not find tokens dynamically, using backup method")
+            try:
+                # Query top tokens by market cap from client
+                top_tokens = await client.get_top_tokens(limit=limit)
+                
+                for token in top_tokens:
+                    mint = token.get("mint")
+                    if not mint:
+                        continue
+                        
+                    # Get basic token data
+                    token_metadata = await client.get_token_metadata(mint)
+                    token_name = token_metadata.get("metadata", {}).get("name", "Unknown")
+                    token_symbol = token_metadata.get("metadata", {}).get("symbol", "UNKNOWN")
+                    
+                    # Determine token category
+                    token_category = analyzer._categorize_token(token_name, token_symbol)
+                    
+                    # Skip non-meme tokens if category specified
+                    if category and token_category != category:
+                        continue
+                    
+                    tokens_data.append({
+                        "mint": mint,
+                        "name": token_name,
+                        "symbol": token_symbol,
+                        "category": token_category,
+                        "price_usd": token.get("price_usd", 0),
+                        "market_cap": token.get("market_cap", 0),
+                        "liquidity_usd": token.get("liquidity_usd", 0),
+                        "holders": token.get("holders", 0)
+                    })
+            except Exception as e:
+                logger.error(f"Error querying top tokens: {str(e)}")
+                # As a last resort, return an empty list rather than hardcoded data
+                tokens_data = []
+        
+        # Filter by category if specified
+        if category:
+            filtered_tokens = [token for token in tokens_data if token["category"] == category]
+        else:
+            filtered_tokens = tokens_data
+        
+        # Sort by market cap (descending) and limit
+        sorted_tokens = sorted(filtered_tokens, key=lambda x: x.get("market_cap", 0), reverse=True)[:limit]
+        
+        result = {
+            "tokens": sorted_tokens,
+            "total_count": len(filtered_tokens),
+            "category": category or "all",
+            "limit": limit
         }
-    ]
-    
-    # Filter by category if specified
-    if category:
-        filtered_tokens = [token for token in meme_tokens if token["category"] == category]
-    else:
-        filtered_tokens = meme_tokens
-    
-    # Sort by market cap (descending) and limit
-    sorted_tokens = sorted(filtered_tokens, key=lambda x: x["market_cap"], reverse=True)[:limit]
-    
-    result = {
-        "tokens": sorted_tokens,
-        "total_count": len(filtered_tokens),
-        "category": category or "all",
-        "limit": limit
-    }
-    
-    log_with_context(
-        logger,
-        "info",
-        f"Returning {len(sorted_tokens)} meme tokens",
-        request_id=request_id,
-        count=len(sorted_tokens)
-    )
-    
-    return result 
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Returning {len(sorted_tokens)} meme tokens",
+            request_id=request_id,
+            count=len(sorted_tokens)
+        )
+        
+        return result 

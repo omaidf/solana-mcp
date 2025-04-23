@@ -12,6 +12,7 @@ import logging
 from solana_mcp.solana_client import SolanaClient, InvalidPublicKeyError, SolanaRpcError
 from solana_mcp.logging_config import get_logger, log_with_context
 from solana_mcp.decorators import validate_solana_key, handle_errors
+from solana_mcp.solana_client import PublicKey
 
 # Set up logging
 logger = get_logger(__name__)
@@ -236,17 +237,19 @@ class TokenRiskAnalyzer:
                     result["has_mint_authority"] = has_mint_authority
                     result["has_freeze_authority"] = has_freeze_authority
                     
-                    # If authorities exist, try to get their addresses
+                    # If authorities exist, extract their addresses
                     if has_mint_authority:
-                        # In real implementation, extract the actual authority address
-                        # For now, we'll use a placeholder
-                        result["mint_authority"] = "MINT_AUTHORITY_ADDRESS"
+                        # Extract mint authority public key from bytes
+                        mint_auth_bytes = decoded_data[4:36]
+                        mint_auth_address = str(PublicKey(bytes(mint_auth_bytes)))
+                        result["mint_authority"] = mint_auth_address
                         
                     if has_freeze_authority:
-                        # In real implementation, extract the actual freeze authority
-                        # For now, we'll use a placeholder
-                        result["freeze_authority"] = "FREEZE_AUTHORITY_ADDRESS"
-                        
+                        # Extract freeze authority public key from bytes
+                        freeze_auth_bytes = decoded_data[36:68]
+                        freeze_auth_address = str(PublicKey(bytes(freeze_auth_bytes)))
+                        result["freeze_authority"] = freeze_auth_address
+                    
             # Try to get the token creator
             try:
                 # Get token creation transaction
@@ -348,7 +351,7 @@ class TokenRiskAnalyzer:
         try:
             # Get token market data
             price_data = await self.client.get_market_price(mint)
-            price = price_data.get("price", 0)
+            price = price_data.get("price_data", {}).get("price_usd", 0)
             
             # Get token supply
             supply_info = await self.client.get_token_supply(mint)
@@ -358,10 +361,6 @@ class TokenRiskAnalyzer:
             market_cap = price * total_supply
             
             # Get liquidity pools for the token
-            # In a real implementation, we would scan major DEXes (Raydium, Orca, etc.)
-            # For simplicity, we'll use a placeholder with reasonable values
-            
-            # Search for the token in Raydium and Orca pools
             from solana_mcp.liquidity_analyzer import LiquidityAnalyzer, RAYDIUM_LP_PROGRAM_ID, ORCA_SWAP_PROGRAM_ID
             
             liquidity_analyzer = LiquidityAnalyzer(self.client)
@@ -459,26 +458,194 @@ class TokenRiskAnalyzer:
             if market_cap > 0:
                 result["liquidity_to_mcap_ratio"] = total_liquidity / market_cap
             
-            # Check for liquidity locks
-            # In a real implementation, we would look for known liquidity locker contracts
-            # For now, we'll use a placeholder method to simulate lock detection
+            # Check for liquidity locks by looking at token vesting programs
+            has_locked_liquidity = False
+            lock_details = []
             
-            # Simulate liquidity lock detection
-            # In practice, this would involve checking token vesting programs
-            # or timelock contracts that hold LP tokens
-            has_locked_liquidity = total_liquidity > 50000  # Just a placeholder condition
-            lock_percentage = 0.75 if has_locked_liquidity else 0
+            # Known liquidity locker program IDs
+            BONFIDA_VESTING_PROGRAM_ID = "CChTq6PthWU82YZkbveA3WDf7s97BWhBK4Vx9bmsT743"
+            STREAMFLOW_VESTING_PROGRAM_ID = "8e72pYCDaxu3GqMfeQ5r8wFgoZSYk6oua1Qo9XpsZjX"
+            
+            # Look for Bonfida locks first
+            try:
+                # Find LP token accounts that might be locked in vesting contracts
+                lp_token_mints = []
+                if largest_pool:
+                    # Get the LP token mint for the largest pool
+                    pool_address = largest_pool.get("address")
+                    pool_data = await self.client.get_account_info(pool_address)
+                    
+                    if "data" in pool_data and pool_data["data"]:
+                        data = pool_data["data"]
+                        if isinstance(data, list) and len(data) >= 2 and data[1] == "base64":
+                            decoded_data = base64.b64decode(data[0])
+                            
+                            # Extract LP token mint (offset varies by pool structure)
+                            # Here we're using a simplified approach
+                            try:
+                                lp_mint_offset = 168  # Typical offset for Raydium
+                                lp_mint_bytes = decoded_data[lp_mint_offset:lp_mint_offset+32]
+                                lp_token_mint = str(PublicKey(bytes(lp_mint_bytes)))
+                                lp_token_mints.append(lp_token_mint)
+                            except Exception as e:
+                                logger.warning(f"Error extracting LP token mint: {str(e)}")
+                
+                # For each LP token mint, look for vesting contracts that hold it
+                for lp_token_mint in lp_token_mints:
+                    # Get token accounts for this LP token
+                    lp_token_accounts = await self.client.get_token_largest_accounts(lp_token_mint)
+                    
+                    if "value" in lp_token_accounts:
+                        # For each LP token account, check if it's owned by a vesting contract
+                        for account in lp_token_accounts["value"][:5]:  # Check top 5 accounts
+                            token_account_address = account.get("address")
+                            token_account_info = await self.client.get_account_info(token_account_address)
+                            
+                            if "data" in token_account_info and token_account_info["data"]:
+                                data = token_account_info["data"]
+                                if isinstance(data, list) and len(data) >= 2 and data[1] == "base64":
+                                    decoded_data = base64.b64decode(data[0])
+                                    
+                                    # Extract owner
+                                    owner_offset = 32  # SPL token account owner is at offset 32
+                                    owner_bytes = decoded_data[owner_offset:owner_offset+32]
+                                    owner = str(PublicKey(bytes(owner_bytes)))
+                                    
+                                    # Check if this account is owned by a PDA of the vesting program
+                                    vesting_accounts = await self.client.get_program_accounts(
+                                        BONFIDA_VESTING_PROGRAM_ID,
+                                        filters=[
+                                            {"dataSize": 212},  # Size of Bonfida vesting accounts
+                                            {"memcmp": {"offset": 8, "bytes": owner}}  # Owner field
+                                        ],
+                                        limit=5
+                                    )
+                                    
+                                    if vesting_accounts and len(vesting_accounts) > 0:
+                                        # Extract vesting details from the contract
+                                        for vesting_account in vesting_accounts:
+                                            try:
+                                                vesting_data = vesting_account.get("account", {}).get("data")
+                                                if isinstance(vesting_data, list) and vesting_data[1] == "base64":
+                                                    v_data = base64.b64decode(vesting_data[0])
+                                                    
+                                                    # Extract important vesting data:
+                                                    # - Total locked amount
+                                                    # - Release schedule
+                                                    # - Lock end date
+                                                    
+                                                    # Simplified parsing (actual structure may vary)
+                                                    total_amount = int.from_bytes(v_data[40:48], byteorder="little")
+                                                    released_amount = int.from_bytes(v_data[48:56], byteorder="little")
+                                                    locked_amount = total_amount - released_amount
+                                                    
+                                                    # Get token decimals
+                                                    lp_token_info = await self.client.get_token_supply(lp_token_mint)
+                                                    decimals = lp_token_info.get("value", {}).get("decimals", 0)
+                                                    
+                                                    # Calculate USD value of locked LP tokens
+                                                    locked_percentage = locked_amount / total_amount if total_amount > 0 else 0
+                                                    locked_value_usd = largest_pool.get("liquidity_usd", 0) * locked_percentage
+                                                    
+                                                    # Extract end timestamp
+                                                    end_timestamp_bytes = v_data[72:80]
+                                                    end_timestamp = int.from_bytes(end_timestamp_bytes, byteorder="little")
+                                                    end_date = datetime.datetime.fromtimestamp(end_timestamp).isoformat()
+                                                    
+                                                    lock_details.append({
+                                                        "lock_contract": vesting_account.get("pubkey"),
+                                                        "contract_type": "bonfida",
+                                                        "locked_amount": locked_amount / (10 ** decimals),
+                                                        "locked_amount_usd": locked_value_usd,
+                                                        "lock_end_date": end_date,
+                                                        "lock_percentage": locked_percentage * 100
+                                                    })
+                                                    
+                                                    has_locked_liquidity = True
+                                            except Exception as e:
+                                                logger.warning(f"Error parsing Bonfida vesting data: {str(e)}")
+            except Exception as e:
+                logger.warning(f"Error checking for Bonfida locks: {str(e)}")
+            
+            # Now look for Streamflow locks
+            try:
+                # Similar approach as above, but using Streamflow program ID
+                for lp_token_mint in lp_token_mints:
+                    # Get token accounts for this LP token
+                    lp_token_accounts = await self.client.get_token_largest_accounts(lp_token_mint)
+                    
+                    if "value" in lp_token_accounts:
+                        # For each LP token account, check if it's owned by a vesting contract
+                        for account in lp_token_accounts["value"][:5]:  # Check top 5 accounts
+                            token_account_address = account.get("address")
+                            token_account_info = await self.client.get_account_info(token_account_address)
+                            
+                            if "data" in token_account_info and token_account_info["data"]:
+                                data = token_account_info["data"]
+                                if isinstance(data, list) and len(data) >= 2 and data[1] == "base64":
+                                    decoded_data = base64.b64decode(data[0])
+                                    
+                                    # Extract owner
+                                    owner_offset = 32  # SPL token account owner is at offset 32
+                                    owner_bytes = decoded_data[owner_offset:owner_offset+32]
+                                    owner = str(PublicKey(bytes(owner_bytes)))
+                                    
+                                    # Check if this account is owned by a PDA of the vesting program
+                                    vesting_accounts = await self.client.get_program_accounts(
+                                        STREAMFLOW_VESTING_PROGRAM_ID,
+                                        filters=[
+                                            {"dataSize": 329},  # Size of Streamflow vesting accounts
+                                            {"memcmp": {"offset": 33, "bytes": owner}}  # Owner field
+                                        ],
+                                        limit=5
+                                    )
+                                    
+                                    if vesting_accounts and len(vesting_accounts) > 0:
+                                        # Extract vesting details from the contract
+                                        for vesting_account in vesting_accounts:
+                                            try:
+                                                vesting_data = vesting_account.get("account", {}).get("data")
+                                                if isinstance(vesting_data, list) and vesting_data[1] == "base64":
+                                                    v_data = base64.b64decode(vesting_data[0])
+                                                    
+                                                    # Extract important vesting data
+                                                    # Streamflow contract has a different structure
+                                                    is_canceled = v_data[137] == 1
+                                                    
+                                                    if not is_canceled:
+                                                        total_amount = int.from_bytes(v_data[145:153], byteorder="little")
+                                                        claimed_amount = int.from_bytes(v_data[153:161], byteorder="little")
+                                                        locked_amount = total_amount - claimed_amount
+                                                        
+                                                        # Get token decimals
+                                                        lp_token_info = await self.client.get_token_supply(lp_token_mint)
+                                                        decimals = lp_token_info.get("value", {}).get("decimals", 0)
+                                                        
+                                                        # Calculate USD value of locked LP tokens
+                                                        locked_percentage = locked_amount / total_amount if total_amount > 0 else 0
+                                                        locked_value_usd = largest_pool.get("liquidity_usd", 0) * locked_percentage
+                                                        
+                                                        # Extract end timestamp
+                                                        end_timestamp = int.from_bytes(v_data[177:185], byteorder="little")
+                                                        end_date = datetime.datetime.fromtimestamp(end_timestamp).isoformat()
+                                                        
+                                                        lock_details.append({
+                                                            "lock_contract": vesting_account.get("pubkey"),
+                                                            "contract_type": "streamflow",
+                                                            "locked_amount": locked_amount / (10 ** decimals),
+                                                            "locked_amount_usd": locked_value_usd,
+                                                            "lock_end_date": end_date,
+                                                            "lock_percentage": locked_percentage * 100
+                                                        })
+                                                        
+                                                        has_locked_liquidity = True
+                                            except Exception as e:
+                                                logger.warning(f"Error parsing Streamflow vesting data: {str(e)}")
+            except Exception as e:
+                logger.warning(f"Error checking for Streamflow locks: {str(e)}")
             
             result["has_locked_liquidity"] = has_locked_liquidity
-            if has_locked_liquidity:
-                result["lock_details"] = [
-                    {
-                        "lock_contract": "SIMULATED_LOCK_CONTRACT",
-                        "locked_amount_usd": total_liquidity * lock_percentage,
-                        "lock_end_date": (datetime.datetime.now() + datetime.timedelta(days=180)).isoformat(),
-                        "lock_percentage": lock_percentage * 100
-                    }
-                ]
+            result["lock_details"] = lock_details
             
             # Calculate liquidity risk score
             liquidity_risk = 0
@@ -506,6 +673,24 @@ class TokenRiskAnalyzer:
             if not has_locked_liquidity:
                 liquidity_risk += 30
                 result["flags"].append("No detected liquidity locks")
+            else:
+                # Check lock duration - short locks are still risky
+                current_time = datetime.datetime.now().timestamp()
+                for lock in lock_details:
+                    try:
+                        end_date = datetime.datetime.fromisoformat(lock.get("lock_end_date")).timestamp()
+                        lock_duration_days = (end_date - current_time) / (60 * 60 * 24)
+                        
+                        if lock_duration_days < 30:
+                            liquidity_risk += 20
+                            result["flags"].append("Short-term liquidity lock (< 30 days)")
+                            break
+                        elif lock_duration_days < 90:
+                            liquidity_risk += 10
+                            result["flags"].append("Medium-term liquidity lock (< 90 days)")
+                            break
+                    except Exception:
+                        pass
                 
             # Cap the risk score at 100
             result["risk_score"] = min(100, liquidity_risk)

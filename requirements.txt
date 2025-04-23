@@ -2,6 +2,7 @@ anyio
 base58
 cachetools
 click
+colorama
 fastapi
 httpx
 itsdangerous

@@ -246,28 +246,40 @@ class TokenAnalyzer:
             mint=mint
         )
         
-        # This would typically call an external API or DEX aggregator
-        # For now, return a placeholder
-        price_data = {
-            "price_usd": 0.0,
-            "price_sol": 0.0,
-            "liquidity_usd": 0.0,
-            "market_cap_usd": 0.0,
-            "volume_24h_usd": 0.0,
-            "change_24h_percent": 0.0,
+        # Get market price data from the Solana client
+        price_result = await self.client.get_market_price(mint)
+        
+        # Extract price data or use default values if not available
+        price_data = price_result.get("price_data", {})
+        
+        # Construct a standardized response
+        response = {
+            "price_usd": price_data.get("price_usd", 0.0),
+            "price_sol": price_data.get("price_sol", 0.0),
+            "liquidity_usd": price_data.get("liquidity", {}).get("sol_volume", 0.0) if price_data.get("liquidity") else 0.0,
+            "market_cap_usd": 0.0,  # Would need additional calculation with supply
+            "volume_24h_usd": 0.0,  # Not available in the current implementation
+            "change_24h_percent": 0.0,  # Not available in the current implementation
             "dex_info": [],
-            "last_updated": datetime.datetime.now().isoformat()
+            "source": price_data.get("source", "unknown"),
+            "last_updated": price_data.get("last_updated", datetime.datetime.now().isoformat())
         }
+        
+        # If there was an error in the price data, include it
+        if "error" in price_result:
+            response["error"] = price_result["error"]
         
         log_with_context(
             logger,
             "info",
-            f"Token price completed for: {mint} (placeholder data)",
+            f"Token price completed for: {mint}",
             request_id=request_id,
-            mint=mint
+            mint=mint,
+            price_usd=response["price_usd"],
+            price_sol=response["price_sol"]
         )
         
-        return price_data
+        return response
 
     @validate_solana_key
     @handle_errors
@@ -386,11 +398,52 @@ class TokenAnalyzer:
             # Check if account exists
             if account_info and "result" in account_info and account_info["result"]:
                 # Process mint account data
-                # Note: This is simplified; in a real implementation, you'd parse the SPL token account data
-                # to extract mint authority, freeze authority, etc.
-                result["is_mutable"] = True
-                result["has_mint_authority"] = True
-                result["has_freeze_authority"] = True
+                data = account_info["result"].get("data")
+                
+                if isinstance(data, list) and data[0] == "base64":
+                    # Decode base64 data
+                    import base64
+                    data_bytes = base64.b64decode(data[1])
+                    
+                    # SPL Token Mint Layout:
+                    # Offset 0: Mint authority option (1 byte)
+                    # Offset 1: Mint authority pubkey (32 bytes)
+                    # Offset 33: Supply (8 bytes)
+                    # Offset 41: Decimals (1 byte)
+                    # Offset 42: is_initialized (1 byte)
+                    # Offset 43: Freeze authority option (1 byte)
+                    # Offset 44: Freeze authority pubkey (32 bytes)
+                    
+                    # Check if mint authority is present
+                    mint_authority_option = data_bytes[0]
+                    result["has_mint_authority"] = mint_authority_option == 1
+                    
+                    if result["has_mint_authority"]:
+                        # Extract mint authority pubkey
+                        import base58
+                        mint_authority = base58.b58encode(data_bytes[1:33]).decode('utf-8')
+                        result["mint_authority"] = mint_authority
+                    
+                    # Get decimals for additional info
+                    result["decimals"] = data_bytes[41]
+                    
+                    # Check if initialized
+                    result["is_initialized"] = data_bytes[42] == 1
+                    
+                    # Check if freeze authority is present
+                    freeze_authority_option = data_bytes[43]
+                    result["has_freeze_authority"] = freeze_authority_option == 1
+                    
+                    if result["has_freeze_authority"]:
+                        # Extract freeze authority pubkey
+                        freeze_authority = base58.b58encode(data_bytes[44:76]).decode('utf-8')
+                        result["freeze_authority"] = freeze_authority
+                    
+                    # A token is mutable if it has a mint authority
+                    result["is_mutable"] = result["has_mint_authority"]
+                
+                else:
+                    result["error"] = "Invalid data format"
                 
         except Exception as e:
             logger.error(f"Error getting token authority for {mint}: {str(e)}")

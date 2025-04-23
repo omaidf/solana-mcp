@@ -3,10 +3,14 @@
 import logging
 import sys
 import os
+import uuid
+from datetime import datetime
 from typing import Dict, Any, Optional
 
 # Default log format
 DEFAULT_LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+# Default log level
+DEFAULT_LOG_LEVEL = "INFO"
 
 # Configure default logging
 def configure_logging(log_level: str = "INFO", log_format: Optional[str] = None):
