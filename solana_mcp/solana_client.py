@@ -135,7 +135,7 @@ class SolanaClient:
                         params.append({"commitment": self.config.commitment})
                 else:
                     # Otherwise add commitment as a separate param
-                    params.append(self.config.commitment)
+                    params.append({"commitment": self.config.commitment})
         
         # Build JSON-RPC request
         payload = {
