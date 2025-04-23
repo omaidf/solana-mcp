@@ -188,7 +188,7 @@ def get_solana_config() -> SolanaConfig:
         ValueError: If environment variables fail validation
     """
     return SolanaConfig(
-        rpc_url=get_env_var("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com", 
+        rpc_url=get_env_var("SOLANA_RPC_URL", "https://api.devnet.solana.com", 
                             validator=url_validator),
         rpc_user=get_env_var("SOLANA_RPC_USER"),
         rpc_password=get_env_var("SOLANA_RPC_PASSWORD"),

@@ -6,6 +6,7 @@ import json
 import re
 import asyncio
 import time
+import datetime
 from typing import Any, Dict, List, Optional, Union, cast, Tuple
 from contextlib import asynccontextmanager
 from urllib.parse import urljoin
@@ -112,8 +113,11 @@ class SolanaClient:
         if params is None:
             params = []
             
-        # Add commitment if not already in params
-        if method not in ["getHealth", "getVersion"]:
+        # Add commitment if not already in params and the method supports it
+        # Some methods don't accept parameters at all
+        methods_without_params = ["getHealth", "getVersion", "getClusterNodes", "getEpochInfo", "getInflationRate", "getSlot"]
+        
+        if method not in methods_without_params:
             # Check if any param is a dict with 'commitment' key
             has_commitment = any(
                 isinstance(p, dict) and "commitment" in p 
@@ -557,7 +561,7 @@ class SolanaClient:
         if end_slot is not None:
             params.append(end_slot)
         if commitment:
-            params.append(commitment)
+            params.append({"commitment": commitment})
         
         return await self._make_request("getBlocks", params)
     
