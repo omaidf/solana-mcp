@@ -349,7 +349,7 @@ Process a natural language query about tokens to get data based on what's being 
 **Endpoint:** `POST /token-analysis/query`
 
 **Parameters:**
-- `query` (body parameter, required): The natural language query text (must include a valid token address)
+- `query` (string parameter, required): The natural language query text (must include a valid token address)
 
 **Example Request:**
 ```bash

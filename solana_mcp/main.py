@@ -14,11 +14,12 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # Internal imports
-from solana_mcp.config import get_server_config, AppConfig, get_app_config
+from solana_mcp.config import get_server_config, AppConfig, get_app_config, get_solana_config
 from solana_mcp.logging_config import setup_logging, get_logger, RequestIdMiddleware
 from solana_mcp.api_routes.token_analysis import router as token_analysis_router
 from solana_mcp.api_routes.liquidity_analysis import router as liquidity_analysis_router
 from solana_mcp.api_routes.token_risk_analysis import router as token_risk_router
+from solana_mcp.api.error_handling import api_error_handler
 
 # Setup logging
 setup_logging()
@@ -50,6 +51,7 @@ app.include_router(token_risk_router)
 
 # Health check endpoint
 @app.get("/health")
+@api_error_handler
 async def health_check():
     """Health check endpoint.
     
@@ -60,6 +62,7 @@ async def health_check():
 
 # Version endpoint
 @app.get("/version")
+@api_error_handler
 async def version():
     """Get API version information.
     
@@ -99,6 +102,7 @@ def run_server(port=None):
     This function is used as an entry point in setup.py.
     """
     config = get_server_config()
+    solana_config = get_solana_config()
     
     # Override port if specified
     if port is not None:
@@ -111,6 +115,8 @@ def run_server(port=None):
     logger.info(
         f"Starting Solana MCP Server on {config.host}:{config.port} (Environment: {config.environment})"
     )
+    logger.info(f"Using Solana RPC URL: {solana_config.rpc_url}")
+    
     uvicorn.run(
         "solana_mcp.main:app",
         host=config.host,

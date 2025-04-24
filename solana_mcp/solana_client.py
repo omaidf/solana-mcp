@@ -697,35 +697,62 @@ class SolanaClient:
         if not validate_public_key(mint):
             raise InvalidPublicKeyError(mint)
         
-        # Calculate metadata account address based on mint (PDA derivation)
-        # This is a simplified implementation and may not work for all tokens
-        # In production, use the proper PDA derivation from the Metaplex SDK
         try:
-            # Query for metadata accounts - this is a simplified approach
+            # Use a more precise approach to fetch specific token metadata
+            # This approach avoids the "Too many accounts requested" error
+            
+            # For PDA derivation, we would ideally use proper Metaplex SDK logic
+            # This is a simplified direct token lookup with tighter filters
             filters = [
                 {
                     "memcmp": {
-                        "offset": 0,
-                        "bytes": mint
+                        "offset": 0,  # Start at position 0 in account data
+                        "bytes": mint  # Look for exact mint address match
                     }
+                },
+                {
+                    "dataSize": 679  # Typical size of Metaplex metadata accounts, limit results
                 }
             ]
             
+            # Use pagination to avoid requesting too many accounts at once
             metadata_accounts = await self.get_program_accounts(
                 METADATA_PROGRAM_ID,
-                filters=filters
+                filters=filters,
+                limit=1  # We only need the first match
             )
+            
+            if not metadata_accounts:
+                # If nothing found, try a more flexible approach with just the mint filter
+                # but still limited to prevent too many results
+                simple_filters = [
+                    {
+                        "memcmp": {
+                            "offset": 33,  # Offset where mint address appears in metadata accounts
+                            "bytes": mint
+                        }
+                    }
+                ]
+                
+                metadata_accounts = await self.get_program_accounts(
+                    METADATA_PROGRAM_ID,
+                    filters=simple_filters,
+                    limit=1
+                )
             
             if not metadata_accounts:
                 return {
                     "mint": mint,
-                    "metadata": None,
-                    "error": "No metadata found"
+                    "metadata": {
+                        "name": "Unknown Token",
+                        "symbol": "UNKNOWN",
+                        "uri": ""
+                    }
                 }
             
             # Parse metadata from the first matching account
             account_data = metadata_accounts[0]["account"]["data"]
-            if isinstance(account_data, list) and account_data[0] == "base64":
+            if isinstance(account_data, list) and len(account_data) >= 2 and account_data[0] == "base64":
                 # Decode base64 data - this is a simplified parser
                 data_bytes = base64.b64decode(account_data[1])
                 
@@ -742,22 +769,27 @@ class SolanaClient:
                 # Try to extract text fields from the binary data
                 try:
                     # Extract name (simplified)
-                    name_length = data_bytes[40]
-                    name_end = 41 + name_length
-                    name = data_bytes[41:name_end].decode('utf-8')
-                    metadata["name"] = name.replace("\x00", "")
-                    
-                    # Extract symbol (simplified)
-                    symbol_length = data_bytes[name_end]
-                    symbol_end = name_end + 1 + symbol_length
-                    symbol = data_bytes[name_end + 1:symbol_end].decode('utf-8')
-                    metadata["symbol"] = symbol.replace("\x00", "")
-                    
-                    # Extract URI (simplified)
-                    uri_length = data_bytes[symbol_end]
-                    uri_end = symbol_end + 1 + uri_length
-                    uri = data_bytes[symbol_end + 1:uri_end].decode('utf-8')
-                    metadata["uri"] = uri.replace("\x00", "")
+                    name_length = data_bytes[40] if len(data_bytes) > 40 else 0
+                    if name_length > 0 and 41 + name_length <= len(data_bytes):
+                        name_end = 41 + name_length
+                        name = data_bytes[41:name_end].decode('utf-8')
+                        metadata["name"] = name.replace("\x00", "")
+                        
+                        # Extract symbol (simplified)
+                        if name_end < len(data_bytes):
+                            symbol_length = data_bytes[name_end]
+                            if symbol_length > 0 and name_end + 1 + symbol_length <= len(data_bytes):
+                                symbol_end = name_end + 1 + symbol_length
+                                symbol = data_bytes[name_end + 1:symbol_end].decode('utf-8')
+                                metadata["symbol"] = symbol.replace("\x00", "")
+                                
+                                # Extract URI (simplified)
+                                if symbol_end < len(data_bytes):
+                                    uri_length = data_bytes[symbol_end]
+                                    if uri_length > 0 and symbol_end + 1 + uri_length <= len(data_bytes):
+                                        uri_end = symbol_end + 1 + uri_length
+                                        uri = data_bytes[symbol_end + 1:uri_end].decode('utf-8')
+                                        metadata["uri"] = uri.replace("\x00", "")
                 except (IndexError, UnicodeDecodeError) as e:
                     # If parsing fails, return minimal metadata
                     logger.warning(f"Error parsing metadata for {mint}: {str(e)}")
@@ -769,8 +801,11 @@ class SolanaClient:
             else:
                 return {
                     "mint": mint,
-                    "metadata": None,
-                    "error": "Invalid metadata format"
+                    "metadata": {
+                        "name": "Unknown Token",
+                        "symbol": "UNKNOWN",
+                        "uri": ""
+                    }
                 }
                 
         except Exception as e:
@@ -778,14 +813,18 @@ class SolanaClient:
             logger.error(f"Error fetching metadata for {mint}: {str(e)}")
             return {
                 "mint": mint,
-                "metadata": None,
+                "metadata": {
+                    "name": "Unknown Token",
+                    "symbol": "UNKNOWN",
+                    "uri": ""
+                },
                 "error": str(e)
             }
     
     async def get_market_price(self, token_mint: str) -> Dict[str, Any]:
         """Get market price data for a token.
         
-w        This method fetches price information for a token from available DEX liquidity.
+        This method fetches price information for a token from available DEX liquidity.
         It uses various sources to determine the token price in SOL and USD.
         
         Args:
@@ -866,7 +905,7 @@ w        This method fetches price information for a token from available DEX li
                 # Jupiter price API call (simplified)
                 try:
                     price_response = await self._make_request(
-                        "getRecentBlockhash",  # We just need a quick RPC method to check connectivity
+                        "getLatestBlockhash",  # Updated from getRecentBlockhash to getLatestBlockhash
                         []
                     )
                     

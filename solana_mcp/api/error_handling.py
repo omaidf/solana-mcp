@@ -163,4 +163,41 @@ def rate_limit(requests_per_minute: int = 60) -> Callable:
         
         return wrapper
     
-    return decorator 
+    return decorator
+
+def api_error_handler(func: Callable) -> Callable:
+    """Decorator to handle common exceptions in API endpoints.
+    
+    This decorator is specifically designed for FastAPI endpoint functions.
+    It catches exceptions and converts them to appropriate HTTP responses.
+    
+    Args:
+        func: The function to wrap
+        
+    Returns:
+        Wrapped function with error handling
+    """
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            # Execute the function
+            return await func(*args, **kwargs)
+        except InvalidPublicKeyError as e:
+            logger.warning(f"Invalid public key: {str(e)}")
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail=f"Invalid Solana public key: {str(e)}")
+        except SolanaRpcError as e:
+            logger.error(f"Solana RPC error: {str(e)}")
+            from fastapi import HTTPException
+            status_code = getattr(e, "status_code", 500)
+            raise HTTPException(status_code=status_code, detail=f"Solana RPC error: {str(e)}")
+        except ValueError as e:
+            logger.warning(f"Value error: {str(e)}")
+            from fastapi import HTTPException
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+            from fastapi import HTTPException
+            raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    
+    return wrapper 

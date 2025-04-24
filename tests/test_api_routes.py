@@ -98,6 +98,24 @@ def test_liquidity_top_pools_endpoint():
     print(f"Top pools response: {json.dumps(data, indent=2)}")
 
 
+def test_semantic_query_endpoint():
+    """Test the semantic query endpoint with a known token."""
+    # USDC token
+    usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    query = f"Show me the price of {usdc_mint}"
+    
+    response = client.post("/token-analysis/query", json={"query": query})
+    
+    assert response.status_code == 200, f"Expected 200 OK but got {response.status_code}"
+    data = response.json()
+    
+    # Check basic structure of the response
+    assert "query" in data, "Expected query in response"
+    assert "primary_intent" in data, "Expected primary_intent in response"
+    
+    print(f"Semantic query response: {json.dumps(data, indent=2)}")
+
+
 def test_invalid_token_address():
     """Test behavior with an invalid token address."""
     invalid_mint = "not-a-valid-solana-token"
@@ -118,4 +136,5 @@ if __name__ == "__main__":
     test_token_holders_endpoint()
     test_token_risk_analysis_endpoint()
     test_liquidity_top_pools_endpoint()
+    test_semantic_query_endpoint()
     test_invalid_token_address() 

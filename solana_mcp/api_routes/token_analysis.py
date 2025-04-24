@@ -3,10 +3,13 @@
 # Standard library imports
 import functools
 import uuid
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Union
+from datetime import datetime
 
 # Third-party library imports
-from fastapi import APIRouter, HTTPException, Depends, Query, Request
+from fastapi import APIRouter, HTTPException, Depends, Query, Request, Body
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 # Internal imports
 from solana_mcp.token_analyzer import TokenAnalyzer, TokenAnalysis
@@ -554,11 +557,15 @@ async def get_fresh_wallets(
         return fresh_wallet_data
 
 
+# Define a model for the semantic query request
+class SemanticQueryRequest(BaseModel):
+    query: str
+
 @router.post("/query")
 @handle_token_exceptions
 async def semantic_query(
     request: Request,
-    query: str,
+    query_request: SemanticQueryRequest,
     request_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Process a natural language query about tokens.
@@ -569,12 +576,13 @@ async def semantic_query(
     
     Args:
         request: FastAPI request object
-        query: The natural language query text
+        query_request: The request body containing the query
         request_id: Optional request ID for tracing
         
     Returns:
         Analysis result based on the query intent
     """
+    query = query_request.query
     log_with_context(
         logger,
         "info",
