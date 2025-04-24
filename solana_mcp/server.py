@@ -713,10 +713,14 @@ async def get_transaction_history_for_address(
     """
     try:
         # Get signatures
+        # Create options dictionary
+        options = {"limit": limit}
+        if before:
+            options["before"] = before
+            
         signatures = await solana_client.get_signatures_for_address(
-            address, 
-            before=before, 
-            limit=limit
+            address,
+            options
         )
         
         result = {
