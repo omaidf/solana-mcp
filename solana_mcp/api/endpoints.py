@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from solana_mcp.api.error_handling import with_error_handling, with_validation, rate_limit
+from solana_mcp.decorators import api_error_handler, validate_input, rate_limit
 from solana_mcp.solana_client import SolanaClient
 
 
@@ -34,7 +34,7 @@ class AnalysisRequest(BaseModel):
 
 # --- Endpoints ---
 
-@with_error_handling
+@api_error_handler
 @rate_limit(requests_per_minute=60)
 async def rest_get_account(request: Request) -> JSONResponse:
     """REST API endpoint for getting account info.
@@ -59,7 +59,7 @@ async def rest_get_account(request: Request) -> JSONResponse:
     return JSONResponse(account_info)
 
 
-@with_error_handling
+@api_error_handler
 @rate_limit(requests_per_minute=60)
 async def rest_get_balance(request: Request) -> JSONResponse:
     """REST API endpoint for getting account balance.
@@ -90,7 +90,7 @@ async def rest_get_balance(request: Request) -> JSONResponse:
     })
 
 
-@with_error_handling
+@api_error_handler
 @rate_limit(requests_per_minute=60)
 async def rest_get_token_info(request: Request) -> JSONResponse:
     """REST API endpoint for getting token information.
@@ -130,7 +130,7 @@ async def rest_get_token_info(request: Request) -> JSONResponse:
     return JSONResponse(token_info)
 
 
-@with_error_handling
+@api_error_handler
 @rate_limit(requests_per_minute=30)
 async def rest_get_transactions(request: Request) -> JSONResponse:
     """REST API endpoint for getting transaction history.
@@ -178,7 +178,7 @@ async def rest_get_transactions(request: Request) -> JSONResponse:
     })
 
 
-@with_error_handling
+@api_error_handler
 @rate_limit(requests_per_minute=30)
 async def rest_get_nft_info(request: Request) -> JSONResponse:
     """REST API endpoint for getting NFT information.
@@ -220,8 +220,8 @@ async def rest_get_nft_info(request: Request) -> JSONResponse:
     return JSONResponse(nft_info)
 
 
-@with_error_handling
-@with_validation(NlpQueryRequest)
+@api_error_handler
+@validate_input(NlpQueryRequest)
 @rate_limit(requests_per_minute=30)  # More restrictive for expensive operations
 async def rest_nlp_query(request: Request, validated_data: NlpQueryRequest) -> JSONResponse:
     """Process natural language queries about Solana.
@@ -255,8 +255,8 @@ async def rest_nlp_query(request: Request, validated_data: NlpQueryRequest) -> J
     })
 
 
-@with_error_handling
-@with_validation(AnalysisRequest)
+@api_error_handler
+@validate_input(AnalysisRequest)
 @rate_limit(requests_per_minute=20)  # Even more restrictive for analysis
 async def rest_chain_analysis(request: Request, validated_data: AnalysisRequest) -> JSONResponse:
     """Analyze patterns in token movements or transactions.

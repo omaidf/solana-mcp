@@ -1,16 +1,34 @@
-"""Error handling utilities for API endpoints."""
+"""Error handling utilities for API endpoints.
+
+DEPRECATED: This module contains duplicate functionality with solana_mcp/decorators.py.
+For better code organization, these utilities should be consolidated into a single location.
+New code should use decorators from solana_mcp/decorators.py instead.
+"""
 
 import functools
 import logging
 import traceback
+import warnings
 from typing import Callable, Any, Dict, Awaitable
 
 from starlette.responses import JSONResponse
 
 from solana_mcp.solana_client import SolanaRpcError, InvalidPublicKeyError
+from solana_mcp.decorators import (
+    api_error_handler as _api_error_handler,
+    rate_limit as _rate_limit,
+)
 
 # Set up logger
 logger = logging.getLogger(__name__)
+
+# Show deprecation warning
+warnings.warn(
+    "solana_mcp.api.error_handling is deprecated. "
+    "Please use solana_mcp.decorators instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 
 
 def explain_solana_error(error_message: str) -> str:
@@ -36,12 +54,21 @@ def explain_solana_error(error_message: str) -> str:
 def with_error_handling(func: Callable[..., Awaitable[JSONResponse]]) -> Callable[..., Awaitable[JSONResponse]]:
     """Decorator to handle common errors in REST API endpoints.
     
+    DEPRECATED: Use solana_mcp.decorators.api_error_handler instead.
+    
     Args:
         func: The endpoint function to wrap
         
     Returns:
         Wrapped function with error handling
     """
+    warnings.warn(
+        "with_error_handling is deprecated. "
+        "Please use solana_mcp.decorators.api_error_handler instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
     @functools.wraps(func)
     async def wrapper(*args, **kwargs) -> JSONResponse:
         try:
@@ -80,12 +107,21 @@ def with_error_handling(func: Callable[..., Awaitable[JSONResponse]]) -> Callabl
 def with_validation(validation_class: Any) -> Callable:
     """Decorator to validate request body against a model.
     
+    DEPRECATED: Use solana_mcp.decorators equivalent instead.
+    
     Args:
         validation_class: Pydantic model class for validation
         
     Returns:
         Decorator function
     """
+    warnings.warn(
+        "with_validation is deprecated. "
+        "Please use solana_mcp.decorators equivalent instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         async def wrapper(request, *args, **kwargs):
@@ -115,61 +151,29 @@ def with_validation(validation_class: Any) -> Callable:
 def rate_limit(requests_per_minute: int = 60) -> Callable:
     """Decorator to apply rate limiting to an endpoint.
     
+    DEPRECATED: Use solana_mcp.decorators.rate_limit instead.
+    
     Args:
         requests_per_minute: Maximum requests allowed per minute
         
     Returns:
         Decorator function
     """
-    # This is a placeholder for a more sophisticated rate limiting implementation
-    # In a real application, you would use Redis or another distributed store
-    rate_limit_store: Dict[str, Dict[str, Any]] = {}
+    warnings.warn(
+        "rate_limit is deprecated. "
+        "Please use solana_mcp.decorators.rate_limit instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     
-    def decorator(func: Callable) -> Callable:
-        @functools.wraps(func)
-        async def wrapper(request, *args, **kwargs):
-            # Get client identifier (IP address or API key)
-            client_id = request.client.host
-            
-            # Check rate limit
-            from time import time
-            current_time = time()
-            
-            if client_id in rate_limit_store:
-                client_data = rate_limit_store[client_id]
-                # Reset count if window has passed
-                if current_time - client_data['window_start'] > 60:
-                    client_data['count'] = 1
-                    client_data['window_start'] = current_time
-                else:
-                    client_data['count'] += 1
-                    
-                # Check if limit exceeded
-                if client_data['count'] > requests_per_minute:
-                    logger.warning(f"Rate limit exceeded for {client_id}")
-                    return JSONResponse({
-                        "error": "Rate limit exceeded",
-                        "error_explanation": f"You have exceeded the limit of {requests_per_minute} requests per minute."
-                    }, status_code=429)
-            else:
-                # First request from this client
-                rate_limit_store[client_id] = {
-                    'count': 1,
-                    'window_start': current_time
-                }
-                
-            # Proceed with the request
-            return await func(request, *args, **kwargs)
-        
-        return wrapper
-    
-    return decorator
+    return _rate_limit(limit=requests_per_minute, period=60)
 
+
+# Re-export from decorators.py with a deprecation warning
 def api_error_handler(func: Callable) -> Callable:
     """Decorator to handle common exceptions in API endpoints.
     
-    This decorator is specifically designed for FastAPI endpoint functions.
-    It catches exceptions and converts them to appropriate HTTP responses.
+    DEPRECATED: Use solana_mcp.decorators.api_error_handler instead.
     
     Args:
         func: The function to wrap
@@ -177,27 +181,11 @@ def api_error_handler(func: Callable) -> Callable:
     Returns:
         Wrapped function with error handling
     """
-    @functools.wraps(func)
-    async def wrapper(*args, **kwargs):
-        try:
-            # Execute the function
-            return await func(*args, **kwargs)
-        except InvalidPublicKeyError as e:
-            logger.warning(f"Invalid public key: {str(e)}")
-            from fastapi import HTTPException
-            raise HTTPException(status_code=400, detail=f"Invalid Solana public key: {str(e)}")
-        except SolanaRpcError as e:
-            logger.error(f"Solana RPC error: {str(e)}")
-            from fastapi import HTTPException
-            status_code = getattr(e, "status_code", 500)
-            raise HTTPException(status_code=status_code, detail=f"Solana RPC error: {str(e)}")
-        except ValueError as e:
-            logger.warning(f"Value error: {str(e)}")
-            from fastapi import HTTPException
-            raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-            from fastapi import HTTPException
-            raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    warnings.warn(
+        "api_error_handler is deprecated. "
+        "Please use solana_mcp.decorators.api_error_handler instead.",
+        DeprecationWarning, 
+        stacklevel=2
+    )
     
-    return wrapper 
+    return _api_error_handler(func) 

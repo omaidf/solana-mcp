@@ -182,6 +182,24 @@ class TokenQueryAnalyzer:
             return result
             
         try:
+            # First, always get basic token metadata to ensure consistent responses
+            token_metadata = await self.token_analyzer.get_token_metadata(token_address, request_id=request_id)
+            basic_token_info = {
+                "token_mint": token_address,
+                "token_name": token_metadata.get("name", "Unknown"),
+                "token_symbol": token_metadata.get("symbol", "UNKNOWN")
+            }
+            
+            # Get supply info for all queries as well
+            try:
+                supply_info = await self.token_analyzer.get_token_supply_and_decimals(token_address, request_id=request_id)
+                decimals = supply_info.get("value", {}).get("decimals", 0)
+                total_supply = supply_info.get("value", {}).get("uiAmountString", "0")
+                basic_token_info["decimals"] = decimals
+                basic_token_info["total_supply"] = total_supply
+            except Exception as e:
+                logger.error(f"Error getting supply data: {str(e)}", exc_info=True)
+            
             # Execute the appropriate analysis based on intent
             if primary_intent == "general_info":
                 analysis = await self.token_analyzer.analyze_token(token_address, request_id=request_id)
@@ -191,11 +209,13 @@ class TokenQueryAnalyzer:
                 
             elif primary_intent == "price":
                 price_data = await self.token_analyzer.get_token_price(token_address, request_id=request_id)
-                result["data"] = price_data
+                # Merge with basic token info
+                result["data"] = {**basic_token_info, **price_data}
                 
             elif primary_intent == "holders":
                 holders_data = await self.token_analyzer.get_token_largest_holders(token_address, request_id=request_id)
-                result["data"] = holders_data
+                # Merge with basic token info
+                result["data"] = {**basic_token_info, **holders_data}
                 
             elif primary_intent == "whales":
                 # Use the threshold if provided, otherwise use default
@@ -204,22 +224,47 @@ class TokenQueryAnalyzer:
                     threshold_usd=threshold or 50000.0, 
                     request_id=request_id
                 )
+                
+                # Ensure total_holders is properly included
+                if "total_holders" not in whale_data:
+                    # Get total holders data if not already included
+                    holders_data = await self.token_analyzer.get_token_largest_holders(token_address, request_id=request_id)
+                    whale_data["total_holders"] = holders_data.get("total_holders", whale_data.get("total_holders_analyzed", 0))
+                
+                # Merge with basic token info, ensuring token_name and token_symbol are preserved
+                if "token_name" not in whale_data or whale_data["token_name"] == "Unknown":
+                    whale_data["token_name"] = basic_token_info["token_name"]
+                if "token_symbol" not in whale_data or whale_data["token_symbol"] == "UNKNOWN":
+                    whale_data["token_symbol"] = basic_token_info["token_symbol"]
+                
                 result["data"] = whale_data
                 
             elif primary_intent == "fresh_wallets":
                 fresh_wallet_data = await self.token_analyzer.get_fresh_wallets(token_address, request_id=request_id)
+                # Merge with basic token info
+                if "token_name" not in fresh_wallet_data or fresh_wallet_data["token_name"] == "Unknown":
+                    fresh_wallet_data["token_name"] = basic_token_info["token_name"]
+                if "token_symbol" not in fresh_wallet_data or fresh_wallet_data["token_symbol"] == "UNKNOWN":
+                    fresh_wallet_data["token_symbol"] = basic_token_info["token_symbol"]
                 result["data"] = fresh_wallet_data
                 
             elif primary_intent == "supply":
                 supply_data = await self.token_analyzer.get_token_supply_and_decimals(token_address, request_id=request_id)
-                result["data"] = supply_data
+                # Merge with basic token info
+                result["data"] = {**basic_token_info, **supply_data}
                 
             elif primary_intent == "authority":
                 authority_data = await self.token_analyzer.get_token_mint_authority(token_address, request_id=request_id)
-                result["data"] = authority_data
+                # Merge with basic token info
+                result["data"] = {**basic_token_info, **authority_data}
                 
             elif primary_intent == "age":
                 age_data = await self.token_analyzer.get_token_age(token_address, request_id=request_id)
+                # Merge with basic token info if not already present
+                if "token_name" not in age_data or age_data["token_name"] == "Unknown":
+                    age_data["token_name"] = basic_token_info["token_name"]
+                if "token_symbol" not in age_data or age_data["token_symbol"] == "UNKNOWN":
+                    age_data["token_symbol"] = basic_token_info["token_symbol"]
                 result["data"] = age_data
                 
             elif primary_intent == "risk":
@@ -232,9 +277,12 @@ class TokenQueryAnalyzer:
                     "token_mint": data.get("token_mint"),
                     "token_name": data.get("token_name"),
                     "token_symbol": data.get("token_symbol"),
+                    "decimals": data.get("decimals"),
+                    "total_supply": data.get("total_supply"),
                     "age_days": data.get("age_days"),
                     "owner_can_mint": data.get("owner_can_mint"),
                     "owner_can_freeze": data.get("owner_can_freeze"),
+                    "total_holders": data.get("total_holders", 0),
                     "largest_holder_percentage": data.get("largest_holder_percentage"),
                     "whale_holdings_percentage": data.get("whale_holdings_percentage"),
                     "fresh_wallet_percentage": data.get("fresh_wallet_percentage"),
@@ -284,7 +332,7 @@ class TokenQueryAnalyzer:
                 # Execute secondary analysis based on the second intent
                 if secondary_intent == "price" and primary_intent != "price":
                     price_data = await self.token_analyzer.get_token_price(token_address, request_id=request_id)
-                    secondary_data["price"] = price_data
+                    secondary_data["price"] = {**basic_token_info, **price_data}
                 
                 elif secondary_intent == "whales" and primary_intent != "whales":
                     whale_data = await self.token_analyzer.get_whale_holders(
@@ -292,6 +340,11 @@ class TokenQueryAnalyzer:
                         threshold_usd=threshold or 50000.0, 
                         request_id=request_id
                     )
+                    # Merge with basic token info
+                    if "token_name" not in whale_data or whale_data["token_name"] == "Unknown":
+                        whale_data["token_name"] = basic_token_info["token_name"]
+                    if "token_symbol" not in whale_data or whale_data["token_symbol"] == "UNKNOWN":
+                        whale_data["token_symbol"] = basic_token_info["token_symbol"]
                     secondary_data["whales"] = whale_data
                 
                 # Add additional data if any secondary analysis was performed

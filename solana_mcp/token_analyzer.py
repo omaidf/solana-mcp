@@ -569,6 +569,7 @@ class TokenAnalyzer:
             "token_mint": mint,
             "threshold_usd": threshold_usd,
             "total_holders_analyzed": 0,
+            "total_holders": 0,  # Initialize total_holders explicitly
             "whale_count": 0,
             "whale_percentage": 0,
             "whale_holders": [],
@@ -582,6 +583,14 @@ class TokenAnalyzer:
             token_metadata = await self.get_token_metadata(mint, request_id=request_id)
             result["token_name"] = token_metadata.get("name", "Unknown")
             result["token_symbol"] = token_metadata.get("symbol", "UNKNOWN")
+            
+            # Always get total holders count first to ensure this data is included
+            try:
+                total_holders = await self.get_token_holders_count(mint, request_id=request_id)
+                result["total_holders"] = total_holders
+            except Exception as e:
+                logger.error(f"Error getting total holders count: {str(e)}", exc_info=True)
+                # Will fall back to analyzed count later if needed
             
             # Get current token price
             price_data = await self.get_token_price(mint, request_id=request_id)
@@ -628,6 +637,10 @@ class TokenAnalyzer:
             accounts = largest_accounts.get("value", [])
             
             result["total_holders_analyzed"] = len(accounts)
+            
+            # If total_holders wasn't successfully fetched earlier, fall back to analyzed count
+            if result["total_holders"] == 0:
+                result["total_holders"] = result["total_holders_analyzed"]
             
             whale_holders = []
             whale_holdings_total = 0
