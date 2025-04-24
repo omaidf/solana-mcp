@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # Internal imports
-from solana_mcp.config import get_server_config
+from solana_mcp.config import get_server_config, AppConfig, get_app_config
 from solana_mcp.logging_config import setup_logging, get_logger, RequestIdMiddleware
 from solana_mcp.api_routes.token_analysis import router as token_analysis_router
 from solana_mcp.api_routes.liquidity_analysis import router as liquidity_analysis_router
@@ -126,19 +126,4 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, help="Server port")
     args = parser.parse_args()
     
-    run_server(port=args.port)
-
-def get_app_config() -> AppConfig:
-    """Get the comprehensive application configuration."""
-    app_config = AppConfig()
-    
-    # Use consistent environment check across all config objects
-    valid_environments = ("development", "testing", "staging", "production")
-    if app_config.environment not in valid_environments:
-        raise ValueError(f"Invalid environment: {app_config.environment}. Must be one of: {', '.join(valid_environments)}")
-    
-    valid_log_levels = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
-    if app_config.log_level not in valid_log_levels:
-        raise ValueError(f"Invalid log_level: {app_config.log_level}. Must be one of: {', '.join(valid_log_levels)}")
-        
-    return app_config 
+    run_server(port=args.port) 
