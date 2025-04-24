@@ -1479,10 +1479,14 @@ async def get_address_transactions(address: str) -> str:
         from solana_mcp.solana_client import get_solana_client
         async with get_solana_client() as solana_client:
             # Get signatures
+            # Create options dictionary
+            options = {"limit": limit}
+            if before:
+                options["before"] = before
+                
             signatures = await solana_client.get_signatures_for_address(
-                address, 
-                before=before, 
-                limit=limit
+                address,
+                options
             )
             
             # For detailed view, we could get full transaction details
@@ -2234,10 +2238,14 @@ async def rest_get_transactions(request):
     # Otherwise, get regular transaction history
     try:
         # Get signatures
+        # Create options dictionary
+        options = {"limit": limit}
+        if before:
+            options["before"] = before
+            
         signatures = await solana_client.get_signatures_for_address(
-            address, 
-            before=before, 
-            limit=limit
+            address,
+            options
         )
         
         return JSONResponse({

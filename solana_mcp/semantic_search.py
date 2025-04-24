@@ -50,6 +50,12 @@ QUERY_PATTERNS = [
         "intent": "get_nft_info",
         "params": lambda match: {"mint": match.group(1)}
     },
+    # Whale queries - Added new pattern to handle direct questions about whales
+    {
+        "pattern": r"(?:are there|are there any|do you see|can you find|any) (?:whales|whale|large holder|big investor|big wallet) (?:in|for|holding) (?:this token|this|token|mint)? ?([a-zA-Z0-9]{32,44})",
+        "intent": "get_token_whales",
+        "params": lambda match: {"mint": match.group(1)}
+    },
 ]
 
 # Define common transaction types and their keywords
@@ -135,6 +141,40 @@ async def parse_natural_language_query(query: str, solana_client: SolanaClient, 
                         session.add_query(query, result)
                         session.update_context_for_entity("token", params["mint"], {"last_check": datetime.datetime.now().isoformat()})
                     return result
+                
+                elif intent == "get_token_whales":
+                    if not params.get("mint"):
+                        return {"error": "Missing token mint address", "error_explanation": "A valid token mint address is required."}
+                        
+                    # Initialize the TokenAnalyzer to access whale data
+                    from solana_mcp.token_analyzer import TokenAnalyzer
+                    token_analyzer = TokenAnalyzer(solana_client)
+                    
+                    # Get whale data with default threshold ($50k)
+                    whale_data = await token_analyzer.get_whale_holders(params["mint"], threshold_usd=50000.0)
+                    
+                    # Get basic token info for context
+                    token_metadata = await solana_client.get_token_metadata(params["mint"])
+                    token_name = token_metadata.get("name", "Unknown")
+                    token_symbol = token_metadata.get("symbol", "UNKNOWN") 
+                    
+                    # Add token info if not already in the whale data
+                    if "token_name" not in whale_data or whale_data["token_name"] == "Unknown":
+                        whale_data["token_name"] = token_name
+                    if "token_symbol" not in whale_data or whale_data["token_symbol"] == "UNKNOWN":
+                        whale_data["token_symbol"] = token_symbol
+                        
+                    # Get total holders to ensure we have this data
+                    holders_data = await token_analyzer.get_token_largest_holders(params["mint"])
+                    total_holders = holders_data.get("total_holders", whale_data.get("total_holders_analyzed", 0))
+                    whale_data["total_holders"] = total_holders
+                    
+                    # Add to session if available
+                    if session:
+                        session.add_query(query, whale_data)
+                        session.update_context_for_entity("token", params["mint"], {"last_whale_check": datetime.datetime.now().isoformat()})
+                    
+                    return whale_data
                 
                 elif intent == "get_transactions":
                     if not params.get("address"):
@@ -332,9 +372,12 @@ async def semantic_transaction_search(
     
     # Get transaction signatures for the address
     try:
+        # Build options dictionary first
+        options = {"limit": min(100, limit * 2)}  # Get more than needed to filter down, but cap at 100
+        
         signatures = await solana_client.get_signatures_for_address(
             address, 
-            limit=min(100, limit * 2)  # Get more than needed to filter down, but cap at 100
+            options
         )
         
         # Check if no signatures were found
@@ -744,10 +787,15 @@ async def get_transaction_history_for_address(
     """
     try:
         # Get signatures
+        # Build options dictionary first
+        options = {}
+        if before:
+            options["before"] = before
+        options["limit"] = limit
+        
         signatures = await solana_client.get_signatures_for_address(
             address, 
-            before=before, 
-            limit=limit
+            options
         )
         
         result = {

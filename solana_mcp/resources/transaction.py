@@ -69,7 +69,8 @@ async def get_address_transactions(address: str, limit: int = 20, *, ctx: Option
 async def _get_address_transactions_impl(solana_client: SolanaClient, address: str, limit: int) -> str:
     """Implementation for get_address_transactions."""
     try:
-        signatures = await solana_client.get_signatures_for_address(address, limit=limit)
+        options = {"limit": limit}
+        signatures = await solana_client.get_signatures_for_address(address, options)
         return json.dumps({"address": address, "signatures": signatures}, indent=2)
     except InvalidPublicKeyError as e:
         return json.dumps({"error": str(e)})

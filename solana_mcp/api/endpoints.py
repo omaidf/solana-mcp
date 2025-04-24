@@ -169,7 +169,8 @@ async def rest_get_transactions(request: Request) -> JSONResponse:
     solana_client = request.app.state.solana_client
     
     # Get signatures for address
-    signatures = await solana_client.get_signatures_for_address(address, limit=limit)
+    options = {"limit": limit}
+    signatures = await solana_client.get_signatures_for_address(address, options)
     
     # Return list of signatures
     return JSONResponse({

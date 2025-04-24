@@ -40,8 +40,10 @@ INTENTS = {
         "distribution of holders", "token allocation", "allocation of tokens"
     ],
     "whales": [
-        "whale", "big holders", "large holders", "major holders", "whale analysis",
-        "whales holding", "biggest holders", ">50k", "large accounts", "rich list",
+        "whale", "whales", "big holders", "large holders", "major holders", "whale analysis",
+        "whales holding", "biggest holders", ">50k", "large accounts", "rich list", 
+        "are there whales", "are there any whales", "any whales", "whale stats", "whale statistics",
+        "whale distribution", "whale info", "whale information", "whale activity", "whale data",
         "big investors", "major investors", "big players", "big wallets", "deep pockets",
         "highest holders", "wealthiest holders", "heaviest investors", "major stakes",
         "big stakes", "large stakes", "whale wallets", "whale accounts", "whale investors",
@@ -453,16 +455,21 @@ class TokenQueryAnalyzer:
         # Count matches for each intent
         intent_scores = defaultdict(float)
         
+        # Special case for whale-related queries
+        if re.search(r'whale|whales|big (holder|wallet|investor|stake)|large (holder|wallet|investor|stake)', query, re.IGNORECASE):
+            # Give a boost to whale intent for direct mentions
+            intent_scores["whales"] += 5.0
+        
         # First pass - exact phrase matching
         for intent, keywords in INTENTS.items():
             for keyword in keywords:
                 if keyword in query:
-                    # Add score based on keyword length (longer keywords are more specific)
-                    # Weight phrases higher than single words
+                    # Add score based on keyword length and specificity
                     if ' ' in keyword:
-                        intent_scores[intent] += len(keyword) / 3
+                        # Multi-word keywords are more specific
+                        intent_scores[intent] += min(len(keyword) / 2, 4.0)  # Cap at 4.0 to avoid overly long phrases dominating
                     else:
-                        intent_scores[intent] += len(keyword) / 5
+                        intent_scores[intent] += min(len(keyword) / 4, 2.0)  # Cap single words at 2.0
         
         # Second pass - word frequency analysis
         word_count = defaultdict(int)
@@ -475,14 +482,24 @@ class TokenQueryAnalyzer:
             for keyword in keywords:
                 if ' ' not in keyword and keyword in word_count:
                     # Words that appear multiple times get higher scores
-                    intent_scores[intent] += word_count[keyword] * 0.5
+                    intent_scores[intent] += word_count[keyword] * 0.75
         
         # Third pass - position-based weighting
-        # Words at the beginning of the query might be more important
         for intent, keywords in INTENTS.items():
             for keyword in keywords:
+                # Check if keyword is at the beginning
                 if ' ' not in keyword and query.startswith(keyword + ' '):
                     intent_scores[intent] += 2.0
+                # Check if keyword is in the first half of the query (with less weight)
+                elif ' ' not in keyword and keyword in query[:len(query)//2]:
+                    intent_scores[intent] += 1.0
+                # Check for multi-word keywords at the beginning with higher weight
+                elif ' ' in keyword and query.startswith(keyword):
+                    intent_scores[intent] += 3.0
+        
+        # Special handling for direct questions about whales
+        if re.search(r'^(are|is|do|does|any|have|has)\s+.*(whale|whales)', query):
+            intent_scores["whales"] += 5.0
         
         # Convert to list of tuples and sort by score descending
         intent_list = [(intent, score) for intent, score in intent_scores.items()]
@@ -491,7 +508,7 @@ class TokenQueryAnalyzer:
         # If we have no matches, default to general_info
         if not intent_list:
             return [("general_info", 0.5)]
-            
+        
         # Normalize confidence scores (0-1 range)
         max_possible_score = 20.0  # Reasonable max score threshold
         normalized_intents = []
@@ -512,15 +529,38 @@ class TokenQueryAnalyzer:
         Returns:
             Token address if found, None otherwise
         """
-        # Look for Solana addresses (base58 format)
+        # More comprehensive Solana address pattern
+        # Matches base58 encoding used by Solana (excludes 0, O, I, l to avoid confusion)
         address_pattern = r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b'
         matches = re.findall(address_pattern, query)
         
         if matches:
-            # Validate each match and return the first valid one
+            # Prioritize addresses that are validated as Solana public keys
+            valid_addresses = []
             for match in matches:
                 if validate_public_key(match):
-                    return match
+                    valid_addresses.append(match)
+            
+            # Return the first valid address if any are found
+            if valid_addresses:
+                # If there's a specific mention of token address with this address, prioritize it
+                for addr in valid_addresses:
+                    # Look for phrases that indicate this is specifically a token address
+                    token_addr_indicators = [
+                        f"token {addr}",
+                        f"mint {addr}",
+                        f"token mint {addr}",
+                        f"token address {addr}",
+                        f"for {addr}",
+                        f"of {addr}",
+                        f"in {addr}"
+                    ]
+                    for indicator in token_addr_indicators:
+                        if indicator.lower() in query.lower():
+                            return addr
+                
+                # If no specific indicators, return the first valid address
+                return valid_addresses[0]
         
         return None
     
@@ -533,16 +573,37 @@ class TokenQueryAnalyzer:
         Returns:
             Threshold value if found, None otherwise
         """
-        # Look for currency amounts (e.g., $10000, 10k, 10,000, etc.)
+        # First check for common preset values mentioned directly
+        preset_values = {
+            "50k": 50000,
+            "100k": 100000,
+            "250k": 250000,
+            "500k": 500000,
+            "1m": 1000000,
+            "million": 1000000
+        }
+        
+        for term, value in preset_values.items():
+            # Check for exact matches with optional $ sign
+            if re.search(rf'\$?\s*{term}\b', query, re.IGNORECASE):
+                return float(value)
+        
+        # Look for currency amounts with more comprehensive patterns
         currency_patterns = [
-            r'\$\s*(\d+(?:,\d+)*(?:\.\d+)?)\s*k\b',  # $10k specifically with k as separate word boundary
-            r'\$\s*(\d+(?:,\d+)*(?:\.\d+)?)',  # $10000, $10,000
-            r'(\d+(?:,\d+)*(?:\.\d+)?)\s*k\b\s*(?:usd|USD)?',  # 10k, 10K USD with k as word boundary
-            r'(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:usd|USD)'  # 10000 USD
+            # $10k specifically with k as separate word boundary
+            r'\$\s*(\d+(?:,\d+)*(?:\.\d+)?)\s*k\b',
+            # $10,000, $10.5k, etc.
+            r'\$\s*(\d+(?:,\d+)*(?:\.\d+)?)',
+            # 10k, 10K USD with k as word boundary
+            r'(\d+(?:,\d+)*(?:\.\d+)?)\s*k\b\s*(?:usd|USD)?',
+            # 10000 USD
+            r'(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:usd|USD)',
+            # 10.5 million/M dollars
+            r'(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:million|m)\b\s*(?:usd|USD|dollars)?'
         ]
         
         for pattern in currency_patterns:
-            matches = re.findall(pattern, query)
+            matches = re.findall(pattern, query, re.IGNORECASE)
             if matches:
                 # Take the first match
                 value_str = matches[0].replace(',', '')
@@ -551,6 +612,9 @@ class TokenQueryAnalyzer:
                     # If pattern contains 'k' or 'K', multiply by 1000
                     if 'k' in pattern.lower():
                         value *= 1000
+                    # If pattern contains 'million' or 'm', multiply by 1,000,000
+                    elif 'million' in pattern.lower() or r'\s*m\b' in pattern.lower():
+                        value *= 1000000
                     return value
                 except ValueError:
                     continue
@@ -568,17 +632,22 @@ class TokenQueryAnalyzer:
         ]
         
         for pattern in threshold_patterns:
-            matches = re.findall(pattern, query)
+            matches = re.findall(pattern, query, re.IGNORECASE)
             if matches:
                 value_str = matches[0].replace(',', '')
                 try:
                     value = float(value_str)
-                    # Check if 'k' is in the matched pattern
-                    if 'k' in pattern[-10:].lower() and 'k' in query[query.find(matches[0])-5:query.find(matches[0])+len(matches[0])+5].lower():
+                    # Check if 'k' is in the actual match context
+                    match_context = query[max(0, query.find(matches[0])-5):min(len(query), query.find(matches[0])+len(matches[0])+5)]
+                    if 'k' in match_context.lower():
                         value *= 1000
                     return value
                 except ValueError:
                     continue
+        
+        # Default whale threshold if nothing specific found but query mentions whales
+        if "whale" in query.lower() and not any(word in query.lower() for word in ["threshold", "minimum", "least", "over", "above"]):
+            return 50000.0  # Default $50k threshold for whale analysis
         
         return None
     

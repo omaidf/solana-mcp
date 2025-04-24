@@ -23,7 +23,8 @@ async def analyze_token_flow(
     """
     try:
         # Get transaction history
-        signatures = await solana_client.get_signatures_for_address(address, limit=limit)
+        options = {"limit": limit}
+        signatures = await solana_client.get_signatures_for_address(address, options)
         
         # Process transactions to find token movements
         inflows = []
@@ -218,7 +219,8 @@ async def analyze_activity_pattern(
     """
     try:
         # Get transaction history
-        signatures = await solana_client.get_signatures_for_address(address, limit=limit)
+        options = {"limit": limit}
+        signatures = await solana_client.get_signatures_for_address(address, options)
         
         # Group by day
         activity_by_day = {}

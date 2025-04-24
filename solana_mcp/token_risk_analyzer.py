@@ -260,7 +260,10 @@ class TokenRiskAnalyzer:
             # Try to get the token creator
             try:
                 # Get token creation transaction
-                signatures = await self.client.get_signatures_for_address(mint, limit=1, before=None)
+                options = {"limit": 1}
+                if before is not None:
+                    options["before"] = before
+                signatures = await self.client.get_signatures_for_address(mint, options)
                 
                 if signatures and len(signatures) > 0:
                     creation_signature = signatures[-1]["signature"]  # Get the earliest signature
