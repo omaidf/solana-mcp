@@ -58,6 +58,13 @@ curl -X GET "http://localhost:8000/token-analysis/analyze/EPjFWdd5AufqSSqeM2qN1x
   "owner_can_freeze": true,
   "total_holders": 10250,
   "largest_holder_percentage": 12.3,
+  "whale_count": 5,
+  "whale_percentage": 0.05,
+  "whale_holdings_percentage": 45.2,
+  "whale_holdings_usd_total": 225000000.0,
+  "fresh_wallet_count": 125,
+  "fresh_wallet_percentage": 1.22,
+  "fresh_wallet_holdings_percentage": 3.5,
   "last_updated": "2024-01-15T12:34:56"
 }
 ```
@@ -240,6 +247,234 @@ curl -X GET "http://localhost:8000/token-analysis/holders-count/EPjFWdd5AufqSSqe
   "count": 10250
 }
 ```
+
+#### Whale Holders
+
+Get token holders with balances over the specified USD threshold (whales).
+
+**Endpoint:** `GET /token-analysis/whales/{mint}`
+
+**Parameters:**
+- `mint` (path parameter, required): The Solana token mint address
+- `threshold_usd` (query parameter, optional): The minimum USD value to consider a holder a whale (default: $50,000)
+
+**Example Request:**
+```bash
+curl -X GET "http://localhost:8000/token-analysis/whales/EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v?threshold_usd=100000"
+```
+
+**Response:**
+```json
+{
+  "token_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "token_name": "USD Coin",
+  "token_symbol": "USDC",
+  "threshold_usd": 100000.0,
+  "total_holders_analyzed": 100,
+  "whale_count": 3,
+  "whale_percentage": 3.0,
+  "whale_holders": [
+    {
+      "address": "FG4Y3yX4AAchp1HvNZ7LfzFTew5pRpfwAzCiJ1Z9gwBN",
+      "token_balance": 500000.0,
+      "usd_value": 500000.0,
+      "percentage_of_supply": 10.0
+    },
+    {
+      "address": "6QuXb6mB6WmRASP2y8AavXh6aabBXEH5ZzrSH5xRrgSm",
+      "token_balance": 300000.0,
+      "usd_value": 300000.0,
+      "percentage_of_supply": 6.0
+    },
+    {
+      "address": "9vgYWRnxJ7zK8AzFKuEFfRv3mRK3FJPspZKXAa3XNUJs",
+      "token_balance": 150000.0,
+      "usd_value": 150000.0,
+      "percentage_of_supply": 3.0
+    }
+  ],
+  "whale_holdings_percentage": 19.0,
+  "whale_holdings_usd_total": 950000.0,
+  "last_updated": "2024-01-15T12:34:56"
+}
+```
+
+#### Fresh Wallets
+
+Get token holders that only hold this specific token (new wallets with no history of other tokens).
+
+**Endpoint:** `GET /token-analysis/fresh-wallets/{mint}`
+
+**Parameters:**
+- `mint` (path parameter, required): The Solana token mint address
+
+**Example Request:**
+```bash
+curl -X GET "http://localhost:8000/token-analysis/fresh-wallets/EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+```
+
+**Response:**
+```json
+{
+  "token_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "token_name": "USD Coin",
+  "token_symbol": "USDC",
+  "total_holders_analyzed": 100,
+  "fresh_wallet_count": 12,
+  "fresh_wallet_percentage": 12.0,
+  "fresh_wallets": [
+    {
+      "wallet_address": "FG4Y3yX4AAchp1HvNZ7LfzFTew5pRpfwAzCiJ1Z9gwBN",
+      "token_account": "7quA1MV2rnHSDgfkfGaESQ1VjgQTqY9k9QUTaAaLhHrA",
+      "token_balance": 5000.0,
+      "percentage_of_supply": 0.1
+    },
+    {
+      "wallet_address": "6QuXb6mB6WmRASP2y8AavXh6aabBXEH5ZzrSH5xRrgSm",
+      "token_account": "CdKPtCb5fBRaGFS4bJgytfReeHuFyhpe9YUyWHPnEWZG",
+      "token_balance": 2500.0,
+      "percentage_of_supply": 0.05
+    }
+  ],
+  "fresh_wallet_holdings_percentage": 0.15,
+  "fresh_wallet_holdings_token_total": 7500.0,
+  "last_updated": "2024-01-15T12:34:56"
+}
+```
+
+#### Semantic Query
+
+Process a natural language query about tokens to get data based on what's being asked.
+
+**Endpoint:** `POST /token-analysis/query`
+
+**Parameters:**
+- `query` (body parameter, required): The natural language query text (must include a valid token address)
+
+**Example Request:**
+```bash
+curl -X POST "http://localhost:8000/token-analysis/query" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "show me the whales holding more than $100k of EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"}'
+```
+
+**Response:**
+```json
+{
+  "query": "show me the whales holding more than $100k of EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "normalized_query": "show me the whales holding more than $100k of epjfwdd5aufqssqem2qn1xzybapC8g4wegkzwyTdt1v",
+  "primary_intent": "whales",
+  "all_intents": [
+    {"intent": "whales", "confidence": 0.8},
+    {"intent": "holders", "confidence": 0.4}
+  ],
+  "confidence": 0.8,
+  "extracted_parameters": {
+    "token_address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "threshold": 100000.0
+  },
+  "data": {
+    "token_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "token_name": "USD Coin",
+    "token_symbol": "USDC",
+    "threshold_usd": 100000.0,
+    "total_holders_analyzed": 100,
+    "whale_count": 3,
+    "whale_percentage": 3.0,
+    "whale_holders": [
+      {
+        "address": "FG4Y3yX4AAchp1HvNZ7LfzFTew5pRpfwAzCiJ1Z9gwBN",
+        "token_balance": 500000.0,
+        "usd_value": 500000.0,
+        "percentage_of_supply": 10.0
+      },
+      {
+        "address": "6QuXb6mB6WmRASP2y8AavXh6aabBXEH5ZzrSH5xRrgSm",
+        "token_balance": 300000.0,
+        "usd_value": 300000.0,
+        "percentage_of_supply": 6.0
+      },
+      {
+        "address": "9vgYWRnxJ7zK8AzFKuEFfRv3mRK3FJPspZKXAa3XNUJs",
+        "token_balance": 150000.0,
+        "usd_value": 150000.0,
+        "percentage_of_supply": 3.0
+      }
+    ],
+    "whale_holdings_percentage": 19.0,
+    "whale_holdings_usd_total": 950000.0,
+    "last_updated": "2024-01-15T12:34:56"
+  },
+  "additional_data": {
+    "holders": {
+      "total_holders": 15,
+      "largest_holder_percentage": 25.7
+    }
+  },
+  "error": null
+}
+```
+
+**Supported Intents:**
+
+The semantic query system can understand various intents:
+
+1. **General Information:** 
+   - "Tell me about token EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+   - "Show me the basic info for EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+2. **Price Information:**
+   - "What is the price of EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v?"
+   - "How much is token EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v worth?"
+
+3. **Holder Information:**
+   - "Who holds EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v?"
+   - "Show me the top holders of EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+4. **Whale Analysis:**
+   - "Who are the whales for EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v?"
+   - "Show accounts with more than $75k of EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+5. **Fresh Wallet Detection:**
+   - "Show me fresh wallets for EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+   - "Find new accounts only holding EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+6. **Supply Information:**
+   - "What's the supply of EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v?"
+   - "Tell me about the total supply of EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+7. **Authority Information:**
+   - "Who has mint authority for EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v?"
+   - "Can EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v be minted?"
+
+8. **Age Information:**
+   - "How old is token EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v?"
+   - "When was EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v created?"
+
+9. **Risk Assessment:**
+   - "Is EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v a risky token?"
+   - "What are the risk factors for EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v?"
+   - "Is EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v safe to buy?"
+
+10. **Token Comparison:**
+    - "Compare EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v with another token"
+    - "How does EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v stack up?"
+
+**Multi-Intent Queries:**
+
+The system can understand queries with multiple intents. For example:
+
+- "What's the price and whale distribution of EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v?"
+- "Show me risk assessment and fresh wallets for EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+When multiple intents are detected, the system will respond with both the primary and secondary data.
+
+**Natural Language Features:**
+
+- **Threshold Extraction:** Automatically extracts dollar amounts for whale analysis (e.g., "$50k", "100,000 USD", "more than 75k")
+- **Contraction Handling:** Understands common contractions like "what's", "who's", "isn't"
+- **Stopword Removal:** Filters common stopwords for better intent detection
+- **Confidence Scoring:** Provides confidence levels for detected intents
 
 ### Liquidity Pool Analysis
 

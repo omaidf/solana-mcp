@@ -220,7 +220,7 @@ class ServerConfig:
     
     def __post_init__(self):
         """Validate configuration after initialization."""
-        if self.environment not in ("development", "staging", "production"):
+        if self.environment not in ("development", "testing", "staging", "production"):
             raise ValueError(f"Invalid environment: {self.environment}")
         
         if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
@@ -318,15 +318,6 @@ class AppConfig:
     
     # Additional settings as needed
     extra: Dict[str, Any] = field(default_factory=dict)
-    
-    def __post_init__(self):
-        """Perform validation after initialization."""
-        # Add any validation logic here
-        if self.environment not in ("development", "staging", "production"):
-            raise ValueError(f"Invalid environment: {self.environment}")
-        
-        if self.log_level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
-            raise ValueError(f"Invalid log_level: {self.log_level}")
 
 
 def get_app_config() -> AppConfig:

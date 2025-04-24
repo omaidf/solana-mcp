@@ -5,6 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import asyncio
 import logging
+import time
+import sys
 
 # Import routers
 from solana_mcp.api_routes.token_analysis import router as token_analysis_router
@@ -70,9 +72,9 @@ async def log_requests(request: Request, call_next):
     Returns:
         Response from the route handler
     """
-    start_time = asyncio.get_event_loop().time()
+    start_time = time.monotonic()
     response = await call_next(request)
-    process_time = asyncio.get_event_loop().time() - start_time
+    process_time = time.monotonic() - start_time
     
     logger.info(
         f"Request: {request.method} {request.url.path} - "
@@ -90,10 +92,15 @@ if __name__ == "__main__":
     logging.info(f"Starting Solana MCP API in {server_config.environment} mode")
     logging.info(f"Listening on {server_config.bind_address}")
     
-    # Run with uvicorn
-    uvicorn.run(
-        "app:app",
-        host=server_config.host,
-        port=server_config.port,
-        reload=server_config.debug
-    ) 
+    try:
+        # Run with uvicorn
+        uvicorn.run(
+            "app:app",
+            host=server_config.host,
+            port=server_config.port,
+            reload=server_config.debug,
+            log_level=server_config.log_level.lower()
+        )
+    except Exception as e:
+        logging.error(f"Error starting server: {str(e)}", exc_info=True)
+        sys.exit(1) 

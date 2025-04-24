@@ -13,6 +13,7 @@ from solana_mcp.token_analyzer import TokenAnalyzer, TokenAnalysis
 from solana_mcp.solana_client import get_solana_client, SolanaClient, InvalidPublicKeyError
 from solana_mcp.logging_config import get_logger, log_with_context
 from solana_mcp.config import get_server_config
+from solana_mcp.semantic_analysis import TokenQueryAnalyzer
 
 # Set up logging
 logger = get_logger(__name__)
@@ -153,6 +154,13 @@ async def analyze_token(
             "owner_can_freeze": analysis.owner_can_freeze,
             "total_holders": analysis.total_holders,
             "largest_holder_percentage": analysis.largest_holder_percentage,
+            "whale_count": analysis.whale_count,
+            "whale_percentage": analysis.whale_percentage,
+            "whale_holdings_percentage": analysis.whale_holdings_percentage,
+            "whale_holdings_usd_total": analysis.whale_holdings_usd_total,
+            "fresh_wallet_count": analysis.fresh_wallet_count,
+            "fresh_wallet_percentage": analysis.fresh_wallet_percentage,
+            "fresh_wallet_holdings_percentage": analysis.fresh_wallet_holdings_percentage,
             "last_updated": analysis.last_updated.isoformat()
         }
         
@@ -453,4 +461,150 @@ async def get_token_holders_count(
             count=count
         )
         
-        return {"count": count} 
+        return {"count": count}
+
+
+@router.get("/whales/{mint}")
+@handle_token_exceptions
+async def get_whale_holders(
+    request: Request,
+    mint: str,
+    threshold_usd: float = Query(50000.0, description="Minimum USD value to consider a holder a whale"),
+    request_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Get token holders with balances over the specified USD threshold (whales).
+    
+    Args:
+        request: FastAPI request object
+        mint: The token mint address
+        threshold_usd: The minimum USD value to consider a holder a whale (default: $50K)
+        request_id: Optional request ID for tracing
+        
+    Returns:
+        Whale holder data
+    """
+    log_with_context(
+        logger,
+        "info",
+        f"Whale holders requested for: {mint} (threshold: ${threshold_usd})",
+        request_id=request_id,
+        mint=mint,
+        threshold_usd=threshold_usd
+    )
+    
+    async with get_solana_client() as client:
+        analyzer = TokenAnalyzer(client)
+        whale_data = await analyzer.get_whale_holders(mint, threshold_usd=threshold_usd, request_id=request_id)
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Whale holders completed for: {mint}",
+            request_id=request_id,
+            mint=mint,
+            whale_count=whale_data.get("whale_count", 0),
+            whale_holdings_percentage=f"{whale_data.get('whale_holdings_percentage', 0):.2f}%"
+        )
+        
+        return whale_data
+
+
+@router.get("/fresh-wallets/{mint}")
+@handle_token_exceptions
+async def get_fresh_wallets(
+    request: Request,
+    mint: str,
+    request_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Get token holders that only hold this specific token (fresh wallets).
+    
+    Fresh wallets are wallets that have only bought this specific token and no others,
+    which could indicate artificial activity or targeted pump activity.
+    
+    Args:
+        request: FastAPI request object
+        mint: The token mint address
+        request_id: Optional request ID for tracing
+        
+    Returns:
+        Fresh wallet data
+    """
+    log_with_context(
+        logger,
+        "info",
+        f"Fresh wallets requested for: {mint}",
+        request_id=request_id,
+        mint=mint
+    )
+    
+    async with get_solana_client() as client:
+        analyzer = TokenAnalyzer(client)
+        fresh_wallet_data = await analyzer.get_fresh_wallets(mint, request_id=request_id)
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Fresh wallets completed for: {mint}",
+            request_id=request_id,
+            mint=mint,
+            fresh_wallet_count=fresh_wallet_data.get("fresh_wallet_count", 0),
+            fresh_wallet_holdings_percentage=f"{fresh_wallet_data.get('fresh_wallet_holdings_percentage', 0):.2f}%"
+        )
+        
+        return fresh_wallet_data
+
+
+@router.post("/query")
+@handle_token_exceptions
+async def semantic_query(
+    request: Request,
+    query: str,
+    request_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Process a natural language query about tokens.
+    
+    This endpoint uses NLP to understand the intent of a text query and returns
+    the relevant token data based on that intent. It can extract token addresses
+    and other parameters directly from the text.
+    
+    Args:
+        request: FastAPI request object
+        query: The natural language query text
+        request_id: Optional request ID for tracing
+        
+    Returns:
+        Analysis result based on the query intent
+    """
+    log_with_context(
+        logger,
+        "info",
+        f"Semantic query received: {query}",
+        request_id=request_id,
+        query=query
+    )
+    
+    async with get_solana_client() as client:
+        query_analyzer = TokenQueryAnalyzer(client)
+        result = await query_analyzer.analyze_query(query, request_id=request_id)
+        
+        if result.get("error"):
+            log_with_context(
+                logger,
+                "warning",
+                f"Semantic query error: {result['error']}",
+                request_id=request_id,
+                query=query,
+                error=result["error"]
+            )
+        else:
+            log_with_context(
+                logger,
+                "info",
+                f"Semantic query completed successfully",
+                request_id=request_id,
+                query=query,
+                intent=result.get("intent"),
+                confidence=result.get("confidence")
+            )
+        
+        return result 

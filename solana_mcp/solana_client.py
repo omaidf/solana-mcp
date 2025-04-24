@@ -1021,11 +1021,7 @@ w        This method fetches price information for a token from available DEX li
         await self.close()
     
     async def close(self):
-        """Close and clean up resources used by the client.
-        
-        This method should be called when the client is no longer needed.
-        """
-        # Clean up HTTP client if it exists
+        """Close the HTTP client."""
         if self._http_client is not None:
             await self._http_client.aclose()
             self._http_client = None

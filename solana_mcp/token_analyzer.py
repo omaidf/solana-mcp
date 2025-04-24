@@ -59,6 +59,13 @@ class TokenAnalysis:
     owner_can_freeze: bool
     total_holders: int
     largest_holder_percentage: float
+    whale_count: int
+    whale_percentage: float
+    whale_holdings_percentage: float
+    whale_holdings_usd_total: float
+    fresh_wallet_count: int
+    fresh_wallet_percentage: float
+    fresh_wallet_holdings_percentage: float
     last_updated: datetime.datetime
 
 
@@ -95,65 +102,105 @@ class TokenAnalyzer:
             mint=mint
         )
         
-        # Get token metadata
-        metadata = await self.get_token_metadata(mint, request_id=request_id)
-        token_name = metadata.get("name", "Unknown")
-        token_symbol = metadata.get("symbol", "UNKNOWN")
-        
-        # Get token supply and decimals
-        supply_info = await self.get_token_supply_and_decimals(mint, request_id=request_id)
-        decimals = supply_info.get("value", {}).get("decimals", 0)
-        total_supply = supply_info.get("value", {}).get("uiAmountString", "0")
-        
-        # Get holders data
-        holders_data = await self.get_token_largest_holders(mint, request_id=request_id)
-        total_holders = holders_data.get("total_holders", 0)
-        largest_holder_percentage = holders_data.get("largest_holder_percentage", 0)
-        
-        # Get age data
-        age_data = await self.get_token_age(mint, request_id=request_id)
-        launch_date_str = age_data.get("launch_date")
-        launch_date = datetime.datetime.fromisoformat(launch_date_str) if launch_date_str else None
-        age_days = age_data.get("age_days")
-        
-        # Get authority data
-        auth_data = await self.get_token_mint_authority(mint, request_id=request_id)
-        owner_can_mint = auth_data.get("has_mint_authority", False)
-        owner_can_freeze = auth_data.get("has_freeze_authority", False)
-        
-        # Get price data
-        price_data = await self.get_token_price(mint, request_id=request_id)
-        current_price_usd = price_data.get("price_usd", 0.0)
-        
-        # Create analysis result
-        analysis = TokenAnalysis(
-            token_mint=mint,
-            token_name=token_name,
-            token_symbol=token_symbol,
-            decimals=decimals,
-            total_supply=total_supply,
-            circulation_supply=total_supply,  # Simplified, could be calculated based on locked tokens
-            current_price_usd=current_price_usd,
-            launch_date=launch_date,
-            age_days=age_days,
-            owner_can_mint=owner_can_mint,
-            owner_can_freeze=owner_can_freeze,
-            total_holders=total_holders,
-            largest_holder_percentage=largest_holder_percentage,
-            last_updated=datetime.datetime.now()
-        )
-        
-        log_with_context(
-            logger,
-            "info",
-            f"Comprehensive token analysis completed for: {mint}",
-            request_id=request_id,
-            mint=mint,
-            token_name=token_name,
-            token_symbol=token_symbol
-        )
-        
-        return analysis
+        try:
+            # Get token metadata
+            metadata = await self.get_token_metadata(mint, request_id=request_id)
+            token_name = metadata.get("name", "Unknown")
+            token_symbol = metadata.get("symbol", "UNKNOWN")
+            
+            # Get token supply and decimals
+            supply_info = await self.get_token_supply_and_decimals(mint, request_id=request_id)
+            decimals = supply_info.get("value", {}).get("decimals", 0)
+            total_supply = supply_info.get("value", {}).get("uiAmountString", "0")
+            
+            # Get holders data
+            holders_data = await self.get_token_largest_holders(mint, request_id=request_id)
+            total_holders = holders_data.get("total_holders", 0)
+            largest_holder_percentage = holders_data.get("largest_holder_percentage", 0)
+            
+            # Get price data before whale and fresh wallet analysis
+            # as both depend on accurate price data
+            price_data = await self.get_token_price(mint, request_id=request_id)
+            current_price_usd = price_data.get("price_usd", 0.0)
+            
+            # Get whale data
+            try:
+                whale_data = await self.get_whale_holders(mint, request_id=request_id)
+                whale_count = whale_data.get("whale_count", 0)
+                whale_percentage = whale_data.get("whale_percentage", 0.0)
+                whale_holdings_percentage = whale_data.get("whale_holdings_percentage", 0.0)
+                whale_holdings_usd_total = whale_data.get("whale_holdings_usd_total", 0.0)
+            except Exception as e:
+                logger.error(f"Error getting whale data: {str(e)}", exc_info=True)
+                whale_count = 0
+                whale_percentage = 0.0
+                whale_holdings_percentage = 0.0
+                whale_holdings_usd_total = 0.0
+            
+            # Get fresh wallet data
+            try:
+                fresh_wallet_data = await self.get_fresh_wallets(mint, request_id=request_id)
+                fresh_wallet_count = fresh_wallet_data.get("fresh_wallet_count", 0)
+                fresh_wallet_percentage = fresh_wallet_data.get("fresh_wallet_percentage", 0.0)
+                fresh_wallet_holdings_percentage = fresh_wallet_data.get("fresh_wallet_holdings_percentage", 0.0)
+            except Exception as e:
+                logger.error(f"Error getting fresh wallet data: {str(e)}", exc_info=True)
+                fresh_wallet_count = 0
+                fresh_wallet_percentage = 0.0
+                fresh_wallet_holdings_percentage = 0.0
+            
+            # Get age data
+            age_data = await self.get_token_age(mint, request_id=request_id)
+            launch_date_str = age_data.get("launch_date")
+            launch_date = datetime.datetime.fromisoformat(launch_date_str) if launch_date_str else None
+            age_days = age_data.get("age_days")
+            
+            # Get authority data
+            auth_data = await self.get_token_mint_authority(mint, request_id=request_id)
+            owner_can_mint = auth_data.get("has_mint_authority", False)
+            owner_can_freeze = auth_data.get("has_freeze_authority", False)
+            
+            # Create analysis result
+            analysis = TokenAnalysis(
+                token_mint=mint,
+                token_name=token_name,
+                token_symbol=token_symbol,
+                decimals=decimals,
+                total_supply=total_supply,
+                circulation_supply=total_supply,  # Simplified, could be calculated based on locked tokens
+                current_price_usd=current_price_usd,
+                launch_date=launch_date,
+                age_days=age_days,
+                owner_can_mint=owner_can_mint,
+                owner_can_freeze=owner_can_freeze,
+                total_holders=total_holders,
+                largest_holder_percentage=largest_holder_percentage,
+                whale_count=whale_count,
+                whale_percentage=whale_percentage,
+                whale_holdings_percentage=whale_holdings_percentage,
+                whale_holdings_usd_total=whale_holdings_usd_total,
+                fresh_wallet_count=fresh_wallet_count,
+                fresh_wallet_percentage=fresh_wallet_percentage,
+                fresh_wallet_holdings_percentage=fresh_wallet_holdings_percentage,
+                last_updated=datetime.datetime.now()
+            )
+            
+            log_with_context(
+                logger,
+                "info",
+                f"Comprehensive token analysis completed for: {mint}",
+                request_id=request_id,
+                mint=mint,
+                token_name=token_name,
+                token_symbol=token_symbol
+            )
+            
+            return analysis
+            
+        except Exception as e:
+            # Log the error and re-raise to be handled by decorators
+            logger.error(f"Error in analyze_token for {mint}: {str(e)}", exc_info=True)
+            raise
 
     @validate_solana_key
     @handle_errors
@@ -495,6 +542,340 @@ class TokenAnalyzer:
         )
         
         return count
+
+    @validate_solana_key
+    @handle_errors
+    async def get_whale_holders(self, mint: str, threshold_usd: float = 50000.0, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get token holders with balances over the specified USD threshold.
+        
+        Args:
+            mint: The token mint address
+            threshold_usd: The minimum USD value to consider a holder a whale (default: $50K)
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Dictionary with whale holder information
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Whale holders analysis requested for: {mint} (threshold: ${threshold_usd})",
+            request_id=request_id,
+            mint=mint,
+            threshold_usd=threshold_usd
+        )
+        
+        result = {
+            "token_mint": mint,
+            "threshold_usd": threshold_usd,
+            "total_holders_analyzed": 0,
+            "whale_count": 0,
+            "whale_percentage": 0,
+            "whale_holders": [],
+            "whale_holdings_usd_total": 0,
+            "whale_holdings_percentage": 0,
+            "last_updated": datetime.datetime.now().isoformat()
+        }
+        
+        try:
+            # Get token metadata
+            token_metadata = await self.get_token_metadata(mint, request_id=request_id)
+            result["token_name"] = token_metadata.get("name", "Unknown")
+            result["token_symbol"] = token_metadata.get("symbol", "UNKNOWN")
+            
+            # Get current token price
+            price_data = await self.get_token_price(mint, request_id=request_id)
+            price_usd = price_data.get("price_usd", 0.0)
+            
+            # Handle price data reliability
+            if price_usd <= 0:
+                # Try other price sources or estimation methods if available
+                price_sol = price_data.get("price_sol", 0.0)
+                if price_sol > 0:
+                    # Estimate USD price using SOL price if SOL/USD rate is available
+                    # This is a simplistic fallback - in a real implementation, you'd use a reliable oracle
+                    estimated_sol_usd = 100.0  # Fallback estimated SOL/USD price
+                    price_usd = price_sol * estimated_sol_usd
+                    logger.warning(f"Using estimated USD price from SOL price: ${price_usd}")
+                    result["price_source"] = "estimated_from_sol"
+            
+            if price_usd <= 0:
+                result["error"] = "Unable to determine token price in USD"
+                result["price_usd"] = 0.0
+                logger.error(f"Unable to determine USD price for token {mint}")
+                # Continue anyway to gather holder data, but whale detection will be limited
+            else:
+                result["token_price_usd"] = price_usd
+            
+            # Get token supply and decimals
+            supply_info = await self.get_token_supply_and_decimals(mint, request_id=request_id)
+            decimals = supply_info.get("value", {}).get("decimals", 0)
+            total_supply_str = supply_info.get("value", {}).get("uiAmountString", "0")
+            
+            try:
+                total_supply = float(total_supply_str)
+                if total_supply <= 0:
+                    logger.warning(f"Invalid or zero total supply value: {total_supply_str}")
+                    total_supply = 1  # Use a non-zero default to avoid division by zero
+                result["total_supply"] = total_supply
+            except (ValueError, TypeError):
+                logger.warning(f"Could not parse total supply: {total_supply_str}")
+                total_supply = 1  # Use a non-zero default to avoid division by zero
+                result["error"] = f"Invalid total supply value: {total_supply_str}"
+            
+            # Get largest token accounts (limit 100)
+            largest_accounts = await self.client.get_token_largest_accounts(mint)
+            accounts = largest_accounts.get("value", [])
+            
+            result["total_holders_analyzed"] = len(accounts)
+            
+            whale_holders = []
+            whale_holdings_total = 0
+            
+            for account in accounts:
+                try:
+                    # Get account balance in token units with safer parsing
+                    account_balance = 0.0
+                    ui_amount = account.get("uiAmount")
+                    
+                    # Handle different types of uiAmount - could be string or number
+                    if ui_amount is not None:
+                        if isinstance(ui_amount, (int, float)):
+                            account_balance = float(ui_amount)
+                        elif isinstance(ui_amount, str):
+                            try:
+                                account_balance = float(ui_amount)
+                            except (ValueError, TypeError):
+                                logger.warning(f"Could not parse account balance: {ui_amount}")
+                                continue
+                    
+                    # Calculate USD value (will be 0 if price_usd is 0)
+                    balance_usd = account_balance * price_usd
+                    
+                    # Check if this is a whale, but only if we have price data
+                    if price_usd > 0 and balance_usd >= threshold_usd:
+                        percentage_of_supply = (account_balance / total_supply * 100) if total_supply > 0 else 0
+                        
+                        whale_holder = {
+                            "address": account.get("address", "unknown"),
+                            "token_balance": account_balance,
+                            "usd_value": balance_usd,
+                            "percentage_of_supply": percentage_of_supply
+                        }
+                        
+                        whale_holders.append(whale_holder)
+                        whale_holdings_total += account_balance
+                except Exception as e:
+                    logger.error(f"Error processing account balance: {str(e)}", exc_info=True)
+                    continue
+            
+            # Update result with whale data
+            result["whale_count"] = len(whale_holders)
+            result["whale_holders"] = whale_holders
+            
+            if result["total_holders_analyzed"] > 0:
+                result["whale_percentage"] = (result["whale_count"] / result["total_holders_analyzed"]) * 100
+            
+            if total_supply > 0:
+                result["whale_holdings_percentage"] = (whale_holdings_total / total_supply) * 100
+            
+            # Calculate total USD value held by whales
+            result["whale_holdings_usd_total"] = whale_holdings_total * price_usd
+            
+        except Exception as e:
+            logger.error(f"Error analyzing whale holders for {mint}: {str(e)}", exc_info=True)
+            result["error"] = str(e)
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Whale holders analysis completed for: {mint}",
+            request_id=request_id,
+            mint=mint,
+            whale_count=result.get("whale_count", 0),
+            whale_holdings_percentage=f"{result.get('whale_holdings_percentage', 0):.2f}%"
+        )
+        
+        return result
+
+    @validate_solana_key
+    @handle_errors
+    async def get_fresh_wallets(self, mint: str, request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get token holders that only hold this specific token (fresh wallets).
+        
+        Fresh wallets are wallets that have only bought this specific token and no others,
+        which could indicate artificial activity or targeted pump activity.
+        
+        Args:
+            mint: The token mint address
+            request_id: Optional request ID for tracing
+            
+        Returns:
+            Dictionary with fresh wallet information
+        """
+        log_with_context(
+            logger,
+            "info",
+            f"Fresh wallets analysis requested for: {mint}",
+            request_id=request_id,
+            mint=mint
+        )
+        
+        result = {
+            "token_mint": mint,
+            "total_holders_analyzed": 0,
+            "fresh_wallet_count": 0,
+            "fresh_wallet_percentage": 0,
+            "fresh_wallets": [],
+            "fresh_wallet_holdings_percentage": 0,
+            "fresh_wallet_holdings_token_total": 0,
+            "last_updated": datetime.datetime.now().isoformat()
+        }
+        
+        try:
+            # Get token metadata
+            token_metadata = await self.get_token_metadata(mint, request_id=request_id)
+            result["token_name"] = token_metadata.get("name", "Unknown")
+            result["token_symbol"] = token_metadata.get("symbol", "UNKNOWN")
+            
+            # Get token supply and decimals
+            supply_info = await self.get_token_supply_and_decimals(mint, request_id=request_id)
+            decimals = supply_info.get("value", {}).get("decimals", 0)
+            total_supply_str = supply_info.get("value", {}).get("uiAmountString", "0")
+            
+            try:
+                total_supply = float(total_supply_str)
+                if total_supply <= 0:
+                    logger.warning(f"Invalid or zero total supply value: {total_supply_str}")
+                    total_supply = 1  # Use a non-zero default to avoid division by zero
+                result["total_supply"] = total_supply
+            except (ValueError, TypeError):
+                logger.warning(f"Could not parse total supply: {total_supply_str}")
+                total_supply = 1  # Use a non-zero default to avoid division by zero
+                result["error"] = f"Invalid total supply value: {total_supply_str}"
+            
+            # Get largest token accounts (limit 100)
+            largest_accounts = await self.client.get_token_largest_accounts(mint)
+            accounts = largest_accounts.get("value", [])
+            
+            result["total_holders_analyzed"] = len(accounts)
+            
+            fresh_wallets = []
+            fresh_wallet_holdings_total = 0
+            
+            # Set of addresses already analyzed to avoid duplicates
+            analyzed_owners = set()
+            
+            # For each token account, check if the owner only holds this token
+            for account in accounts:
+                account_address = account.get("address", "")
+                account_balance = float(account.get("uiAmount", 0))
+                
+                # Get the owner of this token account
+                try:
+                    token_account_info = await self.client.get_account_info(account_address)
+                    
+                    # Extract owner from the token account data
+                    owner = None
+                    
+                    # Verify that account exists and is a token account
+                    if token_account_info and "result" in token_account_info and token_account_info["result"]:
+                        # Check if the account is owned by the Token Program
+                        account_owner = token_account_info["result"].get("owner")
+                        if account_owner == TOKEN_PROGRAM_ID:
+                            data = token_account_info["result"].get("data")
+                            if isinstance(data, list) and len(data) >= 2 and data[0] == "base64":
+                                try:
+                                    # Decode base64 data
+                                    import base64
+                                    data_bytes = base64.b64decode(data[1])
+                                    
+                                    # Check if data length is sufficient
+                                    if len(data_bytes) >= 64:
+                                        # Extract owner pubkey (offset 32 in token account data)
+                                        import base58
+                                        owner = base58.b58encode(data_bytes[32:64]).decode('utf-8')
+                                except Exception as e:
+                                    logger.error(f"Error decoding account data: {str(e)}")
+                                    continue
+                    
+                    if owner and owner not in analyzed_owners:
+                        analyzed_owners.add(owner)
+                        
+                        # Get all token accounts owned by this wallet
+                        token_accounts = await self.client.get_token_accounts_by_owner(owner)
+                        
+                        # Count how many different tokens this wallet holds
+                        unique_tokens = set()
+                        token_balances = {}
+                        
+                        if "value" in token_accounts:
+                            for token_account in token_accounts["value"]:
+                                account_data = token_account.get("account", {}).get("data", {})
+                                if isinstance(account_data, dict) and "parsed" in account_data:
+                                    parsed_data = account_data["parsed"]
+                                    if "info" in parsed_data and "mint" in parsed_data["info"]:
+                                        token_mint_addr = parsed_data["info"]["mint"]
+                                        token_amount = parsed_data["info"].get("tokenAmount", {})
+                                        token_balance = token_amount.get("uiAmount", 0)
+                                        
+                                        # Only count if balance > 0
+                                        if token_balance > 0:
+                                            unique_tokens.add(token_mint_addr)
+                                            token_balances[token_mint_addr] = token_balance
+                        
+                        # Check if wallet only holds our target token
+                        # A wallet is considered "fresh" if it only holds this specific token
+                        # (checking for only one token in unique_tokens is sufficient since we're only 
+                        # counting tokens with balance > 0, and native SOL isn't counted in token accounts)
+                        is_fresh_wallet = len(unique_tokens) == 1 and mint in unique_tokens
+                        
+                        if is_fresh_wallet:
+                            # Get the specific balance for our target token
+                            target_token_balance = token_balances.get(mint, 0)
+                            percentage_of_supply = (target_token_balance / total_supply * 100) if total_supply > 0 else 0
+                            
+                            fresh_wallet = {
+                                "wallet_address": owner,
+                                "token_account": account_address,
+                                "token_balance": target_token_balance,
+                                "percentage_of_supply": percentage_of_supply
+                            }
+                            
+                            fresh_wallets.append(fresh_wallet)
+                            fresh_wallet_holdings_total += target_token_balance
+                
+                except Exception as e:
+                    logger.error(f"Error processing account {account_address}: {str(e)}", exc_info=True)
+                    continue
+            
+            # Update result with fresh wallet data
+            result["fresh_wallet_count"] = len(fresh_wallets)
+            result["fresh_wallets"] = fresh_wallets
+            
+            if result["total_holders_analyzed"] > 0:
+                result["fresh_wallet_percentage"] = (result["fresh_wallet_count"] / result["total_holders_analyzed"]) * 100
+            
+            if total_supply > 0:
+                result["fresh_wallet_holdings_percentage"] = (fresh_wallet_holdings_total / total_supply) * 100
+            
+            result["fresh_wallet_holdings_token_total"] = fresh_wallet_holdings_total
+            
+        except Exception as e:
+            logger.error(f"Error analyzing fresh wallets for {mint}: {str(e)}", exc_info=True)
+            result["error"] = str(e)
+        
+        log_with_context(
+            logger,
+            "info",
+            f"Fresh wallets analysis completed for: {mint}",
+            request_id=request_id,
+            mint=mint,
+            fresh_wallet_count=result.get("fresh_wallet_count", 0),
+            fresh_wallet_holdings_percentage=f"{result.get('fresh_wallet_holdings_percentage', 0):.2f}%"
+        )
+        
+        return result
 
 
 class MemeTokenAnalyzer:

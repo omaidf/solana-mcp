@@ -38,6 +38,7 @@ from solana_mcp.semantic_search import (
 # Global session store with thread safety - replace the existing SESSION_STORE declaration
 _session_store_lock = threading.Lock()
 SESSION_STORE = {}
+_session_store_async_lock = asyncio.Lock()
 SESSION_EXPIRY = 30  # Session expiry in minutes
 
 logger = logging.getLogger(__name__)
@@ -104,9 +105,6 @@ class Session:
         return datetime.datetime.now() > expiry_time
 
 
-# Use asyncio lock for thread-safety in async context
-_session_store_async_lock = asyncio.Lock()
-
 async def get_or_create_session_async(session_id: Optional[str] = None) -> Session:
     """Get an existing session or create a new one with async support.
     
@@ -159,23 +157,29 @@ def get_or_create_session(session_id: Optional[str] = None) -> Session:
 
 async def clean_expired_sessions_async():
     """Remove expired sessions from the store (async version)."""
+    to_remove = []
     async with _session_store_async_lock:
-        expired_sessions = [
-            session_id for session_id, session in SESSION_STORE.items() 
-            if session.is_expired()
-        ]
-        for session_id in expired_sessions:
+        # First collect the expired sessions
+        for session_id, session in SESSION_STORE.items():
+            if session.is_expired():
+                to_remove.append(session_id)
+        
+        # Then remove them - safer than modifying during iteration
+        for session_id in to_remove:
             del SESSION_STORE[session_id]
 
 
 def clean_expired_sessions():
     """Remove expired sessions from the store (sync version)."""
+    to_remove = []
     with _session_store_lock:
-        expired_sessions = [
-            session_id for session_id, session in SESSION_STORE.items() 
-            if session.is_expired()
-        ]
-        for session_id in expired_sessions:
+        # First collect the expired sessions
+        for session_id, session in SESSION_STORE.items():
+            if session.is_expired():
+                to_remove.append(session_id)
+        
+        # Then remove them - safer than modifying during iteration
+        for session_id in to_remove:
             del SESSION_STORE[session_id]
 
 
