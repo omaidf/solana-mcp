@@ -1,7 +1,10 @@
-"""Error handling utilities for Solana MCP.
+"""
+Error handling utilities for Solana MCP.
 
-This module provides standardized error handling patterns and exception
-classes to maintain consistent error handling across the codebase.
+This module provides standardized error handling mechanisms including:
+- Custom exception classes
+- Decorators for common error handling patterns
+- Utilities for error logging and reporting
 """
 
 import asyncio
@@ -10,11 +13,13 @@ import inspect
 import logging
 import traceback
 import time
+from enum import Enum
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, Union, cast
 from dataclasses import dataclass
 
 import aiohttp
+from solana.rpc.core import RPCException
 
 # Get logger
 logger = logging.getLogger(__name__)
@@ -22,22 +27,35 @@ logger = logging.getLogger(__name__)
 # Type variable for function return types
 T = TypeVar('T')
 F = TypeVar('F', bound=Callable[..., Any])
+AsyncF = TypeVar('AsyncF', bound=Callable[..., asyncio.coroutine])
 
 # Base exception classes
 class SolanaMCPError(Exception):
     """Base exception class for all Solana MCP errors."""
     
-    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the exception.
+    def __init__(
+        self, 
+        message: str, 
+        error_code: ErrorCode = ErrorCode.UNKNOWN_ERROR,
+        details: Optional[Dict[str, Any]] = None
+    ):
+        """Initialize a new SolanaMCPError.
         
         Args:
             message: Error message
+            error_code: Error code from ErrorCode enum
             details: Additional error details
         """
         self.message = message
+        self.error_code = error_code
         self.details = details or {}
-        super().__init__(message)
+        
+        # Format the error message
+        formatted_message = f"[{error_code.name}] {message}"
+        if details:
+            formatted_message += f" - Details: {details}"
+        
+        super().__init__(formatted_message)
 
 
 class ConnectionError(SolanaMCPError):
@@ -95,7 +113,7 @@ class RPCError(SolanaMCPError):
         if endpoint:
             error_details["endpoint"] = endpoint
             
-        super().__init__(message, error_details)
+        super().__init__(message, error_details=error_details)
 
 
 class ValidationError(SolanaMCPError):
@@ -453,3 +471,499 @@ def catch_and_log_exceptions(
             return cast(F, sync_wrapper)
     
     return decorator 
+
+
+class ErrorCode(Enum):
+    """Error codes for Solana MCP."""
+    # General errors
+    UNKNOWN_ERROR = 1000
+    CONFIGURATION_ERROR = 1001
+    VALIDATION_ERROR = 1002
+    NOT_IMPLEMENTED_ERROR = 1003
+    
+    # Network errors
+    NETWORK_ERROR = 2000
+    CONNECTION_ERROR = 2001
+    TIMEOUT_ERROR = 2002
+    REQUEST_ERROR = 2003
+    
+    # RPC errors
+    RPC_ERROR = 3000
+    RPC_RATE_LIMIT_ERROR = 3001
+    RPC_INVALID_PARAMETER_ERROR = 3002
+    RPC_METHOD_NOT_FOUND_ERROR = 3003
+    
+    # Data errors
+    DATA_ERROR = 4000
+    PARSING_ERROR = 4001
+    SERIALIZATION_ERROR = 4002
+    DESERIALIZATION_ERROR = 4003
+    
+    # Transaction errors
+    TRANSACTION_ERROR = 5000
+    TRANSACTION_CONFIRMATION_ERROR = 5001
+    TRANSACTION_SIMULATION_ERROR = 5002
+    TRANSACTION_SIGNING_ERROR = 5003
+
+
+def handle_exceptions(
+    *exception_mappings: Union[Type[Exception], tuple[Type[Exception], Type[SolanaMCPError]]],
+    log_level: int = logging.ERROR,
+    reraise: bool = True,
+    default_error: Optional[Type[SolanaMCPError]] = None
+) -> Callable[[F], F]:
+    """Decorator for handling exceptions.
+    
+    This decorator catches specified exceptions and optionally maps them to custom exceptions.
+    
+    Args:
+        *exception_mappings: Exception types or tuples of (caught_exception, mapped_exception)
+        log_level: Logging level for caught exceptions
+        reraise: Whether to reraise caught exceptions
+        default_error: Default error type to map to if no mapping exists
+        
+    Returns:
+        Decorated function
+        
+    Example:
+        @handle_exceptions(
+            (ValueError, ValidationError),
+            TimeoutError,
+            log_level=logging.WARNING
+        )
+        def process_data(data):
+            # process data
+    """
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # Build exception mapping
+            mappings = {}
+            caught_exceptions = []
+            
+            for item in exception_mappings:
+                if isinstance(item, tuple) and len(item) == 2:
+                    caught_exc, mapped_exc = item
+                    mappings[caught_exc] = mapped_exc
+                    caught_exceptions.append(caught_exc)
+                else:
+                    caught_exc = item
+                    caught_exceptions.append(caught_exc)
+            
+            try:
+                return func(*args, **kwargs)
+            except tuple(caught_exceptions) as e:
+                # Get the exception details
+                exc_type = type(e)
+                exc_msg = str(e)
+                exc_trace = traceback.format_exc()
+                
+                # Log the exception
+                logger.log(log_level, f"Caught exception in {func.__name__}: {exc_type.__name__}: {exc_msg}")
+                if log_level == logging.DEBUG:
+                    logger.debug(f"Traceback: {exc_trace}")
+                
+                # Map the exception if a mapping exists
+                if exc_type in mappings:
+                    mapped_exc_type = mappings[exc_type]
+                    if issubclass(mapped_exc_type, SolanaMCPError):
+                        raise mapped_exc_type(exc_msg, details={"original_exception": exc_type.__name__})
+                elif default_error and issubclass(default_error, SolanaMCPError):
+                    raise default_error(exc_msg, details={"original_exception": exc_type.__name__})
+                
+                # Reraise the original exception if requested
+                if reraise:
+                    raise
+                
+                # Return None if not reraising
+                return None
+        
+        return cast(F, wrapper)
+    
+    return decorator
+
+
+def handle_async_exceptions(
+    *exception_mappings: Union[Type[Exception], tuple[Type[Exception], Type[SolanaMCPError]]],
+    log_level: int = logging.ERROR,
+    reraise: bool = True,
+    default_error: Optional[Type[SolanaMCPError]] = None
+) -> Callable[[AsyncF], AsyncF]:
+    """Decorator for handling exceptions in async functions.
+    
+    This decorator catches specified exceptions and optionally maps them to custom exceptions.
+    
+    Args:
+        *exception_mappings: Exception types or tuples of (caught_exception, mapped_exception)
+        log_level: Logging level for caught exceptions
+        reraise: Whether to reraise caught exceptions
+        default_error: Default error type to map to if no mapping exists
+        
+    Returns:
+        Decorated async function
+        
+    Example:
+        @handle_async_exceptions(
+            (aiohttp.ClientError, NetworkError),
+            asyncio.TimeoutError,
+            log_level=logging.WARNING
+        )
+        async def fetch_data(url):
+            # fetch data
+    """
+    def decorator(func: AsyncF) -> AsyncF:
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            # Build exception mapping
+            mappings = {}
+            caught_exceptions = []
+            
+            for item in exception_mappings:
+                if isinstance(item, tuple) and len(item) == 2:
+                    caught_exc, mapped_exc = item
+                    mappings[caught_exc] = mapped_exc
+                    caught_exceptions.append(caught_exc)
+                else:
+                    caught_exc = item
+                    caught_exceptions.append(caught_exc)
+            
+            try:
+                return await func(*args, **kwargs)
+            except tuple(caught_exceptions) as e:
+                # Get the exception details
+                exc_type = type(e)
+                exc_msg = str(e)
+                exc_trace = traceback.format_exc()
+                
+                # Log the exception
+                logger.log(log_level, f"Caught exception in {func.__name__}: {exc_type.__name__}: {exc_msg}")
+                if log_level == logging.DEBUG:
+                    logger.debug(f"Traceback: {exc_trace}")
+                
+                # Map the exception if a mapping exists
+                if exc_type in mappings:
+                    mapped_exc_type = mappings[exc_type]
+                    if issubclass(mapped_exc_type, SolanaMCPError):
+                        raise mapped_exc_type(exc_msg, details={"original_exception": exc_type.__name__})
+                elif default_error and issubclass(default_error, SolanaMCPError):
+                    raise default_error(exc_msg, details={"original_exception": exc_type.__name__})
+                
+                # Reraise the original exception if requested
+                if reraise:
+                    raise
+                
+                # Return None if not reraising
+                return None
+        
+        return cast(AsyncF, wrapper)
+    
+    return decorator
+
+
+def retry(
+    max_attempts: int = 3,
+    retry_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+    retryable_exceptions: List[Type[Exception]] = None,
+    log_level: int = logging.WARNING
+) -> Callable[[F], F]:
+    """Decorator to retry a function on failure.
+    
+    Args:
+        max_attempts: Maximum number of retry attempts
+        retry_delay: Initial delay between retries in seconds
+        backoff_factor: Factor to increase delay between retries
+        retryable_exceptions: List of exceptions that trigger a retry
+        log_level: Logging level for retry attempts
+        
+    Returns:
+        Decorated function
+        
+    Example:
+        @retry(
+            max_attempts=5,
+            retry_delay=0.5,
+            backoff_factor=1.5,
+            retryable_exceptions=[ConnectionError, TimeoutError]
+        )
+        def fetch_data(url):
+            # fetch data
+    """
+    if retryable_exceptions is None:
+        retryable_exceptions = [Exception]
+    
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            delay = retry_delay
+            
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except tuple(retryable_exceptions) as e:
+                    last_exception = e
+                    
+                    if attempt < max_attempts:
+                        logger.log(
+                            log_level, 
+                            f"Retry {attempt}/{max_attempts} for {func.__name__} after error: {str(e)}. "
+                            f"Retrying in {delay:.2f}s"
+                        )
+                        time.sleep(delay)
+                        delay *= backoff_factor
+                    else:
+                        logger.log(
+                            log_level, 
+                            f"Max retries ({max_attempts}) reached for {func.__name__} with error: {str(e)}"
+                        )
+            
+            # If we get here, all retries failed
+            if last_exception:
+                raise last_exception
+            
+            # This should never happen, but just in case
+            raise RuntimeError(f"All retries failed for {func.__name__} but no exception was caught")
+        
+        return cast(F, wrapper)
+    
+    return decorator
+
+
+def async_retry(
+    max_attempts: int = 3,
+    retry_delay: float = 1.0,
+    backoff_factor: float = 2.0,
+    retryable_exceptions: List[Type[Exception]] = None,
+    log_level: int = logging.WARNING
+) -> Callable[[AsyncF], AsyncF]:
+    """Decorator to retry an async function on failure.
+    
+    Args:
+        max_attempts: Maximum number of retry attempts
+        retry_delay: Initial delay between retries in seconds
+        backoff_factor: Factor to increase delay between retries
+        retryable_exceptions: List of exceptions that trigger a retry
+        log_level: Logging level for retry attempts
+        
+    Returns:
+        Decorated async function
+        
+    Example:
+        @async_retry(
+            max_attempts=5,
+            retry_delay=0.5,
+            backoff_factor=1.5,
+            retryable_exceptions=[aiohttp.ClientError, asyncio.TimeoutError]
+        )
+        async def fetch_data(url):
+            # fetch data
+    """
+    if retryable_exceptions is None:
+        retryable_exceptions = [Exception]
+    
+    def decorator(func: AsyncF) -> AsyncF:
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+            delay = retry_delay
+            
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except tuple(retryable_exceptions) as e:
+                    last_exception = e
+                    
+                    if attempt < max_attempts:
+                        logger.log(
+                            log_level, 
+                            f"Retry {attempt}/{max_attempts} for {func.__name__} after error: {str(e)}. "
+                            f"Retrying in {delay:.2f}s"
+                        )
+                        await asyncio.sleep(delay)
+                        delay *= backoff_factor
+                    else:
+                        logger.log(
+                            log_level, 
+                            f"Max retries ({max_attempts}) reached for {func.__name__} with error: {str(e)}"
+                        )
+            
+            # If we get here, all retries failed
+            if last_exception:
+                raise last_exception
+            
+            # This should never happen, but just in case
+            raise RuntimeError(f"All retries failed for {func.__name__} but no exception was caught")
+        
+        return cast(AsyncF, wrapper)
+    
+    return decorator
+
+
+def map_rpc_errors(func: AsyncF) -> AsyncF:
+    """Decorator to map RPC errors to custom exceptions.
+    
+    This decorator catches RPCException and maps it to appropriate custom exceptions
+    based on the error code.
+    
+    Args:
+        func: Async function to decorate
+        
+    Returns:
+        Decorated async function
+    """
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except RPCException as e:
+            # Extract error details
+            error_data = getattr(e, "data", None) or {}
+            error_code = error_data.get("code", 0)
+            error_message = error_data.get("message", str(e))
+            
+            # Map to specific error types based on error code
+            if error_code == -32002:
+                raise RPCError(
+                    f"RPC rate limit exceeded: {error_message}", 
+                    ErrorCode.RPC_RATE_LIMIT_ERROR, 
+                    details=error_data
+                )
+            elif error_code == -32602:
+                raise RPCError(
+                    f"Invalid RPC parameters: {error_message}", 
+                    ErrorCode.RPC_INVALID_PARAMETER_ERROR, 
+                    details=error_data
+                )
+            elif error_code == -32601:
+                raise RPCError(
+                    f"RPC method not found: {error_message}", 
+                    ErrorCode.RPC_METHOD_NOT_FOUND_ERROR, 
+                    details=error_data
+                )
+            else:
+                # Generic RPC error
+                raise RPCError(
+                    f"RPC error: {error_message}", 
+                    ErrorCode.RPC_ERROR, 
+                    details=error_data
+                )
+        except aiohttp.ClientError as e:
+            raise NetworkError(f"Network error: {str(e)}", details={"original_exception": type(e).__name__})
+        except asyncio.TimeoutError:
+            raise NetworkError("Request timed out", details={"error_code": ErrorCode.TIMEOUT_ERROR.value})
+    
+    return cast(AsyncF, wrapper)
+
+
+def validate_parameters(func: F) -> F:
+    """Decorator to validate function parameters.
+    
+    This decorator checks for None values in required parameters and raises
+    ValidationError if any are found.
+    
+    Args:
+        func: Function to decorate
+        
+    Returns:
+        Decorated function
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        # Get the signature
+        sig = inspect.signature(func)
+        
+        # Bind the arguments
+        bound_args = sig.bind(*args, **kwargs)
+        
+        # Check for None values in required parameters
+        for param_name, param in sig.parameters.items():
+            if param.default is param.empty and param_name in bound_args.arguments:
+                if bound_args.arguments[param_name] is None:
+                    raise ValidationError(
+                        f"Required parameter '{param_name}' cannot be None in {func.__name__}",
+                        details={"parameter": param_name}
+                    )
+        
+        return func(*args, **kwargs)
+    
+    return cast(F, wrapper)
+
+
+def validate_async_parameters(func: AsyncF) -> AsyncF:
+    """Decorator to validate async function parameters.
+    
+    This decorator checks for None values in required parameters and raises
+    ValidationError if any are found.
+    
+    Args:
+        func: Async function to decorate
+        
+    Returns:
+        Decorated async function
+    """
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        # Get the signature
+        sig = inspect.signature(func)
+        
+        # Bind the arguments
+        bound_args = sig.bind(*args, **kwargs)
+        
+        # Check for None values in required parameters
+        for param_name, param in sig.parameters.items():
+            if param.default is param.empty and param_name in bound_args.arguments:
+                if bound_args.arguments[param_name] is None:
+                    raise ValidationError(
+                        f"Required parameter '{param_name}' cannot be None in {func.__name__}",
+                        details={"parameter": param_name}
+                    )
+        
+        return await func(*args, **kwargs)
+    
+    return cast(AsyncF, wrapper)
+
+
+# Common exception mappings
+COMMON_NETWORK_EXCEPTIONS = [
+    (aiohttp.ClientError, NetworkError),
+    (asyncio.TimeoutError, NetworkError),
+    (ConnectionError, NetworkError),
+    (TimeoutError, NetworkError),
+]
+
+COMMON_DATA_EXCEPTIONS = [
+    (ValueError, DataError),
+    (TypeError, DataError),
+    (KeyError, DataError),
+    (AttributeError, DataError),
+]
+
+# Specialized decorators using the handle_exceptions decorator
+handle_network_exceptions = functools.partial(
+    handle_exceptions,
+    *COMMON_NETWORK_EXCEPTIONS,
+    log_level=logging.WARNING,
+    default_error=NetworkError
+)
+
+handle_data_exceptions = functools.partial(
+    handle_exceptions,
+    *COMMON_DATA_EXCEPTIONS,
+    log_level=logging.WARNING,
+    default_error=DataError
+)
+
+handle_async_network_exceptions = functools.partial(
+    handle_async_exceptions,
+    *COMMON_NETWORK_EXCEPTIONS,
+    log_level=logging.WARNING,
+    default_error=NetworkError
+)
+
+handle_async_data_exceptions = functools.partial(
+    handle_async_exceptions,
+    *COMMON_DATA_EXCEPTIONS,
+    log_level=logging.WARNING,
+    default_error=DataError
+) 
