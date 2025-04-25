@@ -3,10 +3,9 @@ Caching system for Solana RPC responses to reduce load and improve performance.
 """
 
 import time
-import json
 import logging
 import asyncio
-from typing import Any, Dict, Callable, List, Optional, Union
+from typing import Any, Dict, Callable, Optional
 from functools import wraps
 
 # Setup logging
