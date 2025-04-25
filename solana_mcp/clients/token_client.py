@@ -5,6 +5,8 @@ This module provides specialized client functionality for Solana token operation
 
 import base64
 from typing import Dict, List, Any, Optional
+import datetime
+import httpx
 
 from solana_mcp.clients.base_client import BaseSolanaClient, InvalidPublicKeyError, validate_public_key
 from solana_mcp.logging_config import get_logger
@@ -233,76 +235,38 @@ class TokenClient(BaseSolanaClient):
         try:
             logger.debug(f"Fetching token metadata for mint: {mint}")
             
-            # Try to find the metadata account using two approaches
-            metadata_response = None
-            try:
-                # First approach: Use more specific filters
-                metadata_response = await self._make_request(
-                    "getProgramAccounts",
-                    [
-                        METADATA_PROGRAM_ID,
-                        {
-                            "encoding": "base64",
-                            "filters": [
-                                {"dataSize": 679},  # Expected size of metadata accounts
-                                {
-                                    "memcmp": {
-                                        "offset": 33,
-                                        "bytes": mint
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                )
-                
-                if not metadata_response or len(metadata_response.get("result", [])) == 0:
-                    # Second approach: Try with just the mint filter
-                    metadata_response = await self._make_request(
-                        "getProgramAccounts",
-                        [
-                            METADATA_PROGRAM_ID,
-                            {
-                                "encoding": "base64",
-                                "filters": [
-                                    {
-                                        "memcmp": {
-                                            "offset": 33,
-                                            "bytes": mint
-                                        }
-                                    }
-                                ]
-                            }
+            # Get metadata account using memcmp filter
+            metadata_response = await self._make_request(
+                "getProgramAccounts",
+                [
+                    METADATA_PROGRAM_ID,
+                    {
+                        "encoding": "base64",
+                        "filters": [
+                            {"memcmp": {"offset": 33, "bytes": mint}}
                         ]
-                    )
-            except Exception as e:
-                logger.error(f"Error fetching metadata accounts: {str(e)}")
-                return default_metadata
+                    }
+                ]
+            )
             
-            if metadata_response and "result" in metadata_response:
-                result = metadata_response["result"]
-                
-                if len(result) > 0:
-                    # Extract metadata from the first account
-                    account_info = result[0]
-                    if "account" in account_info and "data" in account_info["account"]:
-                        data = account_info["account"]["data"]
-                        if isinstance(data, list) and data[1] == "base64":
-                            decoded_data = base64.b64decode(data[0])
-                            
-                            # Parsing metadata - using safer methods with bounds checking
-                            if len(decoded_data) < 70:  # Minimum length for valid metadata
-                                logger.warning(f"Metadata account data too short for mint: {mint}")
-                                return default_metadata
-                            
-                            # Read name length (1-byte at offset 0x28/40)
+            if metadata_response and "result" in metadata_response and len(metadata_response["result"]) > 0:
+                # Extract metadata from the first account
+                account_info = metadata_response["result"][0]
+                if "account" in account_info and "data" in account_info["account"]:
+                    data = account_info["account"]["data"]
+                    if isinstance(data, list) and data[1] == "base64":
+                        decoded_data = base64.b64decode(data[0])
+                        
+                        # Ensure we have enough data
+                        if len(decoded_data) > 50:
+                            # Name length is at offset 40 (1 byte)
                             name_length_offset = 40
                             if len(decoded_data) <= name_length_offset:
                                 return default_metadata
                                 
                             name_length = decoded_data[name_length_offset]
                             
-                            # Read name bytes with bounds checking
+                            # Name starts at offset 41
                             name_start = name_length_offset + 1
                             name_end = name_start + name_length
                             if name_end > len(decoded_data):
@@ -310,14 +274,14 @@ class TokenClient(BaseSolanaClient):
                                 
                             name = decoded_data[name_start:name_end].decode('utf-8').rstrip('\x00')
                             
-                            # Read symbol length (1-byte after name)
+                            # Symbol length comes after name
                             symbol_length_offset = name_end
                             if len(decoded_data) <= symbol_length_offset:
                                 return {**default_metadata, "name": name or default_metadata["name"]}
                                 
                             symbol_length = decoded_data[symbol_length_offset]
                             
-                            # Read symbol bytes with bounds checking
+                            # Symbol starts after symbol length
                             symbol_start = symbol_length_offset + 1
                             symbol_end = symbol_start + symbol_length
                             if symbol_end > len(decoded_data):
@@ -325,7 +289,7 @@ class TokenClient(BaseSolanaClient):
                                 
                             symbol = decoded_data[symbol_start:symbol_end].decode('utf-8').rstrip('\x00')
                             
-                            # Read URI length (1-byte after symbol)
+                            # URI length comes after symbol
                             uri_length_offset = symbol_end
                             if len(decoded_data) <= uri_length_offset:
                                 return {
@@ -336,7 +300,7 @@ class TokenClient(BaseSolanaClient):
                                 
                             uri_length = decoded_data[uri_length_offset]
                             
-                            # Read URI bytes with bounds checking
+                            # URI starts after URI length
                             uri_start = uri_length_offset + 1
                             uri_end = uri_start + uri_length
                             if uri_end > len(decoded_data):
@@ -352,11 +316,217 @@ class TokenClient(BaseSolanaClient):
                             
                             logger.debug(f"Successfully parsed metadata for {mint}: {metadata}")
                             return metadata
+                            
+            # If we get here, try an alternative approach using Jupiter token list API
+            try:
+                # Try to get from Jupiter token list API
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(f"https://token.jup.ag/all")
+                    if response.status_code == 200:
+                        tokens = response.json()
+                        for token in tokens:
+                            if token.get("address") == mint:
+                                return {
+                                    "name": token.get("name", default_metadata["name"]),
+                                    "symbol": token.get("symbol", default_metadata["symbol"]),
+                                    "uri": token.get("logoURI", default_metadata["uri"]),
+                                    "source": "jupiter"
+                                }
+            except Exception as e:
+                logger.warning(f"Error fetching from Jupiter API: {str(e)}")
                 
-            # If we get here, return the default supply info
+            # If we get here, return the default metadata
             logger.warning(f"Could not parse token metadata for {mint}, using default values")
             return default_metadata
             
         except Exception as e:
             logger.error(f"Error fetching token metadata for {mint}: {str(e)}")
-            return default_metadata 
+            return default_metadata
+    
+    async def get_token_price(self, token_mint: str) -> Dict[str, Any]:
+        """Get token price from Birdeye API.
+        
+        Args:
+            token_mint: The mint address of the token
+            
+        Returns:
+            Dict containing price information including:
+            - price: current price in USD
+            - price_change_24h: 24-hour price change percentage
+            - last_updated: timestamp of last update
+            
+        Raises:
+            InvalidPublicKeyError: If the token_mint is not a valid Solana public key
+        """
+        if not validate_public_key(token_mint):
+            raise InvalidPublicKeyError(token_mint)
+            
+        # Default response with fallback price
+        default_response = {
+            "price": 0.0,
+            "price_change_24h": 0.0,
+            "last_updated": datetime.datetime.now().isoformat(),
+            "source": "fallback"
+        }
+        
+        try:
+            # Birdeye API endpoint
+            BIRDEYE_API = "https://public-api.birdeye.so/public/price"
+            headers = {"x-chain": "solana"}
+            
+            # Use httpx instead of requests to maintain async
+            async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+                response = await client.get(
+                    f"{BIRDEYE_API}?address={token_mint}",
+                    headers=headers
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                if data.get('success'):
+                    price_data = data['data']
+                    return {
+                        "price": price_data['value'],
+                        "price_change_24h": price_data['change24h'],
+                        "last_updated": datetime.datetime.fromtimestamp(price_data['updateUnixTime']).isoformat(),
+                        "source": "birdeye"
+                    }
+                
+                logger.warning(f"Birdeye API returned unsuccessful response for {token_mint}")
+                return default_response
+                
+        except Exception as e:
+            logger.error(f"Error fetching price from Birdeye for {token_mint}: {str(e)}")
+            return default_response
+            
+    async def get_token_holders(self, token_mint: str, limit: int = 10) -> Dict[str, Any]:
+        """Get top token holders from Solana FM API.
+        
+        Args:
+            token_mint: The mint address of the token
+            limit: Maximum number of holders to return. Defaults to 10.
+            
+        Returns:
+            Dict containing list of holders with their balances
+            
+        Raises:
+            InvalidPublicKeyError: If the token_mint is not a valid Solana public key
+        """
+        if not validate_public_key(token_mint):
+            raise InvalidPublicKeyError(token_mint)
+            
+        # Default response with empty holders
+        default_response = {
+            "holders": [],
+            "total_holders": 0,
+            "source": "fallback"
+        }
+        
+        try:
+            # Solana FM API endpoint
+            SOLANA_FM_API = f"https://api.solana.fm/v0/tokens/{token_mint}/holders?limit={limit}"
+            
+            # Use httpx instead of requests to maintain async
+            async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+                response = await client.get(SOLANA_FM_API)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Process and return the holder data
+                if "data" in data and "items" in data["data"]:
+                    holders = []
+                    for holder in data["data"]["items"]:
+                        try:
+                            holders.append({
+                                "address": holder.get("address", ""),
+                                "amount": holder.get("amount", "0"),
+                                "ui_amount": holder.get("uiAmount", 0),
+                                "percentage": holder.get("percentage", 0)
+                            })
+                        except (KeyError, TypeError) as e:
+                            logger.warning(f"Error parsing holder data: {str(e)}")
+                    
+                    return {
+                        "holders": holders,
+                        "total_holders": data["data"].get("totalItems", len(holders)),
+                        "source": "solana_fm"
+                    }
+                
+                logger.warning(f"Unexpected response format from Solana FM API for {token_mint}")
+                return default_response
+                
+        except Exception as e:
+            logger.error(f"Error fetching holders from Solana FM for {token_mint}: {str(e)}")
+            return default_response
+            
+    async def get_all_token_data(self, token_mint: str, holder_limit: int = 10) -> Dict[str, Any]:
+        """Get comprehensive token data combining metadata, supply, price, and holder information.
+        
+        Args:
+            token_mint: The mint address of the token
+            holder_limit: Maximum number of holders to return. Defaults to 10.
+            
+        Returns:
+            Consolidated token data including metadata, supply, price, and holders
+            
+        Raises:
+            InvalidPublicKeyError: If the token_mint is not a valid Solana public key
+        """
+        if not validate_public_key(token_mint):
+            raise InvalidPublicKeyError(token_mint)
+            
+        # Get token metadata (name, symbol, etc.)
+        metadata = await self.get_token_metadata(token_mint)
+        
+        # Get token supply information
+        supply_data = await self.get_token_supply(token_mint)
+        
+        # Get token price information
+        price_data = await self.get_token_price(token_mint)
+        
+        # Get token holders information
+        holders_data = await self.get_token_holders(token_mint, limit=holder_limit)
+        
+        # Combine all data into a comprehensive response
+        result = {
+            "token_mint": token_mint,
+            "name": metadata.get("name", "Unknown"),
+            "symbol": metadata.get("symbol", "UNKNOWN"),
+            "decimals": supply_data.get("supply", {}).get("decimals", 0),
+            "supply": {
+                "amount": supply_data.get("supply", {}).get("amount", "0"),
+                "ui_amount": supply_data.get("supply", {}).get("ui_amount", 0.0),
+                "ui_amount_string": supply_data.get("supply", {}).get("ui_amount_string", "0")
+            },
+            "price": {
+                "current_price_usd": price_data.get("price", 0.0),
+                "price_change_24h": price_data.get("price_change_24h", 0.0),
+                "last_updated": price_data.get("last_updated", datetime.datetime.now().isoformat()),
+                "source": price_data.get("source", "unknown")
+            },
+            "holders": {
+                "total_holders": holders_data.get("total_holders", 0),
+                "top_holders": holders_data.get("holders", [])
+            },
+            "metadata": {
+                "uri": metadata.get("uri", ""),
+                "source": metadata.get("source", "metaplex")
+            },
+            "last_updated": datetime.datetime.now().isoformat()
+        }
+        
+        # Include error information if any of the API calls failed
+        errors = []
+        if "error" in metadata:
+            errors.append({"metadata_error": metadata["error"]})
+        if "error" in supply_data:
+            errors.append({"supply_error": supply_data["error"]})
+        if "error" in price_data:
+            errors.append({"price_error": price_data["error"]})
+        if "error" in holders_data:
+            errors.append({"holders_error": holders_data["error"]})
+            
+        if errors:
+            result["errors"] = errors
+            
+        return result 

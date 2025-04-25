@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Union, cast, Tuple, TypeVar
 from contextlib import asynccontextmanager
 from urllib.parse import urljoin
 import uuid
+import base58
+from solana.rpc.api import Pubkey
 
 # Third-party library imports
 import httpx
@@ -934,8 +936,8 @@ class SolanaClient:
                             token_a_mint_bytes = decoded_data[200:232]
                             token_b_mint_bytes = decoded_data[232:264]
                             
-                            token_a_mint = str(PublicKey(bytes(token_a_mint_bytes)))
-                            token_b_mint = str(PublicKey(bytes(token_b_mint_bytes)))
+                            token_a_mint = str(Pubkey.from_string(base58.encode(bytes(token_a_mint_bytes))))
+                            token_b_mint = str(Pubkey.from_string(base58.encode(bytes(token_b_mint_bytes))))
                             
                             token_a_reserves = int.from_bytes(decoded_data[264:272], byteorder="little")
                             token_b_reserves = int.from_bytes(decoded_data[296:304], byteorder="little")

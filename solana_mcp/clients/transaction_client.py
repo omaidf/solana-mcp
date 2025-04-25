@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
-from solana.publickey import PublicKey
+from solana.rpc.api import Pubkey
 from solana.transaction import Transaction
 
 from solana_mcp.models.enhanced_transaction import EnhancedTransaction
@@ -205,7 +205,7 @@ class TransactionClient:
         account_keys_raw = message.get("accountKeys", [])
         
         try:
-            account_keys = [PublicKey(key) for key in account_keys_raw]
+            account_keys = [Pubkey.from_string(key) for key in account_keys_raw]
         except ValueError as e:
             raise DataError(
                 f"Invalid public key in transaction: {str(e)}",
@@ -238,7 +238,7 @@ class TransactionClient:
         return enhanced_tx
 
     def _extract_token_transfers(
-        self, meta: Dict[str, Any], account_keys: List[PublicKey]
+        self, meta: Dict[str, Any], account_keys: List[Pubkey]
     ) -> List[TokenTransfer]:
         """Extract token transfers from transaction metadata.
 

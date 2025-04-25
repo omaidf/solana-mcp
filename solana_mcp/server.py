@@ -1,22 +1,17 @@
 """Solana MCP server implementation using FastMCP."""
 
-import anyio
 import click
 import json
 import uuid
 import re
 import asyncio
-import sys
-import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, AsyncIterator, Union, Tuple, Set
 import datetime
-import threading
 import logging
 import time
-from decimal import Decimal
-import requests
+from decimal import Decimal, InvalidOperation
 
 from mcp.server.fastmcp import Context, FastMCP
 import mcp.types as types
@@ -28,8 +23,9 @@ from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
+from starlette.exceptions import HTTPException
 
-from solana_mcp.config import ServerConfig, get_server_config
+from solana_mcp.config import ServerConfig, get_server_config, get_app_config
 from solana_mcp.solana_client import (
     SolanaClient, get_solana_client, SolanaRpcError, InvalidPublicKeyError,
     TOKEN_PROGRAM_ID, METADATA_PROGRAM_ID
@@ -43,11 +39,6 @@ from solana_mcp.semantic_search import (
 # Import the refactored modules
 from solana_mcp.nlp.parser import parse_natural_language_query
 from solana_mcp.nlp.formatter import format_response
-from solana_mcp.services.whale_detector.detector import detect_whale_wallets
-from solana_mcp.services.fresh_wallet.detector import detect_fresh_wallets
-
-# Import wallet classifier (internal module)
-from solana_mcp.wallet_classifier import WalletClassifier
 
 # Global session store with thread safety - replace the existing SESSION_STORE declaration
 _session_store_async_lock = asyncio.Lock()
@@ -255,75 +246,6 @@ TRANSACTION_CATEGORIES = {
     "program_deploy": ["bpf loader", "deploy", "upgrade", "program"],
     "failed": ["failed", "error", "rejected"]
 }
-
-# Basic patterns for NL query understanding
-QUERY_PATTERNS = [
-    # Balance queries
-    {
-        "pattern": r"(?:what is|get|show|check|find) (?:the )?(?:sol|solana)? ?balance (?:of|for) (?:address |wallet |account )?([a-zA-Z0-9]{32,44})",
-        "intent": "get_balance",
-        "params": lambda match: {"address": match.group(1)}
-    },
-    # Account info queries
-    {
-        "pattern": r"(?:what is|get|show|check|find) (?:the )?(?:information|info|details) (?:about|for|of) (?:address |wallet |account )?([a-zA-Z0-9]{32,44})",
-        "intent": "get_account_info",
-        "params": lambda match: {"address": match.group(1)}
-    },
-    # Token queries
-    {
-        "pattern": r"(?:what is|get|show|check|find) (?:the )?(?:token|tokens|token info|token details) (?:of|for|owned by) (?:address |wallet |account )?([a-zA-Z0-9]{32,44})",
-        "intent": "get_token_accounts",
-        "params": lambda match: {"owner": match.group(1)}
-    },
-    # Token info
-    {
-        "pattern": r"(?:what is|get|show|check|find) (?:the )?(?:information|info|details) (?:about|for|of) token (?:with mint )?([a-zA-Z0-9]{32,44})",
-        "intent": "get_token_info",
-        "params": lambda match: {"mint": match.group(1)}
-    },
-    # Transaction history
-    {
-        "pattern": r"(?:what are|get|show|check|find) (?:the )?(?:transactions|tx|transaction history) (?:of|for|by) (?:address |wallet |account )?([a-zA-Z0-9]{32,44})(?: with limit (\d+))?",
-        "intent": "get_transactions",
-        "params": lambda match: {"address": match.group(1), "limit": int(match.group(2)) if match.group(2) else 20}
-    },
-    # NFT queries
-    {
-        "pattern": r"(?:what is|get|show|check|find) (?:the )?(?:nft|nft info|nft details) (?:with mint )?([a-zA-Z0-9]{32,44})",
-        "intent": "get_nft_info",
-        "params": lambda match: {"mint": match.group(1)}
-    },
-    # Whale queries - Find whales (large holders) for a token
-    {
-        "pattern": r"(?:are there|are there any|do you see|can you find|any) (?:whales|whale|large holder|big investor|big wallet) (?:in|for|holding) (?:this token|this|token|mint)? ?([a-zA-Z0-9]{32,44})",
-        "intent": "get_token_whales",
-        "params": lambda match: {"mint": match.group(1)}
-    },
-    # Fresh wallet queries - Find new/fresh wallets for a token
-    {
-        "pattern": r"(?:are there|are there any|do you see|can you find|any) (?:fresh|new|recent|suspicious) (?:wallets|wallet|holder|holders|account|accounts) (?:in|for|holding) (?:this token|this|token|mint)? ?([a-zA-Z0-9]{32,44})",
-        "intent": "get_fresh_wallets",
-        "params": lambda match: {"mint": match.group(1)}
-    },
-]
-
-# This function now delegates to the imported implementation
-async def parse_natural_language_query(query: str, solana_client: SolanaClient, session: Session = None) -> Dict[str, Any]:
-    """Parse a natural language query into an API call.
-    
-    Args:
-        query: The natural language query
-        solana_client: The Solana client
-        session: Optional session for context
-        
-    Returns:
-        The query results
-    """
-    # This function has been moved to solana_mcp/nlp/parser.py
-    # Delegating to the imported implementation
-    return await parse_natural_language_query(query, solana_client, session)
-
 
 # -------------------------------------------
 # Context-Aware Response Formatting
@@ -667,18 +589,19 @@ async def rest_session_history(request):
     """Get session query history."""
     session_id = request.path_params.get("session_id")
     
-    if not session_id or session_id not in SESSION_STORE:
-        return JSONResponse({"error": "Session not found"}, status_code=404)
-    
-    session = SESSION_STORE[session_id]
-    
-    return JSONResponse({
-        "session_id": session.id,
-        "created_at": session.created_at.isoformat(),
-        "last_accessed": session.last_accessed.isoformat(),
-        "query_count": len(session.query_history),
-        "queries": session.query_history
-    })
+    async with _session_store_async_lock:
+        if not session_id or session_id not in SESSION_STORE:
+            return JSONResponse({"error": "Session not found"}, status_code=404)
+        
+        session = SESSION_STORE[session_id]
+        
+        return JSONResponse({
+            "session_id": session.id,
+            "created_at": session.created_at.isoformat(),
+            "last_accessed": session.last_accessed.isoformat(),
+            "query_count": len(session.query_history),
+            "queries": session.query_history
+        })
 
 
 # -------------------------------------------
@@ -1010,6 +933,8 @@ async def rest_chain_analysis(request):
                 # Analyze token transfers (simplified)
                 # In a real implementation, you'd parse program instructions
                 # to identify token transfers and their directions
+                # TODO: Enhance token flow analysis to handle complex transactions (e.g., swaps, multi-sends)
+                # The current logic only compares pre/post balances and may misattribute flows.
                 if "meta" in tx and "postTokenBalances" in tx["meta"] and "preTokenBalances" in tx["meta"]:
                     for pre, post in zip(tx["meta"]["preTokenBalances"], tx["meta"]["postTokenBalances"]):
                         if pre["owner"] == address and pre["uiTokenAmount"]["uiAmount"] > post["uiTokenAmount"]["uiAmount"]:
@@ -1075,497 +1000,38 @@ async def rest_chain_analysis(request):
 
 
 # -------------------------------------------
-# Account Information Resources
-# -------------------------------------------
-
-@app.resource("solana://account/{address}")
-async def get_account(address: str) -> str:
-    """Get Solana account information.
-    
-    Args:
-        address: The account address
-        
-    Returns:
-        Account information as JSON string
-    """
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            account_info = await solana_client.get_account_info(address, encoding="jsonParsed")
-            return json.dumps(account_info, indent=2)
-    except InvalidPublicKeyError as e:
-        return json.dumps({"error": str(e)})
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-@app.resource("solana://balance/{address}")
-async def get_balance(address: str) -> str:
-    """Get Solana account balance.
-    
-    Args:
-        address: The account address
-        
-    Returns:
-        Account balance in SOL
-    """
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            balance_lamports = await solana_client.get_balance(address)
-            balance_sol = balance_lamports / 1_000_000_000  # Convert lamports to SOL
-            return json.dumps({
-                "lamports": balance_lamports,
-                "sol": balance_sol,
-                "formatted": f"{balance_sol} SOL ({balance_lamports} lamports)"
-            }, indent=2)
-    except InvalidPublicKeyError as e:
-        return json.dumps({"error": str(e)})
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-# -------------------------------------------
-# Token Information Resources
-# -------------------------------------------
-
-@app.resource("solana://tokens/{owner}")
-async def get_token_accounts(owner: str) -> str:
-    """Get token accounts owned by an address.
-    
-    Args:
-        owner: The owner address
-        
-    Returns:
-        Token account information as JSON string
-    """
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            token_accounts = await solana_client.get_token_accounts_by_owner(owner)
-            return json.dumps(token_accounts, indent=2)
-    except InvalidPublicKeyError as e:
-        return json.dumps({"error": str(e)})
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-@app.resource("solana://token/{mint}")
-async def get_token_info(mint: str) -> str:
-    """Get token information.
-    
-    Args:
-        mint: The token mint address
-        
-    Returns:
-        Token information as JSON string
-    """
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            # Get token supply
-            supply = await solana_client.get_token_supply(mint)
-            
-            # Get token metadata
-            metadata = await solana_client.get_token_metadata(mint)
-            
-            # Get largest token accounts
-            largest_accounts = await solana_client.get_token_largest_accounts(mint)
-            
-            # Get market price data if available
-            price_data = await solana_client.get_market_price(mint)
-            
-            # Compile all information
-            token_info = {
-                "mint": mint,
-                "supply": supply,
-                "metadata": metadata,
-                "largest_accounts": largest_accounts,
-                "price_data": price_data
-            }
-            
-            return json.dumps(token_info, indent=2)
-    except InvalidPublicKeyError as e:
-        return json.dumps({"error": str(e)})
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-@app.resource("solana://token/{mint}/holders")
-async def get_token_holders(mint: str) -> str:
-    """Get token holders for a mint.
-    
-    Args:
-        mint: The token mint address
-        
-    Returns:
-        Token holders information as JSON string
-    """
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            # Get largest accounts for this token
-            largest_accounts = await solana_client.get_token_largest_accounts(mint)
-            
-            # For each account, get the owner
-            holders = []
-            for account in largest_accounts:
-                # Get the account info to find the owner
-                account_info = await solana_client.get_account_info(
-                    account["address"], 
-                    encoding="jsonParsed"
-                )
-                
-                # Extract owner and balance information
-                if "parsed" in account_info.get("data", {}):
-                    parsed_data = account_info["data"]["parsed"]
-                    if "info" in parsed_data:
-                        info = parsed_data["info"]
-                        holders.append({
-                            "owner": info.get("owner"),
-                            "address": account["address"],
-                            "amount": info.get("tokenAmount", {}).get("amount"),
-                            "decimals": info.get("tokenAmount", {}).get("decimals"),
-                            "uiAmount": info.get("tokenAmount", {}).get("uiAmount")
-                        })
-            
-            return json.dumps({"mint": mint, "holders": holders}, indent=2)
-    except InvalidPublicKeyError as e:
-        return json.dumps({"error": str(e)})
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-# -------------------------------------------
-# Transaction Resources
-# -------------------------------------------
-
-@app.resource("solana://transaction/{signature}")
-async def get_transaction_details(signature: str) -> str:
-    """Get transaction details.
-    
-    Args:
-        signature: The transaction signature
-        
-    Returns:
-        Transaction details as JSON string
-    """
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            tx_details = await solana_client.get_transaction(signature)
-            return json.dumps(tx_details, indent=2)
-    except ValueError as e:  # Invalid signature format
-        return json.dumps({"error": str(e)})
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-@app.resource("solana://transactions/{address}")
-async def get_address_transactions(address: str) -> str:
-    """Get transaction history for an address.
-    
-    Args:
-        address: The account address
-        
-    Returns:
-        Transaction history as JSON string
-    """
-    limit = 20  # Default value
-    before = None  # Default value
-    
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            # Get signatures
-            # Create options dictionary
-            options = {"limit": limit}
-            if before:
-                options["before"] = before
-                
-            signatures = await solana_client.get_signatures_for_address(
-                address,
-                options
-            )
-            
-            # For detailed view, we could get full transaction details
-            # But that would be a lot of RPC calls
-            # Instead just return the signatures with metadata
-            
-            return json.dumps({
-                "address": address,
-                "transactions": signatures
-            }, indent=2)
-    except InvalidPublicKeyError as e:
-        return json.dumps({"error": str(e)})
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-# -------------------------------------------
-# Program Resources
-# -------------------------------------------
-
-@app.resource("solana://program/{program_id}")
-async def get_program_info(program_id: str) -> str:
-    """Get program information.
-    
-    Args:
-        program_id: The program ID
-        
-    Returns:
-        Program information as JSON string
-    """
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            # Get the program account itself
-            program_account = await solana_client.get_account_info(program_id, encoding="jsonParsed")
-            
-            # Prepare result
-            program_info = {
-                "program_id": program_id,
-                "account": program_account,
-                "is_executable": program_account.get("executable", False),
-                "owner": program_account.get("owner"),
-                "lamports": program_account.get("lamports", 0)
-            }
-            
-            return json.dumps(program_info, indent=2)
-    except InvalidPublicKeyError as e:
-        return json.dumps({"error": str(e)})
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-@app.resource("solana://program/{program_id}/accounts")
-async def get_program_account_list(program_id: str) -> str:
-    """Get accounts owned by a program.
-    
-    Args:
-        program_id: The program ID
-        
-    Returns:
-        Program accounts as JSON string
-    """
-    # Default values
-    limit = 10  # Default to 10 to avoid large responses
-    offset = 0
-    memcmp = None  # JSON-encoded memcmp filter
-    datasize = None  # Filter by data size
-    
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            filters = []
-            
-            # Add memcmp filter if provided
-            if memcmp:
-                try:
-                    memcmp_filter = json.loads(memcmp)
-                    filters.append({"memcmp": memcmp_filter})
-                except json.JSONDecodeError:
-                    return json.dumps({"error": "Invalid memcmp JSON format"})
-            
-            # Add datasize filter if provided
-            if datasize is not None:
-                filters.append({"dataSize": datasize})
-            
-            # Get program accounts with pagination
-            accounts = await solana_client.get_program_accounts(
-                program_id,
-                filters=filters if filters else None,
-                encoding="jsonParsed",
-                limit=limit,
-                offset=offset
-            )
-            
-            # Count total found
-            account_count = len(accounts)
-            
-            return json.dumps({
-                "program_id": program_id,
-                "count": account_count,
-                "limit": limit,
-                "offset": offset,
-                "accounts": accounts
-            }, indent=2)
-    except InvalidPublicKeyError as e:
-        return json.dumps({"error": str(e)})
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-# -------------------------------------------
-# Network Status Resources
-# -------------------------------------------
-
-@app.resource("solana://network/epoch")
-async def get_network_epoch() -> str:
-    """Get current epoch information.
-    
-    Returns:
-        Epoch information as JSON string
-    """
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            epoch_info = await solana_client.get_epoch_info()
-            inflation_rate = await solana_client.get_inflation_rate()
-            
-            # Combine information
-            network_info = {
-                "epoch_info": epoch_info,
-                "inflation_rate": inflation_rate
-            }
-            
-            return json.dumps(network_info, indent=2)
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-@app.resource("solana://network/validators")
-async def get_network_validators() -> str:
-    """Get information about validators.
-    
-    Returns:
-        Validator information as JSON string
-    """
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            nodes = await solana_client.get_cluster_nodes()
-            
-            return json.dumps({
-                "validators": nodes
-            }, indent=2)
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-# -------------------------------------------
-# NFT Resources
-# -------------------------------------------
-
-@app.resource("solana://nft/{mint}")
-async def get_nft_info(mint: str) -> str:
-    """Get NFT information.
-    
-    Args:
-        mint: The NFT mint address
-        
-    Returns:
-        NFT information as JSON string
-    """
-    try:
-        from solana_mcp.solana_client import get_solana_client
-        async with get_solana_client() as solana_client:
-            # Get token metadata
-            metadata = await solana_client.get_token_metadata(mint)
-            
-            # Get token account to find the owner
-            largest_accounts = await solana_client.get_token_largest_accounts(mint)
-            
-            # Get the current owner if possible
-            owner = None
-            if largest_accounts and len(largest_accounts) > 0:
-                # Get the account with the highest balance
-                largest_account = largest_accounts[0]["address"]
-                account_info = await solana_client.get_account_info(largest_account, encoding="jsonParsed")
-                
-                if "parsed" in account_info.get("data", {}):
-                    parsed_data = account_info["data"]["parsed"]
-                    if "info" in parsed_data:
-                        owner = parsed_data["info"].get("owner")
-                
-            # Compile NFT information
-            nft_info = {
-                "mint": mint,
-                "metadata": metadata,
-                "owner": owner,
-                "token_standard": "Unknown"  # In a real implementation, determine if it's NFT/SFT
-            }
-            
-            return json.dumps(nft_info, indent=2)
-    except InvalidPublicKeyError as e:
-        return json.dumps({"error": str(e)})
-    except SolanaRpcError as e:
-        return json.dumps({"error": str(e), "details": e.error_data})
-    except Exception as e:
-        return json.dumps({"error": f"Unexpected error: {str(e)}"})
-
-
-# -------------------------------------------
-# Tool Implementations
+# Tool Implementations (Simplified Error Handling)
 # -------------------------------------------
 
 @app.tool()
 async def get_solana_account(ctx: Context, address: str) -> str:
-    """Fetch a Solana account's information.
-    
-    Args:
-        ctx: The request context
-        address: The account public key
-        
-    Returns:
-        Formatted account information
-    """
+    """Fetch a Solana account's information (MCP Tool). Uses utility function."""
     solana_client = ctx.request_context.lifespan_context.solana_client
+    # Use utility function
     try:
-        account_info = await solana_client.get_account_info(address, encoding="jsonParsed")
-        return json.dumps(account_info, indent=2)
-    except InvalidPublicKeyError as e:
-        return f"Error: {str(e)}"
-    except SolanaRpcError as e:
-        return f"Solana RPC Error: {str(e)}"
+        # Request detailed format, let utility handle errors
+        account_info = await get_account_details(address, solana_client, format_level="detailed")
+        # Return JSON string representation of the result
+        return json.dumps(account_info, indent=2, default=str)
     except Exception as e:
-        return f"Error fetching account: {str(e)}"
+        # Catch unexpected errors not handled by utility func
+        logger.error(f"Unexpected error in get_solana_account tool for {address}: {e}", exc_info=True)
+        # Tools typically return strings, format error message
+        return f"Unexpected Error: {str(e)}"
 
 
 @app.tool()
 async def get_solana_balance(ctx: Context, address: str) -> str:
-    """Fetch a Solana account's balance.
-    
-    Args:
-        ctx: The request context
-        address: The account public key
-        
-    Returns:
-        Account balance in SOL
-    """
+    """Fetch a Solana account's balance (MCP Tool). Uses utility function."""
     solana_client = ctx.request_context.lifespan_context.solana_client
+    # Use utility function
     try:
-        balance_lamports = await solana_client.get_balance(address)
-        balance_sol = balance_lamports / 1_000_000_000  # Convert lamports to SOL
-        return f"{balance_sol} SOL ({balance_lamports} lamports)"
-    except InvalidPublicKeyError as e:
-        return f"Error: {str(e)}"
-    except SolanaRpcError as e:
-        return f"Solana RPC Error: {str(e)}"
+        balance_info = await get_account_balance(address, solana_client, format_level="detailed")
+        # Return JSON string representation of the result
+        return json.dumps(balance_info, indent=2, default=str)
     except Exception as e:
-        return f"Error fetching balance: {str(e)}"
+        logger.error(f"Unexpected error in get_solana_balance tool for {address}: {e}", exc_info=True)
+        return f"Unexpected Error: {str(e)}"
 
 
 @app.tool()
@@ -1741,97 +1207,77 @@ async def get_token_metadata(ctx: Context, mint: str) -> str:
 
 @app.tool()
 async def get_token_holders(ctx: Context, mint: str, limit: int = 10) -> str:
-    """Get holders for a token.
-    
-    Args:
-        ctx: The request context
-        mint: The mint address
-        limit: Maximum number of holders to return
-        
-    Returns:
-        Token holders information
-    """
+    """Get holders for a token (MCP Tool - uses efficient internal helper)."""
     solana_client = ctx.request_context.lifespan_context.solana_client
+    # Use efficient internal helper function
     try:
-        # Get largest accounts for this token
-        largest_accounts = await solana_client.get_token_largest_accounts(mint)
-        
-        # Limit the number of accounts to process
-        accounts_to_process = largest_accounts[:limit] if len(largest_accounts) > limit else largest_accounts
-        
-        # For each account, get the owner
-        holders = []
-        for account in accounts_to_process:
-            # Get the account info to find the owner
-            account_info = await solana_client.get_account_info(
-                account["address"], 
-                encoding="jsonParsed"
-            )
-            
-            # Extract owner and balance information
-            if "parsed" in account_info.get("data", {}):
-                parsed_data = account_info["data"]["parsed"]
-                if "info" in parsed_data:
-                    info = parsed_data["info"]
-                    holders.append({
-                        "owner": info.get("owner"),
-                        "address": account["address"],
-                        "amount": info.get("tokenAmount", {}).get("amount"),
-                        "decimals": info.get("tokenAmount", {}).get("decimals"),
-                        "uiAmount": info.get("tokenAmount", {}).get("uiAmount")
-                    })
-        
+        holders_data = await _get_token_holders_internal(mint, solana_client, limit=limit)
+
+        # Convert Decimal amounts to string/float for JSON serialization in tool response
+        response_holders = []
+        for holder in holders_data:
+            try:
+                 # Calculate uiAmount if decimals are available
+                 ui_amount = None
+                 if holder.get('decimals') is not None:
+                     ui_amount = float(holder['amount'] / (Decimal(10)**holder['decimals']))
+
+                 response_holders.append({
+                     "owner": holder["owner"],
+                     "address": holder["address"],
+                     "amount": str(holder['amount']), # Raw amount as string
+                     "decimals": holder.get('decimals'),
+                     "uiAmount": ui_amount # Calculated uiAmount
+                 })
+            except Exception as e:
+                 logger.warning(f"Error processing holder data for JSON response in tool: {holder}, Error: {e}")
+                 response_holders.append({
+                     "owner": holder.get("owner"),
+                     "address": holder.get("address"),
+                     "amount": "Error processing amount",
+                 })
+
         return json.dumps({
-            "mint": mint, 
-            "total_holders": len(largest_accounts),
-            "holders_shown": len(holders),
-            "holders": holders
+            "mint": mint,
+            "holders_returned": len(response_holders),
+            "limit_applied": limit,
+            "holders": response_holders
+            # Note: Total holder count is not efficiently available via getProgramAccounts
         }, indent=2)
     except InvalidPublicKeyError as e:
-        return f"Error: {str(e)}"
+        return f"Error: Invalid mint address: {str(e)}"
     except SolanaRpcError as e:
+        logger.error(f"Solana RPC Error in get_token_holders tool for {mint}: {e} - Details: {e.error_data}", exc_info=True)
         return f"Solana RPC Error: {str(e)}"
     except Exception as e:
-        return f"Error fetching token holders: {str(e)}"
+        logger.error(f"Unexpected error in get_token_holders tool for {mint}: {e}", exc_info=True)
+        return f"Unexpected Error: {str(e)}"
 
 
 @app.tool()
 async def get_transaction_history(
-    ctx: Context, 
-    address: str, 
-    limit: int = 10, 
+    ctx: Context,
+    address: str,
+    limit: int = 10,
     before: str = None
 ) -> str:
-    """Get transaction history for an address.
-    
-    Args:
-        ctx: The request context
-        address: The account address
-        limit: Maximum number of transactions to return
-        before: Signature to search backwards from
-        
-    Returns:
-        Transaction history
-    """
+    """Get transaction history for an address (MCP Tool). Uses utility function."""
     solana_client = ctx.request_context.lifespan_context.solana_client
+    # Use utility function
     try:
-        signatures = await solana_client.get_signatures_for_address(
-            address, 
-            before=before, 
-            limit=limit
+        tx_history = await get_transaction_history_for_address(
+            address,
+            solana_client,
+            limit=limit,
+            before=before,
+            format_level="detailed" # Request detailed format from utility
         )
-        
-        return json.dumps({
-            "address": address,
-            "transaction_count": len(signatures),
-            "transactions": signatures
-        }, indent=2)
-    except InvalidPublicKeyError as e:
-        return f"Error: {str(e)}"
-    except SolanaRpcError as e:
-        return f"Solana RPC Error: {str(e)}"
+        # Return JSON string representation of the result
+        return json.dumps(tx_history, indent=2, default=str)
     except Exception as e:
-        return f"Error fetching transaction history: {str(e)}"
+        # Catch unexpected errors not handled by utility func
+        logger.error(f"Unexpected error in get_transaction_history tool for {address}: {e}", exc_info=True)
+        return f"Unexpected Error: {str(e)}"
 
 
 @app.tool()
@@ -1915,211 +1361,200 @@ def token_analysis() -> types.Prompt:
 # Add REST API handlers
 
 async def rest_get_account(request):
-    """REST API endpoint for getting account info"""
+    """REST API endpoint for getting account info. Uses utility function."""
     address = request.path_params.get("address")
+    format_level = request.query_params.get("format", "standard") # Allow format control
+
     if not address:
         return JSONResponse({
             "error": "Missing address parameter",
             "error_explanation": "The account address must be provided in the URL path."
         }, status_code=400)
-        
+
+    if not validate_public_key(address):
+         return JSONResponse({
+            "error": "Invalid address format",
+            "error_explanation": explain_solana_error("Invalid public key")
+        }, status_code=400)
+
     solana_client = request.app.state.solana_client
     try:
-        account_info = await solana_client.get_account_info(address, encoding="jsonParsed")
+        # Use utility function
+        account_info = await get_account_details(address, solana_client, format_level=format_level)
+        # Utility function returns dict with potential 'error' key
+        if "error" in account_info:
+            status_code = 400 if "Invalid public key" in account_info.get("error","") else 500
+            return JSONResponse(account_info, status_code=status_code)
         return JSONResponse(account_info)
-    except InvalidPublicKeyError as e:
-        return JSONResponse({
-            "error": str(e),
-            "error_explanation": explain_solana_error(str(e))
-        }, status_code=400)
-    except SolanaRpcError as e:
-        return JSONResponse({
-            "error": str(e),
-            "error_explanation": explain_solana_error(str(e)),
-            "details": e.error_data
-        }, status_code=500)
     except Exception as e:
+        logger.error(f"Unexpected error in rest_get_account for {address}: {e}", exc_info=True)
         return JSONResponse({
-            "error": f"Unexpected error: {str(e)}",
-            "error_explanation": "An unexpected error occurred while processing your request."
+            "error": f"Unexpected server error",
+            "error_explanation": "An unexpected internal error occurred while fetching account details."
         }, status_code=500)
 
 
 async def rest_get_balance(request):
-    """REST API endpoint for getting account balance"""
+    """REST API endpoint for getting account balance. Uses utility function."""
     address = request.path_params.get("address")
+    format_level = request.query_params.get("format", "standard") # Allow format control
+
     if not address:
         return JSONResponse({
             "error": "Missing address parameter",
             "error_explanation": "The account address must be provided in the URL path."
         }, status_code=400)
-        
+
+    if not validate_public_key(address):
+         return JSONResponse({
+            "error": "Invalid address format",
+            "error_explanation": explain_solana_error("Invalid public key")
+        }, status_code=400)
+
     solana_client = request.app.state.solana_client
     try:
-        balance_lamports = await solana_client.get_balance(address)
-        balance_sol = balance_lamports / 1_000_000_000  # Convert lamports to SOL
-        return JSONResponse({
-            "lamports": balance_lamports,
-            "sol": balance_sol,
-            "formatted": f"{balance_sol} SOL ({balance_lamports} lamports)"
-        })
-    except InvalidPublicKeyError as e:
-        return JSONResponse({
-            "error": str(e),
-            "error_explanation": explain_solana_error(str(e))
-        }, status_code=400)
-    except SolanaRpcError as e:
-        return JSONResponse({
-            "error": str(e),
-            "error_explanation": explain_solana_error(str(e)),
-            "details": e.error_data
-        }, status_code=500)
+        # Use utility function
+        balance_info = await get_account_balance(address, solana_client, format_level=format_level)
+        # Utility function returns dict with potential 'error' key
+        if "error" in balance_info:
+            status_code = 400 if "Invalid public key" in balance_info.get("error","") else 500
+            # Consider 404 if account not found (utility might need to return specific error)
+            return JSONResponse(balance_info, status_code=status_code)
+        return JSONResponse(balance_info)
     except Exception as e:
+        logger.error(f"Unexpected error in rest_get_balance for {address}: {e}", exc_info=True)
         return JSONResponse({
-            "error": f"Unexpected error: {str(e)}",
-            "error_explanation": "An unexpected error occurred while processing your request."
+            "error": f"Unexpected server error",
+            "error_explanation": "An unexpected internal error occurred while fetching balance."
         }, status_code=500)
 
 
 async def rest_get_token_info(request):
-    """REST API endpoint for getting token info"""
+    """REST API endpoint for getting token info. Uses utility function."""
     mint = request.path_params.get("mint")
+    format_level = request.query_params.get("format", "standard") # Allow format control
+
+    if not mint:
+        return JSONResponse({"error": "Missing mint parameter"}, status_code=400)
+
+    if not validate_public_key(mint):
+         return JSONResponse({
+            "error": "Invalid mint address format",
+            "error_explanation": explain_solana_error("Invalid public key")
+        }, status_code=400)
+
     solana_client = request.app.state.solana_client
     try:
-        # Get token supply
-        supply = await solana_client.get_token_supply(mint)
-        
-        # Get token metadata
-        metadata = await solana_client.get_token_metadata(mint)
-        
-        # Get largest token accounts
-        largest_accounts = await solana_client.get_token_largest_accounts(mint)
-        
-        # Get market price data if available
-        price_data = await solana_client.get_market_price(mint)
-        
-        # Compile all information
-        token_info = {
-            "mint": mint,
-            "supply": supply,
-            "metadata": metadata,
-            "largest_accounts": largest_accounts,
-            "price_data": price_data
-        }
-        
-        return JSONResponse(token_info)
-    except InvalidPublicKeyError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-    except SolanaRpcError as e:
-        return JSONResponse({"error": str(e), "details": e.error_data}, status_code=500)
+         # Use utility function
+        token_details = await get_token_details(mint, solana_client, format_level=format_level)
+        # Utility function returns dict with potential 'error' key
+        if "error" in token_details:
+            status_code = 400 if "Invalid public key" in token_details.get("error","") else 500
+            # Consider 404 if mint not found
+            return JSONResponse(token_details, status_code=status_code)
+        # Convert Decimal fields for JSON response if format_level isn't minimal
+        if format_level != "minimal":
+            if token_details.get('supply',{}).get('value',{}).get('amount'):
+                try:
+                    token_details['supply']['value']['amount'] = str(Decimal(token_details['supply']['value']['amount']))
+                except: pass # Ignore conversion errors
+            if token_details.get('price_data',{}).get('price'):
+                try:
+                    token_details['price_data']['price'] = float(Decimal(token_details['price_data']['price']))
+                except: pass
+            # Convert largest_accounts amounts?
+
+        return JSONResponse(token_details)
     except Exception as e:
-        return JSONResponse({"error": f"Unexpected error: {str(e)}"}, status_code=500)
+        logger.error(f"Unexpected error in rest_get_token_info for {mint}: {e}", exc_info=True)
+        return JSONResponse({
+            "error": f"Unexpected server error",
+            "error_explanation": "An unexpected internal error occurred while fetching token details."
+        }, status_code=500)
 
 
 async def rest_get_transactions(request):
-    """REST API endpoint for getting transaction history"""
+    """REST API endpoint for getting transaction history. Uses utility function for non-search."""
     address = request.path_params.get("address")
     limit = int(request.query_params.get("limit", "20"))
     before = request.query_params.get("before")
     search_query = request.query_params.get("search")
-    
-    solana_client = request.app.state.solana_client
-    
-    # Handle semantic search if query provided
-    if search_query:
-        try:
-            results = await semantic_transaction_search(address, search_query, solana_client, limit)
-            return JSONResponse(results)
-        except InvalidPublicKeyError as e:
-            return JSONResponse({
-                "error": str(e), 
-                "error_explanation": explain_solana_error(str(e))
-            }, status_code=400)
-        except SolanaRpcError as e:
-            return JSONResponse({
-                "error": str(e), 
-                "error_explanation": explain_solana_error(str(e)), 
-                "details": e.error_data
-            }, status_code=500)
-        except Exception as e:
-            return JSONResponse({
-                "error": f"Unexpected error: {str(e)}",
-                "error_explanation": "An unexpected error occurred while processing your request."
-            }, status_code=500)
-    
-    # Otherwise, get regular transaction history
-    try:
-        # Get signatures
-        # Create options dictionary
-        options = {"limit": limit}
-        if before:
-            options["before"] = before
-            
-        signatures = await solana_client.get_signatures_for_address(
-            address,
-            options
-        )
-        
-        return JSONResponse({
-            "address": address,
-            "transactions": signatures
-        })
-    except InvalidPublicKeyError as e:
-        return JSONResponse({
-            "error": str(e), 
-            "error_explanation": explain_solana_error(str(e))
+    format_level = request.query_params.get("format", "standard") # Allow format control
+
+    if not address:
+        return JSONResponse({"error": "Missing address parameter"}, status_code=400)
+
+    if not validate_public_key(address):
+         return JSONResponse({
+            "error": "Invalid address format",
+            "error_explanation": explain_solana_error("Invalid public key")
         }, status_code=400)
-    except SolanaRpcError as e:
-        return JSONResponse({
-            "error": str(e), 
-            "error_explanation": explain_solana_error(str(e)), 
-            "details": e.error_data
-        }, status_code=500)
+
+    solana_client = request.app.state.solana_client
+
+    try:
+        # Handle semantic search if query provided
+        if search_query:
+            # Assume semantic_transaction_search handles errors internally or raises
+            # It should ideally return a dict with an error key on failure
+            results = await semantic_transaction_search(address, search_query, solana_client, limit)
+            status_code = 200
+            if isinstance(results, dict) and "error" in results:
+                 status_code = 400 if "Invalid public key" in results.get("error", "") else 500
+            return JSONResponse(results, status_code=status_code)
+
+        # Otherwise, get regular transaction history using utility function
+        else:
+            tx_history = await get_transaction_history_for_address(
+                address,
+                solana_client,
+                limit=limit,
+                before=before,
+                format_level=format_level
+            )
+            # Utility function returns dict with potential 'error' key
+            if "error" in tx_history:
+                status_code = 400 if "Invalid public key" in tx_history.get("error","") else 500
+                return JSONResponse(tx_history, status_code=status_code)
+            return JSONResponse(tx_history)
+
     except Exception as e:
+        logger.error(f"Unexpected error in rest_get_transactions for {address}: {e}", exc_info=True)
         return JSONResponse({
-            "error": f"Unexpected error: {str(e)}",
-            "error_explanation": "An unexpected error occurred while processing your request."
+            "error": f"Unexpected server error",
+            "error_explanation": "An unexpected internal error occurred while fetching transactions."
         }, status_code=500)
 
 
 async def rest_get_nft_info(request):
-    """REST API endpoint for getting NFT info"""
+    """REST API endpoint for getting NFT info. Uses utility function."""
     mint = request.path_params.get("mint")
+    format_level = request.query_params.get("format", "standard") # Allow format control
+
+    if not mint:
+        return JSONResponse({"error": "Missing mint parameter"}, status_code=400)
+
+    if not validate_public_key(mint):
+         return JSONResponse({
+            "error": "Invalid mint address format",
+            "error_explanation": explain_solana_error("Invalid public key")
+        }, status_code=400)
+
     solana_client = request.app.state.solana_client
     try:
-        # Get token metadata
-        metadata = await solana_client.get_token_metadata(mint)
-        
-        # Get token account to find the owner
-        largest_accounts = await solana_client.get_token_largest_accounts(mint)
-        
-        # Get the current owner if possible
-        owner = None
-        if largest_accounts and len(largest_accounts) > 0:
-            # Get the account with the highest balance
-            largest_account = largest_accounts[0]["address"]
-            account_info = await solana_client.get_account_info(largest_account, encoding="jsonParsed")
-            
-            if "parsed" in account_info.get("data", {}):
-                parsed_data = account_info["data"]["parsed"]
-                if "info" in parsed_data:
-                    owner = parsed_data["info"].get("owner")
-        
-        # Compile NFT information
-        nft_info = {
-            "mint": mint,
-            "metadata": metadata,
-            "owner": owner,
-            "token_standard": "Unknown"  # In a real implementation, determine if it's NFT/SFT
-        }
-        
-        return JSONResponse(nft_info)
-    except InvalidPublicKeyError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-    except SolanaRpcError as e:
-        return JSONResponse({"error": str(e), "details": e.error_data}, status_code=500)
+        # Use utility function
+        nft_details = await get_nft_details(mint, solana_client, format_level=format_level)
+        # Utility function returns dict with potential 'error' key
+        if "error" in nft_details:
+             status_code = 400 if "Invalid public key" in nft_details.get("error","") else 500
+             return JSONResponse(nft_details, status_code=status_code)
+        return JSONResponse(nft_details)
     except Exception as e:
-        return JSONResponse({"error": f"Unexpected error: {str(e)}"}, status_code=500)
+        logger.error(f"Unexpected error in rest_get_nft_info for {mint}: {e}", exc_info=True)
+        return JSONResponse({
+            "error": f"Unexpected server error",
+            "error_explanation": "An unexpected internal error occurred while fetching NFT details."
+        }, status_code=500)
 
 
 async def health_check(request):
@@ -2298,25 +1733,6 @@ async def api_docs(request):
                 ]
             }
         },
-        "/api/analysis": {
-            "post": {
-                "summary": "Analyze blockchain patterns",
-                "requestBody": {
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "properties": {
-                                    "type": {"type": "string", "enum": ["token_flow", "activity_pattern"]},
-                                    "address": {"type": "string"}
-                                },
-                                "required": ["type", "address"]
-                            }
-                        }
-                    }
-                }
-            }
-        },
         "/api/whale-detector": {
             "post": {
                 "summary": "Find whale wallets for a specific token",
@@ -2455,9 +1871,6 @@ def run_server(
                 Route("/api/session/{session_id}", rest_session_history),
                 Route("/api/schemas", rest_schemas),
                 Route("/api/schemas/{schema}", rest_schemas),
-                Route("/api/analysis", rest_chain_analysis, methods=["POST"]),
-                
-                # Whale and fresh wallet detection endpoints
                 Route("/api/whale-detector", rest_whale_detector, methods=["POST"]),
                 Route("/api/fresh-wallet-detector", rest_fresh_wallet_detector, methods=["POST"]),
                 
@@ -2511,418 +1924,447 @@ def run_server(
     else:
         # Default to stdio
         app.run(transport="stdio")
-        
-        # The following code is not needed anymore since we're using the synchronous run method
-        # from mcp.server.stdio import stdio_server
-        # 
-        # async def arun():
-        #     async with stdio_server() as streams:
-        #         await app.run(
-        #             streams[0], streams[1], app.create_initialization_options()
-        #         )
-        # 
-        # anyio.run(arun)
 
 
 # -------------------------------------------
-# Whale and Fresh Wallet Detection
+# Whale and Fresh Wallet Detection (Refactored for Performance)
 # -------------------------------------------
 
-# These functions now delegate to the imported implementations
 async def detect_whale_wallets(token_address: str, solana_client: SolanaClient) -> Dict[str, Any]:
-    """Find whale wallets for a token.
-    
-    Args:
-        token_address: Token mint address
-        solana_client: Solana client
-        
-    Returns:
-        Whale wallet information
+    """Find whale wallets for a token (Refactored for Performance).
+
+    Identifies wallets holding a significant amount of the target token
+    AND/OR having a high estimated total portfolio value.
     """
+    start_time = time.monotonic()
+    # Load configuration
+    config = get_app_config()
+    analysis_config = config.analysis
+    logger.info(f"Starting whale detection for token: {token_address}")
+
+    if not validate_public_key(token_address):
+        return {
+            "success": False,
+            "error": "Invalid token address format",
+            "error_explanation": "The provided token address is not a valid Solana public key"
+        }
+
     try:
-        if not validate_public_key(token_address):
+        # 1. Fetch basic token info (supply, decimals, metadata, price) concurrently
+        # Also fetch current SOL price concurrently
+        logger.debug(f"[{token_address}] Fetching token supply, metadata, price, and SOL price...")
+        token_info_tasks = {
+            "supply": solana_client.get_token_supply(token_address),
+            "metadata": solana_client.get_token_metadata(token_address),
+            "target_price": solana_client.get_market_price(token_address),
+            "sol_price": solana_client.get_market_price("So11111111111111111111111111111111111111112") # Fetch SOL price
+        }
+        results = await asyncio.gather(*token_info_tasks.values(), return_exceptions=True)
+        token_info_results = dict(zip(token_info_tasks.keys(), results))
+
+        # --- Process Token Info Results ---
+        supply_data = token_info_results.get("supply")
+        metadata = token_info_results.get("metadata")
+        target_price_data = token_info_results.get("target_price")
+        sol_price_data = token_info_results.get("sol_price")
+        error_details = []
+
+        # Validate supply data
+        if isinstance(supply_data, Exception) or not supply_data or "value" not in supply_data:
+            error_msg = f"Failed to get valid supply for {token_address}: {supply_data}"
+            logger.error(error_msg)
+            return {"success": False, "error": "Error fetching token supply", "details": str(supply_data)}
+
+        # Handle potential errors for metadata and prices
+        if isinstance(metadata, Exception): logger.warning(f"[{token_address}] Failed to get metadata: {metadata}"); error_details.append(f"Metadata failed: {metadata}"); metadata = {}
+        if isinstance(target_price_data, Exception): logger.warning(f"[{token_address}] Failed to get target price: {target_price_data}"); error_details.append(f"Target price failed: {target_price_data}"); target_price_data = {}
+        if isinstance(sol_price_data, Exception): logger.warning(f"[{token_address}] Failed to get SOL price: {sol_price_data}"); error_details.append(f"SOL price failed: {sol_price_data}"); sol_price_data = {}
+
+        # Determine SOL price to use (dynamic or fallback from config)
+        current_sol_price_usd = analysis_config.estimated_sol_price_usd # Default to config fallback
+        if sol_price_data and "price" in sol_price_data:
+            try:
+                current_sol_price_usd = Decimal(str(sol_price_data["price"]))
+                logger.debug(f"[{token_address}] Using dynamic SOL price: {current_sol_price_usd}")
+            except (InvalidOperation, TypeError):
+                logger.warning(f"[{token_address}] Invalid dynamic SOL price value ({sol_price_data['price']}), using fallback: {current_sol_price_usd}")
+        else:
+            logger.warning(f"[{token_address}] Failed to fetch dynamic SOL price, using fallback: {current_sol_price_usd}")
+
+        # Extract token details
+        decimals = supply_data.get("value", {}).get("decimals")
+        total_supply_lamports = Decimal(supply_data.get("value", {}).get("amount", '0'))
+        if decimals is None: return {"success": False, "error": "Could not determine token decimals"}
+
+        total_supply = total_supply_lamports / Decimal(10 ** decimals) if decimals >= 0 else Decimal(0)
+        symbol = metadata.get("symbol", token_address[:6])
+        name = metadata.get("name", "Unknown Token")
+        target_price_usd = Decimal(str(target_price_data.get("price", 0.0))) # Default to 0
+
+        token_info = {
+            'decimals': decimals,
+            'symbol': symbol,
+            'name': name,
+            'price_usd': target_price_usd,
+            'total_supply': total_supply,
+            'current_sol_price_usd': current_sol_price_usd # Include SOL price used
+        }
+        logger.debug(f"[{token_address}] Token info processed: {token_info}")
+
+        # 2. Fetch top N holders efficiently (using config limit)
+        whale_holder_limit = analysis_config.whale_holder_limit
+        logger.debug(f"[{token_address}] Fetching top {whale_holder_limit} holders...")
+        holders = await _get_token_holders_internal(token_address, solana_client, limit=whale_holder_limit)
+        if not holders:
+            logger.warning(f"[{token_address}] No holders found.")
+            final_token_info = token_info.copy()
+            final_token_info['price_usd'] = float(final_token_info['price_usd'])
+            final_token_info['total_supply'] = float(final_token_info['total_supply'])
+            final_token_info['current_sol_price_usd'] = float(final_token_info['current_sol_price_usd'])
             return {
-                "error": "Invalid token address format",
-                "error_explanation": "The provided token address is not a valid Solana public key"
+                "success": True, "warning": "No token holders found.",
+                "token_address": token_address, "token_info": final_token_info,
+                "whale_count": 0, "whales": []
             }
-        
-        # Get token info
-        try:
-            supply_data = await solana_client.get_token_supply(token_address)
-            decimals = supply_data["value"]["decimals"]
-            total_supply = Decimal(supply_data["value"]["amount"]) / Decimal(10 ** decimals)
-            
-            # Get token metadata
-            metadata = await solana_client.get_token_metadata(token_address)
-            symbol = metadata.get("symbol", token_address[:6])
-            
-            # Get token price
-            price_data = await solana_client.get_market_price(token_address)
-            price_usd = Decimal(str(price_data.get("price", 0.01)))
-            
-            token_info = {
-                'decimals': decimals,
-                'symbol': symbol,
-                'price_usd': price_usd,
-                'total_supply': total_supply
-            }
-        except SolanaRpcError as e:
-            return {
-                "error": f"Error fetching token info: {str(e)}",
-                "error_explanation": "Failed to get token information from the Solana blockchain"
-            }
-        
-        # Get top token holders
-        try:
-            holders = await get_token_holders(token_address, solana_client)
-            if not holders:
-                return {
-                    "error": "No token holders found",
-                    "error_explanation": "Could not find any holders for this token"
-                }
-        except SolanaRpcError as e:
-            return {
-                "error": f"Error fetching token holders: {str(e)}",
-                "error_explanation": "Failed to get token holders from the Solana blockchain"
-            }
-        
-        # Process top holders to find whales
+
+        logger.debug(f"[{token_address}] Processing {len(holders)} potential whale holders...")
+        holder_owners = [h['owner'] for h in holders]
+
+        # 3. Fetch wallet token balances concurrently
+        logger.debug(f"[{token_address}] Fetching token balances for {len(holder_owners)} wallets...")
+        balance_tasks = [_get_wallet_token_balances_internal(owner, solana_client) for owner in holder_owners]
+        wallet_balances_results = await asyncio.gather(*balance_tasks, return_exceptions=True)
+
+        # 4. Process holders with their fetched balances
+        logger.debug(f"[{token_address}] Analyzing holders for whale status...")
         whale_wallets = []
-        for holder in holders[:25]:  # Limit to top 25 for API response time
+        processed_holder_count = 0
+        # Use thresholds from config
+        whale_value_threshold = analysis_config.whale_total_value_threshold_usd
+        whale_supply_threshold = analysis_config.whale_supply_percentage_threshold
+
+        for i, holder in enumerate(holders):
+            processed_holder_count += 1
             wallet_address = holder["owner"]
             amount = holder["amount"]
-            
-            # Calculate token amount and value
-            token_amount = amount / Decimal(10 ** token_info['decimals'])
-            token_value = token_amount * token_info['price_usd']
-            supply_percentage = (token_amount / token_info['total_supply']) * 100 if token_info['total_supply'] > 0 else 0
-            
-            # Get wallet tokens to calculate total value
-            wallet_tokens = await get_wallet_tokens_for_owner(wallet_address, solana_client)
-            
-            # Calculate total wallet value (simplified for API speed)
-            total_value = token_value  # Start with target token value
-            token_count = len(wallet_tokens)
-            
-            # Add value of common tokens (simplified estimate)
-            for token in wallet_tokens:
-                if token["mint"] == "So11111111111111111111111111111111111111112":  # SOL
-                    # Add SOL value (estimated at $150 per SOL)
-                    total_value += Decimal(token["amount"]) * Decimal(150)
-                elif token["mint"] in ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
-                    # USDC, USDT (stablecoins valued at 1:1)
-                    total_value += Decimal(token["amount"])
-            
-            # Determine if this is a whale based on value threshold (simplified)
-            # Consider as whale if total value > $50,000 or holding >1% of supply
-            is_whale = total_value > 50000 or supply_percentage > 1
-            
+            holder_decimals = holder.get("decimals")
+
+            if holder_decimals is None or holder_decimals != token_info['decimals']:
+                logger.warning(f"[{token_address}] Skipping whale holder {wallet_address} due to decimals mismatch")
+                continue
+
+            wallet_balances = wallet_balances_results[i]
+            if isinstance(wallet_balances, Exception):
+                logger.warning(f"[{token_address}] Failed balances for whale candidate {wallet_address}: {wallet_balances}")
+                error_details.append(f"Balance fetch failed for {wallet_address[:6]}...: {wallet_balances}")
+                continue
+
+            try: token_amount = amount / Decimal(10 ** token_info['decimals'])
+            except ZeroDivisionError: continue
+
+            target_token_value_usd = token_amount * token_info['price_usd']
+            supply_percentage = (token_amount / token_info['total_supply']) * 100 if token_info['total_supply'] > 0 else Decimal(0)
+
+            total_value_usd = Decimal(0)
+            token_count = len(wallet_balances)
+            for balance_info in wallet_balances:
+                mint = balance_info['mint']
+                bal_amount = balance_info['amount_decimal']
+                value = Decimal(0)
+                # TODO: Enhance value estimation to include more tokens via a price feed API.
+                # Current logic only prices the target token, SOL, USDC, USDT, underestimating total value.
+                if mint == token_address: value = target_token_value_usd
+                elif mint == "So11111111111111111111111111111111111111112": value = bal_amount * current_sol_price_usd # Use fetched/fallback SOL price
+                elif mint in ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]: value = bal_amount
+                total_value_usd += value
+
+            # Use thresholds from config
+            is_whale = (total_value_usd > whale_value_threshold or
+                        supply_percentage > whale_supply_threshold)
+
             if is_whale:
                 whale_wallets.append({
                     'wallet': wallet_address,
                     'target_token_amount': float(token_amount),
-                    'target_token_value_usd': float(token_value),
+                    'target_token_value_usd': float(target_token_value_usd),
                     'target_token_supply_percentage': float(supply_percentage),
-                    'total_value_usd': float(total_value),
+                    'estimated_total_value_usd': float(total_value_usd),
                     'token_count': token_count
                 })
-        
-        # Sort whale wallets by total value
-        whale_wallets.sort(key=lambda x: x['total_value_usd'], reverse=True)
-        
-        return {
+
+        whale_wallets.sort(key=lambda x: x['estimated_total_value_usd'], reverse=True)
+
+        end_time = time.monotonic()
+        duration = end_time - start_time
+        logger.info(f"[{token_address}] Whale detection completed in {duration:.2f}s. Found {len(whale_wallets)} whales out of {processed_holder_count} processed.")
+
+        final_token_info = token_info.copy()
+        final_token_info['price_usd'] = float(final_token_info['price_usd'])
+        final_token_info['total_supply'] = float(final_token_info['total_supply'])
+        final_token_info['current_sol_price_usd'] = float(final_token_info['current_sol_price_usd'])
+
+        result = {
+            "success": True,
             "token_address": token_address,
-            "token_symbol": token_info['symbol'],
-            "token_price_usd": float(token_info['price_usd']),
+            "token_info": final_token_info,
+            "analysis_config": {
+                "holder_limit": whale_holder_limit,
+                "value_threshold_usd": float(whale_value_threshold),
+                "supply_percentage_threshold": float(whale_supply_threshold),
+            },
+            "analysis_duration_seconds": round(duration, 2),
+            "holders_analyzed": processed_holder_count,
             "whale_count": len(whale_wallets),
             "whales": whale_wallets
         }
+        if error_details:
+            result["warnings"] = error_details
+        return result
+
     except Exception as e:
+        logger.error(f"[{token_address}] Unexpected error during whale detection: {e}", exc_info=True)
         return {
-            "error": f"Unexpected error: {str(e)}",
-            "error_explanation": "An unexpected error occurred during whale detection"
+            "success": False,
+            "error": f"Unexpected server error: {str(e)}",
+            "error_explanation": "An unexpected error occurred during whale detection."
         }
 
 
 async def detect_fresh_wallets(token_address: str, solana_client: SolanaClient) -> Dict[str, Any]:
-    """Find fresh wallets for a token.
-    
-    Args:
-        token_address: Token mint address
-        solana_client: Solana client
-        
-    Returns:
-        Fresh wallet information
+    """Find fresh wallets for a token (Refactored for Performance).
+
+    Identifies wallets that hold the target token and are likely new
+    or have very low token diversity.
     """
+    start_time = time.monotonic()
+    # Load configuration
+    config = get_app_config()
+    analysis_config = config.analysis
+    logger.info(f"Starting fresh wallet detection for token: {token_address}")
+
+    if not validate_public_key(token_address):
+         return {
+             "success": False,
+             "error": "Invalid token address format",
+             "error_explanation": "The provided token address is not a valid Solana public key"
+         }
+
     try:
-        if not validate_public_key(token_address):
+        # 1. Fetch basic token info (decimals, metadata, price) + SOL price concurrently
+        logger.debug(f"[{token_address}] Fetching token supply, metadata, price, and SOL price...")
+        token_info_tasks = {
+            "supply": solana_client.get_token_supply(token_address),
+            "metadata": solana_client.get_token_metadata(token_address),
+            "target_price": solana_client.get_market_price(token_address),
+            "sol_price": solana_client.get_market_price("So11111111111111111111111111111111111111112")
+        }
+        results = await asyncio.gather(*token_info_tasks.values(), return_exceptions=True)
+        token_info_results = dict(zip(token_info_tasks.keys(), results))
+
+        # --- Process Token Info --- #
+        supply_data = token_info_results.get("supply")
+        metadata = token_info_results.get("metadata")
+        target_price_data = token_info_results.get("target_price")
+        sol_price_data = token_info_results.get("sol_price")
+        error_details = []
+
+        if isinstance(supply_data, Exception) or not supply_data or "value" not in supply_data: return {"success": False, "error": "Error fetching token supply", "details": str(supply_data)}
+        if isinstance(metadata, Exception): logger.warning(f"[{token_address}] Metadata failed: {metadata}"); error_details.append(f"Metadata failed: {metadata}"); metadata = {}
+        if isinstance(target_price_data, Exception): logger.warning(f"[{token_address}] Target price failed: {target_price_data}"); error_details.append(f"Target price failed: {target_price_data}"); target_price_data = {}
+        if isinstance(sol_price_data, Exception): logger.warning(f"[{token_address}] SOL price failed: {sol_price_data}"); error_details.append(f"SOL price failed: {sol_price_data}"); sol_price_data = {}
+
+        # Determine SOL price
+        current_sol_price_usd = analysis_config.estimated_sol_price_usd
+        if sol_price_data and "price" in sol_price_data:
+             try: current_sol_price_usd = Decimal(str(sol_price_data["price"]))
+             except (InvalidOperation, TypeError): logger.warning(f"[{token_address}] Invalid dynamic SOL price, using fallback: {current_sol_price_usd}")
+        else: logger.warning(f"[{token_address}] Failed dynamic SOL price, using fallback: {current_sol_price_usd}")
+
+        # Extract token details
+        decimals = supply_data.get("value", {}).get("decimals")
+        if decimals is None: return {"success": False, "error": "Could not determine token decimals"}
+        symbol = metadata.get("symbol", token_address[:6])
+        name = metadata.get("name", "Unknown Token")
+        target_price_usd = Decimal(str(target_price_data.get("price", 0.0)))
+
+        token_info = {
+            'decimals': decimals,
+            'symbol': symbol,
+            'name': name,
+            'price_usd': target_price_usd,
+            'current_sol_price_usd': current_sol_price_usd
+        }
+        logger.debug(f"[{token_address}] Token info processed: {token_info}")
+
+        # 2. Fetch top N holders efficiently (using config limit)
+        fresh_holder_limit = analysis_config.fresh_wallet_holder_limit
+        logger.debug(f"[{token_address}] Fetching top {fresh_holder_limit} holders...")
+        holders = await _get_token_holders_internal(token_address, solana_client, limit=fresh_holder_limit)
+        if not holders:
+            logger.warning(f"[{token_address}] No holders found.")
+            final_token_info = token_info.copy()
+            final_token_info['price_usd'] = float(final_token_info['price_usd'])
+            final_token_info['current_sol_price_usd'] = float(final_token_info['current_sol_price_usd'])
             return {
-                "error": "Invalid token address format",
-                "error_explanation": "The provided token address is not a valid Solana public key"
-            }
-        
-        # Get token info
-        try:
-            supply_data = await solana_client.get_token_supply(token_address)
-            decimals = supply_data["value"]["decimals"]
-            
-            # Get token metadata
-            metadata = await solana_client.get_token_metadata(token_address)
-            symbol = metadata.get("symbol", token_address[:6])
-            
-            # Get token price
-            price_data = await solana_client.get_market_price(token_address)
-            price_usd = Decimal(str(price_data.get("price", 0.01)))
-            
-            token_info = {
-                'decimals': decimals,
-                'symbol': symbol,
-                'price_usd': price_usd
-            }
-        except SolanaRpcError as e:
-            return {
-                "error": f"Error fetching token info: {str(e)}",
-                "error_explanation": "Failed to get token information from the Solana blockchain"
-            }
-        
-        # Get top token holders
-        try:
-            holders = await get_token_holders(token_address, solana_client)
-            if not holders:
-                return {
-                    "error": "No token holders found",
-                    "error_explanation": "Could not find any holders for this token"
-                }
-        except SolanaRpcError as e:
-            return {
-                "error": f"Error fetching token holders: {str(e)}",
-                "error_explanation": "Failed to get token holders from the Solana blockchain"
-            }
-        
-        # Process top holders to find fresh wallets
+                 "success": True, "warning": "No token holders found.",
+                 "token_address": token_address, "token_info": final_token_info,
+                 "fresh_wallet_count": 0, "fresh_wallets": []
+             }
+
+        logger.debug(f"[{token_address}] Processing {len(holders)} potential fresh holders...")
         fresh_wallets = []
-        processed_holders = 0
-        
-        for holder in holders[:50]:  # Limit to top 50 for API response time
-            processed_holders += 1
+        holder_owners = [h['owner'] for h in holders]
+
+        # 3. Fetch wallet token balances AND recent transaction signatures concurrently
+        logger.debug(f"[{token_address}] Fetching balances and tx signatures for {len(holder_owners)} wallets...")
+        tx_limit = analysis_config.fresh_wallet_tx_limit
+        tasks = []
+        for owner in holder_owners:
+            tasks.append(_get_wallet_token_balances_internal(owner, solana_client))
+            tasks.append(solana_client.get_signatures_for_address(owner, limit=tx_limit))
+
+        holder_data_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 4. Process holders with their fetched data
+        logger.debug(f"[{token_address}] Analyzing holders for freshness...")
+        processed_holders_count = 0
+        # Use thresholds from config
+        max_age_days = analysis_config.fresh_wallet_max_age_days
+        max_tokens_low_diversity = analysis_config.fresh_wallet_max_tokens_low_diversity
+        max_tokens_new_wallet = analysis_config.fresh_wallet_max_tokens_new_wallet
+        min_value_threshold = analysis_config.min_token_value_usd_threshold
+
+        for i, holder in enumerate(holders):
+            processed_holders_count += 1
             wallet_address = holder["owner"]
             amount = holder["amount"]
-            
-            # Calculate token amount and value
-            token_amount = amount / Decimal(10 ** token_info['decimals'])
-            token_value = token_amount * token_info['price_usd']
-            
-            # 1. Check token diversity (main indicator of a fresh wallet)
-            wallet_tokens = await get_wallet_tokens_for_owner(wallet_address, solana_client)
-            token_count = len(wallet_tokens)
+            holder_decimals = holder.get("decimals")
+
+            if holder_decimals is None or holder_decimals != token_info['decimals']:
+                logger.warning(f"[{token_address}] Skipping fresh holder {wallet_address} due to decimals mismatch")
+                continue
+
+            balances_result = holder_data_results[i * 2]
+            signatures_result = holder_data_results[i * 2 + 1]
+
+            if isinstance(balances_result, Exception):
+                logger.warning(f"[{token_address}] Failed balances for fresh candidate {wallet_address}: {balances_result}")
+                error_details.append(f"Balance fetch failed for {wallet_address[:6]}...: {balances_result}")
+                continue
+
+            signatures = []
+            if isinstance(signatures_result, Exception):
+                logger.warning(f"[{token_address}] Failed signatures for fresh candidate {wallet_address}: {signatures_result}")
+                error_details.append(f"Signature fetch failed for {wallet_address[:6]}...: {signatures_result}")
+            elif signatures_result: signatures = signatures_result
+
+            wallet_balances = balances_result
+            token_count = len(wallet_balances)
+
+            try: token_amount = amount / Decimal(10 ** token_info['decimals'])
+            except ZeroDivisionError: continue
+            target_token_value_usd = token_amount * token_info['price_usd']
+
+            # --- Freshness Criteria ---
             non_dust_token_count = 0
-            
-            # Count non-dust tokens
-            for token in wallet_tokens:
-                if token["mint"] in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
-                    # SOL, USDC, USDT - count if more than $1
-                    price = Decimal(150) if token["mint"] == "So11111111111111111111111111111111111111112" else Decimal(1)
-                    if Decimal(token["amount"]) * price > 1:
-                        non_dust_token_count += 1
-                else:
-                    # For other tokens, assume they have some value
-                    non_dust_token_count += 1
-            
-            # 2. Check wallet age
-            try:
-                signatures = await solana_client.get_signatures_for_address(wallet_address, limit=10)
-                wallet_age_days = None
-                
-                if signatures and len(signatures) > 0:
-                    oldest_tx = signatures[-1]
-                    if "blockTime" in oldest_tx:
-                        created_at = datetime.datetime.fromtimestamp(oldest_tx["blockTime"])
-                        wallet_age_days = (datetime.datetime.now() - created_at).days
-            except:
-                wallet_age_days = None
-            
-            # 3. Simplified transaction analysis (check if recent txs involve this token)
-            token_tx_ratio = 0.0
-            if signatures and len(signatures) > 0:
-                # For each signature, get the transaction
-                token_tx_count = 0
-                for sig_info in signatures[:5]:  # Check just a few recent txs
-                    try:
-                        # Simplified detection - just see if the token address appears in the transaction data
-                        tx_data = await solana_client.get_transaction(sig_info["signature"])
-                        if token_address in str(tx_data):
-                            token_tx_count += 1
-                    except:
-                        pass
-                
-                token_tx_ratio = token_tx_count / len(signatures[:5])
-            
-            # Determine if this is a fresh wallet
-            is_new_wallet = wallet_age_days is not None and wallet_age_days <= 30
-            is_fresh = (
-                (is_new_wallet and non_dust_token_count < 5) or  # New wallet with few tokens
-                (non_dust_token_count < 4) or  # Very few tokens
-                token_tx_ratio > 0.5  # High ratio of token transactions
-            )
-            
-            # Calculate freshness score
+            for balance_info in wallet_balances:
+                 mint = balance_info['mint']
+                 bal_amount = balance_info['amount_decimal']
+                 value = Decimal(0)
+                 # TODO: Refine non-dust calculation. Currently counts any non-target token with balance > 0
+                 # if value < min_threshold, potentially misclassifying wallets with many dust balances.
+                 if mint == token_address: value = target_token_value_usd if token_info['price_usd'] > 0 else Decimal(0)
+                 elif mint == "So11111111111111111111111111111111111111112": value = bal_amount * current_sol_price_usd # Use fetched/fallback
+                 elif mint in ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]: value = bal_amount
+
+                 if value >= min_value_threshold:
+                     non_dust_token_count += 1
+                 elif mint != token_address and bal_amount > 0:
+                     non_dust_token_count += 1
+
+            wallet_age_days = None
+            first_tx_timestamp = None
+            now_aware = datetime.datetime.now(datetime.timezone.utc)
+            if signatures:
+                try:
+                    timestamps = [sig.get("blockTime") for sig in signatures if sig.get("blockTime") is not None]
+                    if timestamps:
+                        first_tx_timestamp = min(timestamps)
+                        created_at_utc = datetime.datetime.fromtimestamp(first_tx_timestamp, tz=datetime.timezone.utc)
+                        wallet_age_days = (now_aware - created_at_utc).days
+                except Exception as e: logger.warning(f"[{token_address}] Error calculating wallet age for {wallet_address}: {e}")
+
+            # --- Determine Freshness --- Use thresholds from config
+            is_new_wallet = wallet_age_days is not None and wallet_age_days <= max_age_days
+            is_low_diversity = non_dust_token_count < max_tokens_low_diversity
+            is_fresh = (is_new_wallet and non_dust_token_count < max_tokens_new_wallet) or is_low_diversity
+
             freshness_score = 0.0
             if is_fresh:
-                freshness_score = (1 - (non_dust_token_count / 10)) * 0.5
+                diversity_score = max(0.0, 1.0 - (non_dust_token_count / 10.0))
+                freshness_score += diversity_score * 0.7
                 if is_new_wallet:
-                    freshness_score += 0.3
-                freshness_score += min(0.2, token_tx_ratio * 0.3)
-                freshness_score = min(0.95, freshness_score)  # Cap at 0.95
-            
+                     age_score = max(0.0, 1.0 - (wallet_age_days / max_age_days))
+                     freshness_score += age_score * 0.3
+                freshness_score = min(1.0, max(0.0, freshness_score))
+
             if is_fresh:
                 fresh_wallets.append({
                     'wallet': wallet_address,
                     'is_fresh': True,
-                    'token_count': token_count,
-                    'non_dust_token_count': non_dust_token_count,
-                    'token_tx_ratio': float(token_tx_ratio),
-                    'wallet_age_days': wallet_age_days,
-                    'target_token_amount': float(token_amount),
-                    'target_token_value_usd': float(token_value),
-                    'freshness_score': float(freshness_score)
+                    'freshness_score': round(freshness_score, 3),
+                    'criteria': {
+                         'is_new': is_new_wallet,
+                         'is_low_diversity': is_low_diversity,
+                         'calculated_age_days': wallet_age_days,
+                         'non_dust_token_count': non_dust_token_count,
+                    },
+                    'details': {
+                        'token_count': token_count,
+                        'first_tx_timestamp': first_tx_timestamp,
+                        'target_token_amount': float(token_amount),
+                        'target_token_value_usd': float(target_token_value_usd),
+                    }
                 })
-        
-        # Sort fresh wallets by freshness score
+
         fresh_wallets.sort(key=lambda x: x['freshness_score'], reverse=True)
-        
-        return {
+
+        end_time = time.monotonic()
+        duration = end_time - start_time
+        logger.info(f"[{token_address}] Fresh wallet detection completed in {duration:.2f}s. Found {len(fresh_wallets)} fresh wallets out of {processed_holders_count} processed.")
+
+        final_token_info = token_info.copy()
+        final_token_info['price_usd'] = float(final_token_info['price_usd'])
+        final_token_info['current_sol_price_usd'] = float(final_token_info['current_sol_price_usd'])
+
+        result = {
+            "success": True,
             "token_address": token_address,
-            "token_symbol": token_info['symbol'],
-            "token_price_usd": float(token_info['price_usd']),
+            "token_info": final_token_info,
+             "analysis_config": {
+                "holder_limit": fresh_holder_limit,
+                "tx_limit_for_age": tx_limit,
+                "max_age_days": max_age_days,
+                "low_diversity_threshold": max_tokens_low_diversity,
+                "new_wallet_diversity_threshold": max_tokens_new_wallet,
+                "min_token_value_usd": float(min_value_threshold)
+            },
+            "analysis_duration_seconds": round(duration, 2),
+            "holders_analyzed": processed_holders_count,
             "fresh_wallet_count": len(fresh_wallets),
-            "total_analyzed_wallets": processed_holders,
             "fresh_wallets": fresh_wallets
         }
+        if error_details:
+            result["warnings"] = error_details
+        return result
+
     except Exception as e:
+        logger.error(f"[{token_address}] Unexpected error during fresh wallet detection: {e}", exc_info=True)
         return {
-            "error": f"Unexpected error: {str(e)}",
-            "error_explanation": "An unexpected error occurred during fresh wallet detection"
+            "success": False,
+            "error": f"Unexpected server error: {str(e)}",
+            "error_explanation": "An unexpected error occurred during fresh wallet detection."
         }
-
-
-# Add helper functions for the detectors
-async def get_token_holders(token_address: str, solana_client: SolanaClient, limit: int = 100) -> List[Dict[str, Any]]:
-    """Get token holders for a mint.
-    
-    Args:
-        token_address: Token mint address
-        solana_client: Solana client
-        limit: Maximum holders to return
-        
-    Returns:
-        List of token holders
-    """
-    # Get all token accounts for the mint
-    result = await solana_client._make_request("getProgramAccounts", [
-        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token program ID
-        {
-            "filters": [
-                {
-                    "dataSize": 165  # Size of token account data
-                },
-                {
-                    "memcmp": {
-                        "offset": 0,
-                        "bytes": token_address
-                    }
-                }
-            ],
-            "encoding": "jsonParsed"
-        }
-    ])
-    
-    # Process the accounts
-    holders = []
-    
-    for account in result:
-        try:
-            parsed_info = account.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
-            owner = parsed_info.get('owner')
-            amount_str = parsed_info.get('tokenAmount', {}).get('amount', '0')
-            
-            # Skip empty accounts
-            if amount_str == '0':
-                continue
-                
-            amount = Decimal(amount_str)
-            
-            holders.append({
-                'owner': owner,
-                'amount': amount,
-                'address': account.get('pubkey')
-            })
-        except (KeyError, TypeError) as e:
-            continue
-            
-    # Sort holders by amount (descending) and limit to top holders
-    holders.sort(key=lambda x: x['amount'], reverse=True)
-    return holders[:limit]
-
-
-async def get_wallet_tokens_for_owner(owner_address: str, solana_client: SolanaClient) -> List[Dict[str, Any]]:
-    """Get all tokens owned by a wallet.
-    
-    Args:
-        owner_address: Owner address
-        solana_client: Solana client
-        
-    Returns:
-        List of tokens
-    """
-    # Get native SOL balance
-    sol_balance_response = await solana_client.get_balance(owner_address)
-    sol_balance = Decimal(sol_balance_response) / Decimal(10**9)  # SOL has 9 decimals
-    
-    # Get token accounts owned by the wallet
-    token_accounts = await solana_client.get_token_accounts_by_owner(owner_address)
-    
-    # Initialize with SOL
-    balances = [
-        {
-            'token': 'SOL',
-            'mint': 'So11111111111111111111111111111111111111112',  # Native SOL mint
-            'amount': str(sol_balance),
-            'decimals': 9
-        }
-    ]
-    
-    # Process all token accounts
-    for account in token_accounts:
-        try:
-            account_data = account.get("data", {})
-            if not account_data or not isinstance(account_data, dict):
-                continue
-                
-            parsed_data = account_data.get("parsed", {})
-            info = parsed_data.get("info", {})
-            
-            mint = info.get("mint")
-            token_amount = info.get("tokenAmount", {})
-            amount = token_amount.get("amount", "0")
-            decimals = token_amount.get("decimals", 0)
-            
-            # Skip empty accounts
-            if amount == "0":
-                continue
-            
-            # Calculate actual token amount
-            token_amount_decimal = Decimal(amount) / Decimal(10 ** decimals)
-            
-            balances.append({
-                'token': mint[:6],  # Use first 6 chars as shorthand
-                'mint': mint,
-                'amount': str(token_amount_decimal),
-                'decimals': decimals
-            })
-        except (KeyError, TypeError) as e:
-            continue
-            
-    return balances
 
 
 # Add the REST API endpoint functions
@@ -2950,6 +2392,21 @@ async def rest_whale_detector(request):
     # Return error status code if result contains an error
     if "error" in result:
         return JSONResponse(result, status_code=400)
+    
+    # Ensure token_name is present
+    if "token_name" not in result:
+        # Get token metadata
+        try:
+            metadata = await solana_client.get_token_metadata(token_address)
+            result["token_name"] = metadata.get("name", "Unknown Token")
+        except Exception as e:
+            result["token_name"] = "Unknown Token"
+            if "warnings" not in result:
+                result["warnings"] = []
+            result["warnings"].append(f"Failed to fetch token name: {str(e)}")
+    
+    # Ensure success flag is included
+    result["success"] = True
     
     return JSONResponse(result)
 
@@ -3004,6 +2461,188 @@ async def _periodic_session_cleanup():
         logger.info("Session cleanup task cancelled")
     except Exception as e:
         logger.error(f"Error in session cleanup task: {str(e)}", exc_info=True)
+
+
+# -------------------------------------------
+# Utility Functions (Add Internal Helpers Here)
+# -------------------------------------------
+
+# Renamed from get_token_holders to avoid conflicts and clarify internal use
+async def _get_token_holders_internal(token_address: str, solana_client: SolanaClient, limit: int = 100) -> List[Dict[str, Any]]:
+    """(Internal) Get token holders for a mint using efficient getProgramAccounts.
+
+    Args:
+        token_address: Token mint address
+        solana_client: Solana client
+        limit: Maximum holders to return
+
+    Returns:
+        List of token holders with owner, amount (Decimal), address
+        Raises SolanaRpcError or Exception on failure.
+    """
+    logger.debug(f"Fetching top {limit} holders for mint: {token_address}")
+    try:
+        # Use getProgramAccounts with memcmp filter for efficiency
+        result = await solana_client._make_request("getProgramAccounts", [
+            TOKEN_PROGRAM_ID,  # Use imported constant
+            {
+                "filters": [
+                    {
+                        "dataSize": 165  # Size of token account data
+                    },
+                    {
+                        "memcmp": {
+                            "offset": 0,
+                            "bytes": token_address
+                        }
+                    }
+                ],
+                "encoding": "jsonParsed"
+            }
+        ])
+
+        holders = []
+        if not result:
+            logger.warning(f"getProgramAccounts returned empty result for {token_address}")
+            return []
+
+        for account in result:
+            try:
+                # Defensive parsing
+                account_data = account.get('account', {})
+                if not account_data or not isinstance(account_data, dict):
+                    logger.warning(f"Skipping account with unexpected structure: {account.get('pubkey')}")
+                    continue
+
+                parsed_info = account_data.get('data', {}).get('parsed', {}).get('info', {})
+                if not parsed_info or not isinstance(parsed_info, dict):
+                    logger.warning(f"Skipping account with missing parsed info: {account.get('pubkey')}")
+                    continue
+
+                owner = parsed_info.get('owner')
+                token_amount_info = parsed_info.get('tokenAmount', {})
+                amount_str = token_amount_info.get('amount', '0')
+                decimals = token_amount_info.get('decimals') # Store decimals for potential later use
+
+                if not owner:
+                    logger.warning(f"Skipping account without owner: {account.get('pubkey')}")
+                    continue
+
+                # Skip zero balance accounts
+                if amount_str == '0':
+                    continue
+
+                amount = Decimal(amount_str) # Raises ValueError if amount_str is invalid Decimal
+
+                holders.append({
+                    'owner': owner,
+                    'amount': amount, # Keep as Decimal for precision
+                    'address': account.get('pubkey'),
+                    'decimals': decimals # Include decimals
+                })
+            except (KeyError, TypeError, ValueError) as e:
+                logger.warning(f"Error processing holder account {account.get('pubkey')} for mint {token_address}: {e}")
+                continue
+
+        # Sort holders by amount (descending)
+        holders.sort(key=lambda x: x['amount'], reverse=True)
+        logger.info(f"Found {len(holders)} holders for {token_address}, returning top {min(len(holders), limit)}")
+        return holders[:limit]
+    except SolanaRpcError as e:
+        logger.error(f"RPC Error fetching holders for {token_address}: {e}")
+        raise # Re-raise to be handled by caller
+    except Exception as e:
+        logger.error(f"Unexpected error fetching holders for {token_address}: {e}")
+        raise # Re-raise
+
+
+# Renamed from get_wallet_tokens_for_owner to clarify internal use and refactored
+async def _get_wallet_token_balances_internal(owner_address: str, solana_client: SolanaClient) -> List[Dict[str, Any]]:
+    """(Internal) Get all token balances (including SOL) for a wallet owner.
+
+    Args:
+        owner_address: Owner address
+        solana_client: Solana client
+
+    Returns:
+        List of tokens with balance info (token, mint, amount_decimal, decimals)
+        Returns empty list on failure to fetch critical data.
+    """
+    logger.debug(f"Fetching token balances for owner: {owner_address}")
+    balances = []
+    try:
+        # Concurrently fetch SOL balance and token accounts
+        sol_task = solana_client.get_balance(owner_address)
+        tokens_task = solana_client.get_token_accounts_by_owner(owner_address, encoding="jsonParsed")
+
+        results = await asyncio.gather(sol_task, tokens_task, return_exceptions=True)
+
+        sol_balance_lamports = results[0]
+        token_accounts_result = results[1]
+
+        # Process SOL balance
+        if isinstance(sol_balance_lamports, Exception):
+            logger.warning(f"Could not fetch SOL balance for {owner_address}: {sol_balance_lamports}")
+        elif sol_balance_lamports is not None:
+            try:
+                sol_balance_decimal = Decimal(sol_balance_lamports) / Decimal(10**9)
+                if sol_balance_decimal > 0:
+                    balances.append({
+                        'token': 'SOL',
+                        'mint': 'So11111111111111111111111111111111111111112', # Native SOL mint
+                        'amount_decimal': sol_balance_decimal,
+                        'decimals': 9
+                    })
+            except Exception as e:
+                 logger.warning(f"Error processing SOL balance for {owner_address}: {e}")
+
+        # Process token accounts
+        if isinstance(token_accounts_result, Exception):
+            logger.warning(f"Could not fetch token accounts for {owner_address}: {token_accounts_result}")
+        elif token_accounts_result and isinstance(token_accounts_result, dict) and "value" in token_accounts_result:
+            token_accounts = token_accounts_result["value"]
+            for account in token_accounts:
+                try:
+                    # Defensive parsing from the structure returned by get_token_accounts_by_owner
+                    account_info = account.get("account", {})
+                    if not account_info or not isinstance(account_info, dict): continue
+                    data = account_info.get("data", {})
+                    if not data or not isinstance(data, dict): continue
+                    parsed = data.get("parsed", {})
+                    if not parsed or not isinstance(parsed, dict): continue
+                    info = parsed.get("info", {})
+                    if not info or not isinstance(info, dict): continue
+
+                    mint = info.get("mint")
+                    token_amount_info = info.get("tokenAmount", {})
+                    amount_str = token_amount_info.get("amount", "0")
+                    decimals = token_amount_info.get("decimals")
+
+                    if not mint or decimals is None: continue
+                    if amount_str == "0": continue
+
+                    # Calculate actual token amount
+                    token_amount_decimal = Decimal(amount_str) / Decimal(10 ** decimals)
+
+                    balances.append({
+                        'token': mint[:6],  # Use first 6 chars as shorthand symbol
+                        'mint': mint,
+                        'amount_decimal': token_amount_decimal,
+                        'decimals': decimals
+                    })
+                except (KeyError, TypeError, ValueError, ZeroDivisionError) as e:
+                    logger.warning(f"Error processing token account {account.get('pubkey')} for {owner_address}: {e}")
+                    continue
+        else:
+             logger.warning(f"Unexpected format for token accounts result for {owner_address}: {token_accounts_result}")
+
+
+        logger.debug(f"Found {len(balances)} token types for owner {owner_address}")
+        return balances
+
+    except Exception as e:
+        logger.error(f"Unexpected error fetching balances for {owner_address}: {e}", exc_info=True)
+        return [] # Return empty list on failure
 
 
 if __name__ == "__main__":

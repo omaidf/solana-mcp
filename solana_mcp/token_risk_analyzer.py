@@ -4,6 +4,7 @@ import datetime
 import math
 import re
 import base64
+import base58
 from typing import Dict, List, Any, Optional, Tuple, Set
 from dataclasses import dataclass
 import json
@@ -12,7 +13,7 @@ import logging
 from solana_mcp.solana_client import SolanaClient, InvalidPublicKeyError, SolanaRpcError
 from solana_mcp.logging_config import get_logger, log_with_context
 from solana_mcp.decorators import validate_solana_key, handle_errors
-from solana_mcp.solana_client import PublicKey
+from solana.rpc.api import Pubkey
 
 # Set up logging
 logger = get_logger(__name__)
@@ -241,7 +242,7 @@ class TokenRiskAnalyzer:
                     # Get mint authority if present
                     if has_mint_authority:
                         mint_auth_bytes = decoded_data[1:33]
-                        mint_auth_address = str(PublicKey(bytes(mint_auth_bytes)))
+                        mint_auth_address = str(Pubkey.from_string(base58.encode(bytes(mint_auth_bytes))))
                         result["mint_authority"] = mint_auth_address
                     
                     # Skip supply (8 bytes), decimals (1 byte), and is_initialized (1 byte)
@@ -254,7 +255,7 @@ class TokenRiskAnalyzer:
                     # Get freeze authority if present
                     if has_freeze_authority:
                         freeze_auth_bytes = decoded_data[44:76]
-                        freeze_auth_address = str(PublicKey(bytes(freeze_auth_bytes)))
+                        freeze_auth_address = str(Pubkey.from_string(base58.encode(bytes(freeze_auth_bytes))))
                         result["freeze_authority"] = freeze_auth_address
                     
             # Try to get the token creator
@@ -495,7 +496,7 @@ class TokenRiskAnalyzer:
                             try:
                                 lp_mint_offset = 168  # Typical offset for Raydium
                                 lp_mint_bytes = decoded_data[lp_mint_offset:lp_mint_offset+32]
-                                lp_token_mint = str(PublicKey(bytes(lp_mint_bytes)))
+                                lp_token_mint = str(Pubkey.from_string(base58.encode(bytes(lp_mint_bytes))))
                                 lp_token_mints.append(lp_token_mint)
                             except Exception as e:
                                 logger.warning(f"Error extracting LP token mint: {str(e)}")
@@ -519,7 +520,7 @@ class TokenRiskAnalyzer:
                                     # Extract owner
                                     owner_offset = 32  # SPL token account owner is at offset 32
                                     owner_bytes = decoded_data[owner_offset:owner_offset+32]
-                                    owner = str(PublicKey(bytes(owner_bytes)))
+                                    owner = str(Pubkey.from_string(base58.encode(bytes(owner_bytes))))
                                     
                                     # Check if this account is owned by a PDA of the vesting program
                                     vesting_accounts = await self.client.get_program_accounts(
@@ -598,7 +599,7 @@ class TokenRiskAnalyzer:
                                     # Extract owner
                                     owner_offset = 32  # SPL token account owner is at offset 32
                                     owner_bytes = decoded_data[owner_offset:owner_offset+32]
-                                    owner = str(PublicKey(bytes(owner_bytes)))
+                                    owner = str(Pubkey.from_string(base58.encode(bytes(owner_bytes))))
                                     
                                     # Check if this account is owned by a PDA of the vesting program
                                     vesting_accounts = await self.client.get_program_accounts(

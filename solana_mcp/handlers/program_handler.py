@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
-from solana.publickey import PublicKey
+from solana.rpc.api import Pubkey
 from solana.transaction import Transaction
 
 from solana_mcp.models.instruction_data import InstructionData

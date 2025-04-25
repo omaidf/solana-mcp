@@ -9,7 +9,7 @@ from base64 import b64decode
 import logging
 from typing import Any, Dict, List, Optional, Type, ClassVar, Mapping
 
-from solana.publickey import PublicKey
+from solana.rpc.api import Pubkey
 from solana.transaction import TransactionInstruction
 
 from solana_mcp.utils.error_handling import handle_errors, NotFoundError
@@ -20,10 +20,10 @@ class ProgramHandler(abc.ABC):
     """Base abstract class for program-specific handlers."""
     
     # Class variable to store program ID
-    PROGRAM_ID: ClassVar[PublicKey]
+    PROGRAM_ID: ClassVar[Pubkey]
     
     @classmethod
-    def supports_program(cls, program_id: PublicKey) -> bool:
+    def supports_program(cls, program_id: Pubkey) -> bool:
         """Check if this handler supports the given program ID.
         
         Args:
@@ -68,7 +68,7 @@ class ProgramHandler(abc.ABC):
 class TokenProgramHandler(ProgramHandler):
     """Handler for Token Program instructions."""
     
-    PROGRAM_ID = PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+    PROGRAM_ID = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
     
     # Instruction type discriminators
     _INSTRUCTION_TYPES = {
@@ -176,7 +176,7 @@ class TokenProgramHandler(ProgramHandler):
 class SystemProgramHandler(ProgramHandler):
     """Handler for System Program instructions."""
     
-    PROGRAM_ID = PublicKey("11111111111111111111111111111111")
+    PROGRAM_ID = Pubkey.from_string("11111111111111111111111111111111")
     
     # Instruction type discriminators
     _INSTRUCTION_TYPES = {
@@ -268,7 +268,7 @@ class SystemProgramHandler(ProgramHandler):
                     # Extract owner if present
                     if len(instruction.data) >= 52:  # + 32 bytes for owner
                         owner_bytes = instruction.data[20:52]
-                        owner = str(PublicKey(owner_bytes))
+                        owner = str(Pubkey.from_string(base58.encode(bytes(owner_bytes))))
                         result["owner"] = owner
         
         # Add more instruction type parsing as needed...
@@ -295,7 +295,7 @@ class ProgramHandlerRegistry:
         """
         self._handlers[str(handler.PROGRAM_ID)] = handler
     
-    def get_handler(self, program_id: PublicKey) -> Optional[ProgramHandler]:
+    def get_handler(self, program_id: Pubkey) -> Optional[ProgramHandler]:
         """Get a handler for the given program ID.
         
         Args:

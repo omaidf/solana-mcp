@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, List, Union, cast
 from dataclasses import dataclass, field
 from functools import lru_cache
 import re
+from decimal import Decimal, InvalidOperation
 
 # Third-party library imports
 from dotenv import load_dotenv
@@ -155,6 +156,24 @@ def environment_validator(value: str) -> str:
     return value.lower()
 
 
+def decimal_validator(value: str) -> Decimal:
+    """Validate and convert string to Decimal.
+    
+    Args:
+        value: String value to convert
+        
+    Returns:
+        Decimal value
+        
+    Raises:
+        ValueError: If not a valid decimal number
+    """
+    try:
+        return Decimal(value)
+    except InvalidOperation:
+        raise ValueError(f"'{value}' is not a valid decimal number")
+
+
 @dataclass
 class SolanaConfig:
     """Configuration for Solana RPC connection."""
@@ -300,6 +319,38 @@ class APIConfig:
 
 
 @dataclass
+class AnalysisConfig:
+    """Configuration for Whale/Fresh wallet analysis."""
+    whale_holder_limit: int = 50
+    whale_total_value_threshold_usd: Decimal = Decimal("50000")
+    whale_supply_percentage_threshold: Decimal = Decimal("1.0")
+    fresh_wallet_holder_limit: int = 100
+    fresh_wallet_tx_limit: int = 10
+    fresh_wallet_max_age_days: int = 30
+    fresh_wallet_max_tokens_low_diversity: int = 4
+    fresh_wallet_max_tokens_new_wallet: int = 5
+    min_token_value_usd_threshold: Decimal = Decimal("1.0")
+    estimated_sol_price_usd: Decimal = Decimal("150.0") # Fallback if dynamic fetch fails
+
+
+@lru_cache()
+def get_analysis_config() -> AnalysisConfig:
+    """Get Analysis configuration from environment variables."""
+    return AnalysisConfig(
+        whale_holder_limit=get_env_var("WHALE_HOLDER_LIMIT", 50, validator=int_validator),
+        whale_total_value_threshold_usd=get_env_var("WHALE_TOTAL_VALUE_THRESHOLD_USD", Decimal("50000"), validator=decimal_validator),
+        whale_supply_percentage_threshold=get_env_var("WHALE_SUPPLY_PERCENTAGE_THRESHOLD", Decimal("1.0"), validator=decimal_validator),
+        fresh_wallet_holder_limit=get_env_var("FRESH_WALLET_HOLDER_LIMIT", 100, validator=int_validator),
+        fresh_wallet_tx_limit=get_env_var("FRESH_WALLET_TX_LIMIT", 10, validator=int_validator),
+        fresh_wallet_max_age_days=get_env_var("FRESH_WALLET_MAX_AGE_DAYS", 30, validator=int_validator),
+        fresh_wallet_max_tokens_low_diversity=get_env_var("FRESH_WALLET_MAX_TOKENS_LOW_DIVERSITY", 4, validator=int_validator),
+        fresh_wallet_max_tokens_new_wallet=get_env_var("FRESH_WALLET_MAX_TOKENS_NEW_WALLET", 5, validator=int_validator),
+        min_token_value_usd_threshold=get_env_var("MIN_TOKEN_VALUE_USD_THRESHOLD", Decimal("1.0"), validator=decimal_validator),
+        estimated_sol_price_usd=get_env_var("ESTIMATED_SOL_PRICE_USD", Decimal("150.0"), validator=decimal_validator) # Fallback SOL price
+    )
+
+
+@dataclass
 class AppConfig:
     """Comprehensive application configuration."""
     
@@ -307,6 +358,7 @@ class AppConfig:
     server: ServerConfig = field(default_factory=get_server_config)
     session: SessionConfig = field(default_factory=SessionConfig)
     api: APIConfig = field(default_factory=APIConfig)
+    analysis: AnalysisConfig = field(default_factory=get_analysis_config)
     
     # Feature flags
     enable_monitoring: bool = os.environ.get("ENABLE_MONITORING", "").lower() in ("true", "1", "yes")

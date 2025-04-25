@@ -5,7 +5,8 @@ from typing import Dict, Any, Optional
 
 from mcp.server.fastmcp import Context
 
-from solana_mcp.solana_client import SolanaClient, InvalidPublicKeyError, SolanaRpcError
+from solana_mcp.solana_client import SolanaClient, InvalidPublicKeyError, SolanaRpcError, get_solana_client
+from solana_mcp.clients.token_client import TokenClient
 
 
 async def get_token_accounts(owner: str, *, ctx: Optional[Context] = None) -> str:
@@ -22,7 +23,6 @@ async def get_token_accounts(owner: str, *, ctx: Optional[Context] = None) -> st
     if ctx:
         solana_client = ctx.request_context.lifespan_context.solana_client
     else:
-        from solana_mcp.solana_client import get_solana_client
         async with get_solana_client() as solana_client:
             return await _get_token_accounts_impl(solana_client, owner)
     
@@ -57,7 +57,6 @@ async def get_token_info(mint: str, *, ctx: Optional[Context] = None) -> str:
     if ctx:
         solana_client = ctx.request_context.lifespan_context.solana_client
     else:
-        from solana_mcp.solana_client import get_solana_client
         async with get_solana_client() as solana_client:
             return await _get_token_info_impl(solana_client, mint)
     
@@ -108,7 +107,6 @@ async def get_token_holders(mint: str, *, ctx: Optional[Context] = None) -> str:
     if ctx:
         solana_client = ctx.request_context.lifespan_context.solana_client
     else:
-        from solana_mcp.solana_client import get_solana_client
         async with get_solana_client() as solana_client:
             return await _get_token_holders_impl(solana_client, mint)
     
@@ -153,6 +151,45 @@ async def _get_token_holders_impl(solana_client: SolanaClient, mint: str) -> str
         return json.dumps({"error": f"Unexpected error: {str(e)}"})
 
 
+async def get_all_token_data(mint: str, *, ctx: Optional[Context] = None) -> str:
+    """Get comprehensive token data for a mint.
+    
+    Args:
+        mint: The token mint address
+        ctx: The request context (injected by MCP)
+        
+    Returns:
+        Complete token data as JSON string
+    """
+    # Get client from context or create new one
+    if ctx:
+        solana_client = ctx.request_context.lifespan_context.solana_client
+    else:
+        async with get_solana_client() as solana_client:
+            return await _get_all_token_data_impl(solana_client, mint)
+    
+    # If we got here, we're using the context's client
+    return await _get_all_token_data_impl(solana_client, mint)
+
+
+async def _get_all_token_data_impl(solana_client: SolanaClient, mint: str) -> str:
+    """Implementation for get_all_token_data."""
+    try:
+        # Create a token client from the solana client
+        token_client = TokenClient(solana_client.config)
+        
+        # Use token client's get_all_token_data method
+        all_token_data = await token_client.get_all_token_data(mint)
+        
+        return json.dumps(all_token_data, indent=2)
+    except InvalidPublicKeyError as e:
+        return json.dumps({"error": str(e)})
+    except SolanaRpcError as e:
+        return json.dumps({"error": str(e), "details": e.error_data})
+    except Exception as e:
+        return json.dumps({"error": f"Unexpected error: {str(e)}"})
+
+
 def register_resources(app):
     """Register token resources with the app.
     
@@ -169,4 +206,8 @@ def register_resources(app):
         
     @app.resource("solana://token/{mint}/holders")
     async def token_holders_resource(mint: str) -> str:
-        return await get_token_holders(mint, ctx=None) 
+        return await get_token_holders(mint, ctx=None)
+        
+    @app.resource("solana://token/{mint}/all")
+    async def token_all_data_resource(mint: str) -> str:
+        return await get_all_token_data(mint, ctx=None) 
