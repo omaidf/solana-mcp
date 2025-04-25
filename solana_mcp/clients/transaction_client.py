@@ -1,186 +1,218 @@
-"""Transaction-related Solana RPC client operations.
+"""Transaction client module for Solana MCP.
 
-This module provides specialized client functionality for Solana transaction operations.
+This module provides a client for transaction-related operations.
 """
 
-import re
-from typing import Dict, List, Any, Optional
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
+
+from solana.publickey import PublicKey
+from solana.transaction import Transaction
+
+from solana_mcp.models.enhanced_transaction import EnhancedTransaction
+from solana_mcp.models.token_transfer import TokenTransfer
+from solana_mcp.services.rpc_service import RPCService
+from solana_mcp.solana_client import SolanaClient
+from solana_mcp.utils.constants import ZERO_PUBKEY
+from solana_mcp.utils.dependency_injection import inject
+from solana_mcp.utils.error_handling import TransactionError, NotFoundError, handle_errors
+from solana_mcp.utils.transaction_parser import (
+    extract_sol_transfers,
+    extract_token_transfers,
+    parse_instruction_logs,
+)
 
 from solana_mcp.clients.base_client import BaseSolanaClient, InvalidPublicKeyError, validate_public_key
 from solana_mcp.logging_config import get_logger
+from solana_mcp.utils.validation import validate_transaction_signature
+from solana_mcp.constants import SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID, PROGRAM_NAMES
 
 # Get logger
 logger = get_logger(__name__)
 
-class TransactionClient(BaseSolanaClient):
-    """Client for Solana transaction operations."""
-    
-    async def get_transaction(self, signature: str) -> Dict[str, Any]:
+class TransactionClient:
+    """Client for transaction-related operations."""
+
+    @inject
+    def __init__(self, solana_client: Optional[SolanaClient] = None, rpc_service: Optional[RPCService] = None):
+        """Initialize transaction client.
+
+        Args:
+            solana_client: Solana client instance (injected)
+            rpc_service: RPC service instance (injected)
+        """
+        self.solana_client = solana_client
+        self.rpc_service = rpc_service
+
+    @handle_errors(error_map={
+        Exception: TransactionError,
+        ValueError: NotFoundError
+    })
+    async def get_transaction(
+        self, signature: str, encoding: Optional[str] = None
+    ) -> EnhancedTransaction:
         """Get transaction details.
-        
+
         Args:
-            signature: The transaction signature
-            
+            signature: Transaction signature
+            encoding: Encoding type
+
         Returns:
-            Transaction details
-            
+            Enhanced transaction details
+        
         Raises:
-            ValueError: If the signature format is invalid
+            NotFoundError: If transaction not found
+            TransactionError: For any other transaction-related error
         """
-        # Validate transaction signature format - base58 encoded signatures
-        # should be alphanumeric and typical length is 88 characters, but allow some flexibility
-        if not signature or not isinstance(signature, str):
-            raise ValueError(f"Transaction signature must be a non-empty string")
-        
-        # Use a more general validation for base58 encoded data
-        if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{43,128}$", signature):
-            raise ValueError(f"Invalid transaction signature format: {signature}")
-        
-        return await self._make_request(
-            "getTransaction", 
-            [signature, {"encoding": "json"}]
-        )
-    
-    async def get_block(self, slot: int) -> Dict[str, Any]:
-        """Get information about a block.
-        
+        # Get transaction from RPC
+        tx_response = await self.rpc_service.get_transaction(signature, encoding)
+        if not tx_response or not tx_response.get("transaction"):
+            raise NotFoundError(f"Transaction not found: {signature}")
+
+        # Parse transaction
+        return await self.parse_transaction(tx_response)
+
+    @handle_errors(error_map={
+        Exception: TransactionError
+    })
+    async def get_block(
+        self, slot: int, encoding: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Get block details.
+
         Args:
-            slot: The slot number
-            
+            slot: Block slot
+            encoding: Encoding type
+
         Returns:
-            Block information
-        """
-        return await self._make_request(
-            "getBlock",
-            [slot, {"encoding": "json", "transactionDetails": "full", "rewards": True}]
-        )
-    
-    async def get_blocks(
-        self, 
-        start_slot: int, 
-        end_slot: Optional[int] = None,
-        commitment: Optional[str] = None
-    ) -> List[int]:
-        """Get a list of confirmed blocks.
+            Block details
         
+        Raises:
+            TransactionError: For any transaction-related error
+        """
+        block = await self.rpc_service.get_block(slot, encoding)
+        return block
+
+    @handle_errors(error_map={
+        Exception: TransactionError
+    })
+    async def get_blocks(
+        self, start_slot: int, end_slot: Optional[int] = None
+    ) -> List[int]:
+        """Get blocks in slot range.
+
         Args:
-            start_slot: Start slot (inclusive)
-            end_slot: End slot (inclusive, optional)
-            commitment: Commitment level
-            
+            start_slot: Start slot
+            end_slot: End slot (optional)
+
         Returns:
             List of block slots
+        
+        Raises:
+            TransactionError: For any transaction-related error
         """
-        params = [start_slot]
-        if end_slot is not None:
-            params.append(end_slot)
-        if commitment:
-            params.append({"commitment": commitment})
-        
-        return await self._make_request("getBlocks", params)
-    
-    async def parse_transaction(self, transaction_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Parse a transaction into a more human-readable format.
-        
+        blocks = await self.rpc_service.get_blocks(start_slot, end_slot)
+        return blocks
+
+    @handle_errors(error_map={
+        Exception: TransactionError
+    })
+    async def parse_transaction(self, tx_data: Dict[str, Any]) -> EnhancedTransaction:
+        """Parse transaction data into enhanced transaction model.
+
         Args:
-            transaction_data: The transaction data from get_transaction
-            
+            tx_data: Transaction data from RPC
+
         Returns:
-            Parsed transaction data
-        """
-        if not transaction_data:
-            return {"error": "No transaction data provided"}
+            Enhanced transaction object
         
-        try:
-            # Extract basic transaction info
-            result = {}
-            
-            # Check if we have a proper transaction response
-            if "meta" not in transaction_data and "transaction" not in transaction_data:
-                return {"error": "Invalid transaction data format"}
-            
-            # Get basic transaction data
-            result["signature"] = transaction_data.get("transaction", {}).get("signatures", ["unknown"])[0]
-            result["slot"] = transaction_data.get("slot", 0)
-            result["block_time"] = transaction_data.get("blockTime", None)
-            
-            # Check transaction status
-            meta = transaction_data.get("meta", {})
-            if meta.get("err") is not None:
-                result["status"] = "failed"
-                result["error"] = meta.get("err")
-            else:
-                result["status"] = "success"
-            
-            # Get transaction fee
-            result["fee"] = meta.get("fee", 0)
-            
-            # Extract instructions
-            instructions = []
-            tx = transaction_data.get("transaction", {})
-            message = tx.get("message", {})
-            
-            # Extract accounts referenced in the transaction
-            account_keys = []
-            for key in message.get("accountKeys", []):
-                if isinstance(key, str):
-                    account_keys.append(key)
-                elif isinstance(key, dict) and "pubkey" in key:
-                    account_keys.append(key["pubkey"])
-            
-            # Process instructions
-            for idx, instruction in enumerate(message.get("instructions", [])):
-                program_id_idx = instruction.get("programIdIndex")
-                program_id = account_keys[program_id_idx] if 0 <= program_id_idx < len(account_keys) else "unknown"
-                
-                # Get accounts used by this instruction
-                accounts = []
-                for acc_idx in instruction.get("accounts", []):
-                    if 0 <= acc_idx < len(account_keys):
-                        accounts.append(account_keys[acc_idx])
-                
-                # Add instruction data
-                instr_data = {
-                    "program_id": program_id,
-                    "accounts": accounts,
-                    "data": instruction.get("data", "")
-                }
-                
-                # Add program name if we recognize it
-                instr_data["program_name"] = self._get_program_name(program_id)
-                
-                # Try to identify instruction type based on program and data
-                instr_data["type"] = self._identify_instruction_type(program_id, instruction.get("data", ""), accounts)
-                
-                instructions.append(instr_data)
-            
-            result["instructions"] = instructions
-            
-            # Extract token balances if available
-            if "preTokenBalances" in meta and "postTokenBalances" in meta:
-                result["token_transfers"] = self._extract_token_transfers(
-                    meta.get("preTokenBalances", []),
-                    meta.get("postTokenBalances", []),
-                    account_keys
-                )
-            
-            # Extract SOL transfers from account balance changes
-            if "preBalances" in meta and "postBalances" in meta:
-                result["sol_transfers"] = self._extract_sol_transfers(
-                    meta.get("preBalances", []),
-                    meta.get("postBalances", []),
-                    account_keys
-                )
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error parsing transaction: {str(e)}", exc_info=True)
-            return {
-                "error": f"Failed to parse transaction: {str(e)}",
-                "raw_data": transaction_data
-            }
-    
+        Raises:
+            TransactionError: For any transaction-related error
+        """
+        # Extract transaction data
+        meta = tx_data.get("meta", {})
+        transaction = tx_data.get("transaction", {})
+
+        # Extract transaction data
+        signature = transaction.get("signatures", [""])[0]
+        slot = tx_data.get("slot")
+        block_time = tx_data.get("blockTime")
+        timestamp = datetime.fromtimestamp(block_time) if block_time else None
+        success = not meta.get("err")
+
+        # Extract logs if available
+        logs = meta.get("logMessages", [])
+        parsed_logs = parse_instruction_logs(logs) if logs else []
+
+        # Extract fee info
+        fee = meta.get("fee", 0)
+
+        # Extract account keys
+        account_keys = [
+            PublicKey(key) for key in transaction.get("message", {}).get("accountKeys", [])
+        ]
+
+        # Extract SOL transfers
+        pre_balances = meta.get("preBalances", [])
+        post_balances = meta.get("postBalances", [])
+        sol_transfers = extract_sol_transfers(account_keys, pre_balances, post_balances)
+
+        # Extract token transfers
+        token_transfers = self._extract_token_transfers(meta, account_keys)
+
+        # Create enhanced transaction object
+        enhanced_tx = EnhancedTransaction(
+            signature=signature,
+            slot=slot,
+            timestamp=timestamp,
+            success=success,
+            fee=fee,
+            logs=logs,
+            parsed_logs=parsed_logs,
+            sol_transfers=sol_transfers,
+            token_transfers=token_transfers,
+            raw_data=tx_data,
+        )
+        
+        return enhanced_tx
+
+    def _extract_token_transfers(
+        self, meta: Dict[str, Any], account_keys: List[PublicKey]
+    ) -> List[TokenTransfer]:
+        """Extract token transfers from transaction metadata.
+
+        Args:
+            meta: Transaction metadata
+            account_keys: List of account public keys
+
+        Returns:
+            List of token transfers
+        """
+        token_transfers = []
+        if "postTokenBalances" in meta and "preTokenBalances" in meta:
+            token_transfers = extract_token_transfers(
+                meta.get("preTokenBalances", []),
+                meta.get("postTokenBalances", []),
+                account_keys,
+            )
+        return token_transfers
+
+    def _extract_program_ids(self, transaction: Transaction) -> Set[str]:
+        """Extract program IDs from transaction.
+
+        Args:
+            transaction: Transaction object
+
+        Returns:
+            Set of program IDs
+        """
+        program_ids = set()
+        for instruction in transaction.instructions:
+            if instruction.program_id:
+                program_ids.add(str(instruction.program_id))
+        return program_ids
+
     def _get_program_name(self, program_id: str) -> str:
         """Get a human-readable name for a program ID.
         
@@ -190,19 +222,7 @@ class TransactionClient(BaseSolanaClient):
         Returns:
             Program name or 'Unknown Program'
         """
-        program_names = {
-            "11111111111111111111111111111111": "System Program",
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA": "Token Program",
-            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL": "Token Associated Program",
-            "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s": "Metaplex Metadata",
-            "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB": "Jupiter Aggregator",
-            "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP": "Orca Program",
-            "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8": "Raydium Program",
-            "So11111111111111111111111111111111111111112": "Wrapped SOL",
-            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC Mint",
-            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": "USDT Mint",
-        }
-        return program_names.get(program_id, "Unknown Program")
+        return PROGRAM_NAMES.get(program_id, "Unknown Program")
     
     def _identify_instruction_type(self, program_id: str, data: str, accounts: List[str]) -> str:
         """Identify the type of instruction based on program and data.
@@ -219,7 +239,7 @@ class TransactionClient(BaseSolanaClient):
         # decode the data based on the program's instruction format
         
         # System program instructions
-        if program_id == "11111111111111111111111111111111":
+        if program_id == SYSTEM_PROGRAM_ID:
             # First byte of data indicates instruction type
             if data.startswith("3Bxs"):  # Example: Transfer instruction starts with 3Bxs
                 return "Transfer"
@@ -228,7 +248,7 @@ class TransactionClient(BaseSolanaClient):
             return "SystemInstruction"
             
         # Token program instructions
-        elif program_id == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA":
+        elif program_id == TOKEN_PROGRAM_ID:
             # This would need proper decoding based on actual data format
             # Using simplified examples
             if data.startswith("3"):  # Example: Transfer instruction

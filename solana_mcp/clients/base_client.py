@@ -18,19 +18,13 @@ from cachetools import TTLCache, cached
 # Internal imports
 from solana_mcp.config import SolanaConfig, get_solana_config
 from solana_mcp.logging_config import get_logger
+from solana_mcp.utils.validation import validate_public_key, InvalidPublicKeyError
 
 # Type variable for generic functions
 T = TypeVar('T')
 
 # Get logger
 logger = get_logger(__name__)
-
-# Solana public key validation pattern (base58 format)
-PUBKEY_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
-
-class InvalidPublicKeyError(Exception):
-    """Exception raised when an invalid public key is provided."""
-    pass
 
 class SolanaRpcError(Exception):
     """Exception raised when a Solana RPC request fails."""
@@ -44,19 +38,6 @@ class SolanaRpcError(Exception):
         """
         super().__init__(message)
         self.error_data = error_data or {}
-
-def validate_public_key(pubkey: str) -> bool:
-    """Validate a Solana public key.
-    
-    Args:
-        pubkey: The public key to validate
-        
-    Returns:
-        True if the public key is valid, False otherwise
-    """
-    if not pubkey or not isinstance(pubkey, str):
-        return False
-    return bool(PUBKEY_PATTERN.match(pubkey))
 
 class BaseSolanaClient:
     """Base client for interacting with Solana blockchain."""

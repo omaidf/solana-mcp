@@ -13,6 +13,7 @@ from solana_mcp.services.transaction_service import TransactionService
 from solana_mcp.services.token_service import TokenService
 from solana_mcp.solana_client import SolanaClient
 from solana_mcp.utils.decorators import validate_solana_key
+from solana_mcp.constants import SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, METADATA_PROGRAM_ID
 
 class AnalysisService(BaseService):
     """Service for analyzing Solana blockchain data."""
@@ -245,41 +246,47 @@ class AnalysisService(BaseService):
         Returns:
             List of token transfers
         """
-        transfers = []
+        # Import TransactionClient to use its implementation
+        from solana_mcp.clients.transaction_client import TransactionClient
         
         try:
-            # This is a simplified implementation
-            # A real implementation would need to parse the transaction instructions
-            # to identify token transfers, amounts, and directions
+            # Create a TransactionClient with appropriate configuration
+            transaction_client = TransactionClient(
+                # Pass the same configuration the client would have
+                rpc_url=self.client.config.rpc_url if hasattr(self.client, 'config') else None,
+                timeout=self.timeout
+            )
             
-            # Simplified logic to detect token program interactions
-            if "instructions" in transaction:
-                for instr in transaction.get("instructions", []):
-                    # Check if this is a token program instruction
-                    if instr.get("program_id") == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA":
-                        # Simplified transfer detection - in a real implementation,
-                        # we would need to decode the instruction data
-                        accounts = instr.get("accounts", [])
-                        if len(accounts) >= 3:  # Source, destination, owner
-                            source = accounts[0]
-                            destination = accounts[1]
-                            
-                            # Determine direction
-                            direction = "in" if destination == address else "out" if source == address else None
-                            
-                            if direction:
-                                transfers.append({
-                                    "direction": direction,
-                                    "counterparty": destination if direction == "out" else source,
-                                    "amount": 1.0,  # Placeholder - would need instruction data decoding
-                                    "token": "Unknown",  # Placeholder - would need to identify token
-                                    "time": transaction.get("block_time")
-                                })
+            # Use TransactionClient's parse_transaction to get token transfers
+            parsed_tx = transaction_client.parse_transaction(transaction)
+            
+            # Extract token transfers from the parsed transaction
+            token_transfers = parsed_tx.get("token_transfers", [])
+            
+            # Convert to our expected format
+            transfers = []
+            for transfer in token_transfers:
+                # Determine if this transfer involves our address
+                token_account = transfer.get("token_account", "")
+                owner = transfer.get("owner", "")
+                
+                if owner == address or token_account == address:
+                    # Determine direction
+                    direction = "in" if transfer.get("change", 0) > 0 else "out"
+                    
+                    transfers.append({
+                        "direction": direction,
+                        "counterparty": token_account if direction == "in" else owner,
+                        "amount": abs(transfer.get("change", 0)),
+                        "token": transfer.get("mint", "Unknown"),
+                        "time": transaction.get("block_time")
+                    })
+                    
+            return transfers
         except Exception as e:
             self.logger.error(f"Error extracting token transfers: {str(e)}", exc_info=True)
+            return []
         
-        return transfers
-    
     def _count_program_interactions(self, transaction: Dict[str, Any], counter: Counter) -> None:
         """Count program interactions in a transaction.
         
@@ -287,13 +294,18 @@ class AnalysisService(BaseService):
             transaction: Transaction data
             counter: Counter to update
         """
+        # Import TransactionClient to use its program name mapping
+        from solana_mcp.clients.transaction_client import TransactionClient
+        transaction_client = TransactionClient()
+        
         if "transaction" in transaction and "message" in transaction["transaction"]:
             message = transaction["transaction"]["message"]
             
             for instr in message.get("instructions", []):
                 if "programId" in instr:
                     program_id = instr["programId"]
-                    program_name = self.transaction_service._get_program_name(program_id)
+                    # Use TransactionClient's program name mapping
+                    program_name = transaction_client._get_program_name(program_id)
                     counter[program_name] += 1
     
     def _detect_transaction_type(self, transaction: Dict[str, Any]) -> Optional[str]:
@@ -312,13 +324,13 @@ class AnalysisService(BaseService):
             for instr in transaction.get("instructions", []):
                 program_id = instr.get("program_id")
                 
-                if program_id == "11111111111111111111111111111111":
+                if program_id == SYSTEM_PROGRAM_ID:
                     return "SOL Transfer"
-                elif program_id == "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA":
+                elif program_id == TOKEN_PROGRAM_ID:
                     return "Token Transfer"
-                elif program_id == "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL":
+                elif program_id == ASSOCIATED_TOKEN_PROGRAM_ID:
                     return "Token Account Creation"
-                elif program_id == "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s":
+                elif program_id == METADATA_PROGRAM_ID:
                     return "NFT Operation"
         
         return "Unknown"

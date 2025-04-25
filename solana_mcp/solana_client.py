@@ -20,30 +20,16 @@ from cachetools import TTLCache, cached
 from solana_mcp.config import SolanaConfig, get_solana_config
 from solana_mcp.logging_config import get_logger, log_with_context
 from solana_mcp.utils.batching import BatchProcessor
+from solana_mcp.utils.validation import validate_public_key, InvalidPublicKeyError, validate_transaction_signature
+from solana_mcp.constants import (
+    TOKEN_PROGRAM_ID, METADATA_PROGRAM_ID, METAPLEX_PROGRAM_ID, 
+    RAYDIUM_PROGRAM_ID, JUPITER_PROGRAM_ID, ORCA_PROGRAM_ID
+)
 
 # Get logger
 logger = get_logger(__name__)
 
-# Constants
-TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-METADATA_PROGRAM_ID = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
-METAPLEX_PROGRAM_ID = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
-RAYDIUM_PROGRAM_ID = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
-
-# Solana public key validation pattern (base58 format)
-PUBKEY_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
-
-# Jupiter Aggregator Program ID for DEX data
-JUPITER_PROGRAM_ID = "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB"
-
-# Orca Program ID
-ORCA_PROGRAM_ID = "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP"
-
 T = TypeVar('T')
-
-class InvalidPublicKeyError(Exception):
-    """Exception raised when an invalid public key is provided."""
-    pass
 
 class SolanaRpcError(Exception):
     """Exception raised when a Solana RPC request fails."""
@@ -57,19 +43,6 @@ class SolanaRpcError(Exception):
         """
         super().__init__(message)
         self.error_data = error_data or {}
-
-def validate_public_key(pubkey: str) -> bool:
-    """Validate a Solana public key.
-    
-    Args:
-        pubkey: The public key to validate
-        
-    Returns:
-        True if the public key is valid, False otherwise
-    """
-    if not pubkey or not isinstance(pubkey, str):
-        return False
-    return bool(PUBKEY_PATTERN.match(pubkey))
 
 class PublicKey:
     """Solana public key class."""
@@ -440,8 +413,8 @@ class SolanaClient:
         if not signature or not isinstance(signature, str):
             raise ValueError(f"Transaction signature must be a non-empty string")
         
-        # Use a more general validation for base58 encoded data
-        if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{43,128}$", signature):
+        # Use centralized validation utility
+        if not validate_transaction_signature(signature):
             raise ValueError(f"Invalid transaction signature format: {signature}")
         
         # Import here to avoid circular import issues

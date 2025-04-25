@@ -9,16 +9,16 @@ import asyncio
 import json
 import logging
 from typing import Any, Dict, List, Optional, Union
-from functools import lru_cache
 
 import httpx
 
-from solana_mcp.services.base_service import BaseService, handle_errors
-from solana_mcp.utils.errors import (
-    RpcConnectionError, 
-    RpcError, 
+from solana_mcp.services.base_service import BaseService
+from solana_mcp.utils.error_handling import (
+    handle_errors,
+    ConnectionError,
+    RPCError,
     ValidationError,
-    ResourceNotFoundError
+    SolanaMCPError
 )
 from solana_mcp.utils.config import get_settings
 
@@ -60,7 +60,7 @@ class RPCService(BaseService):
         await self.client.aclose()
         self.logger.info("RPCService closed")
     
-    @handle_errors()
+    @handle_errors(retries=3, retry_exceptions=[ConnectionError, httpx.RequestError], retry_delay=1.0)
     async def make_request(self, method: str, params: List[Any]) -> Dict[str, Any]:
         """
         Make an RPC request to the Solana API.
@@ -73,8 +73,8 @@ class RPCService(BaseService):
             RPC response data
             
         Raises:
-            RpcConnectionError: If there is a connection error
-            RpcError: If the RPC request fails
+            ConnectionError: If there is a connection error
+            RPCError: If the RPC request fails
         """
         payload = {
             "jsonrpc": "2.0",
@@ -83,120 +83,57 @@ class RPCService(BaseService):
             "params": params
         }
         
-        # Retry parameters
-        initial_retry_delay = 1.0  # starting delay in seconds
-        max_retry_delay = 10.0  # maximum delay in seconds
-        retriable_status_codes = {408, 429, 500, 502, 503, 504}
-        
-        for retry_count in range(self.max_retries + 1):
-            try:
-                async with self.log_timing(f"rpc_request.{method}"):
-                    # Log the attempt if it's a retry
-                    if retry_count > 0:
-                        self.logger.info(f"Retry attempt {retry_count}/{self.max_retries} for {method}")
-                    
-                    response = await self.client.post(
-                        self.rpc_url,
-                        json=payload,
-                        headers={"Content-Type": "application/json"}
-                    )
-                    
-                    # Handle HTTP status errors
-                    if response.status_code in retriable_status_codes and retry_count < self.max_retries:
-                        wait_time = min(
-                            initial_retry_delay * (2 ** retry_count), 
-                            max_retry_delay
-                        )
-                        self.logger.warning(f"HTTP status {response.status_code}, retrying in {wait_time}s: {method}")
-                        await asyncio.sleep(wait_time)
-                        continue
-                    
-                    # Raise for other HTTP status errors
-                    response.raise_for_status()
-                    
-                    # Parse JSON response
-                    result = response.json()
-                    
-                    # Handle RPC errors
-                    if "error" in result:
-                        error = result["error"]
-                        message = f"Solana RPC error: {error.get('message', 'Unknown error')}"
-                        if "data" in error:
-                            message += f" - {json.dumps(error['data'])}"
-                        
-                        # Check for rate limiting errors and retry if possible
-                        if ("rate limited" in message.lower() or 
-                            error.get("code") == -32005) and retry_count < self.max_retries:
-                            wait_time = min(
-                                initial_retry_delay * (2 ** retry_count), 
-                                max_retry_delay
-                            )
-                            self.logger.warning(f"Rate limited, retrying in {wait_time}s: {method}")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        
-                        # Non-retriable RPC error or max retries reached
-                        raise RpcError(
-                            message=message,
-                            details={"method": method, "error": error}
-                        )
-                    
-                    # Success case - return the result
-                    return result["result"]
-                    
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code in retriable_status_codes and retry_count < self.max_retries:
-                    wait_time = min(
-                        initial_retry_delay * (2 ** retry_count), 
-                        max_retry_delay
-                    )
-                    self.logger.warning(f"Request failed with status {e.response.status_code}, retrying in {wait_time}s")
-                    await asyncio.sleep(wait_time)
-                    continue
-                
-                raise RpcError(
-                    message=f"RPC request failed with status {e.response.status_code}",
-                    details={"method": method, "status_code": e.response.status_code}
+        try:
+            async with self.log_timing(f"rpc_request.{method}"):
+                response = await self.client.post(
+                    self.rpc_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"}
                 )
                 
-            except httpx.RequestError as e:
-                if retry_count < self.max_retries:
-                    wait_time = min(
-                        initial_retry_delay * (2 ** retry_count), 
-                        max_retry_delay
-                    )
-                    self.logger.warning(f"Connection error, retrying in {wait_time}s: {str(e)}")
-                    await asyncio.sleep(wait_time)
-                    continue
+                # Raise for HTTP status errors
+                response.raise_for_status()
                 
-                raise RpcConnectionError(
-                    message=f"Connection error during RPC request: {str(e)}",
-                    details={"method": method, "error": str(e)}
-                )
+                # Parse JSON response
+                result = response.json()
                 
-            except Exception as e:
-                if retry_count < self.max_retries:
-                    wait_time = min(
-                        initial_retry_delay * (2 ** retry_count), 
-                        max_retry_delay
-                    )
-                    self.logger.warning(f"Unexpected error, retrying in {wait_time}s: {str(e)}")
-                    await asyncio.sleep(wait_time)
-                    continue
+                # Handle RPC errors
+                if "error" in result:
+                    error = result["error"]
+                    code = error.get("code", 0)
+                    message = error.get("message", "Unknown error")
+                    data = error.get("data")
+                    
+                    # Raise standardized RPCError
+                    raise RPCError(method, code, message, data)
                 
-                raise RpcError(
-                    message=f"Unexpected error during RPC request: {str(e)}",
-                    details={"method": method, "error": str(e)}
-                )
-        
-        # We should never reach here, but just in case
-        raise RpcError(
-            message=f"RPC request failed after {self.max_retries} retries",
-            details={"method": method}
-        )
+                # Success case - return the result
+                return result["result"]
+                
+        except httpx.HTTPStatusError as e:
+            raise RPCError(
+                method, 
+                e.response.status_code, 
+                f"HTTP error: {e.response.status_code}", 
+                {"response": e.response.text}
+            )
+            
+        except httpx.RequestError as e:
+            raise ConnectionError(f"Connection error during RPC request to {method}: {str(e)}")
+            
+        except RPCError:
+            # Pass through our custom RPCError
+            raise
+            
+        except Exception as e:
+            raise RPCError(
+                method, 
+                -1, 
+                f"Unexpected error: {str(e)}"
+            )
     
     # Solana RPC methods
-    @handle_errors()
+    @handle_errors(retries=2)
     async def get_account_info(self, account: str, encoding: str = "base64") -> Dict[str, Any]:
         """
         Get account information.
@@ -211,20 +148,14 @@ class RPCService(BaseService):
         if not self._validate_public_key(account):
             raise ValidationError(f"Invalid account address: {account}")
             
-        # Import AccountClient to use the centralized implementation
-        from solana_mcp.clients.account_client import AccountClient
+        params = [
+            account,
+            {"encoding": encoding}
+        ]
         
-        # Create an AccountClient with appropriate configuration
-        account_client = AccountClient(rpc_url=self.rpc_url, timeout=self.timeout)
-        
-        try:
-            # Delegate to the AccountClient implementation
-            return await account_client.get_account_info(account, encoding)
-        finally:
-            # Clean up the client
-            await account_client.close()
+        return await self.make_request("getAccountInfo", params)
     
-    @handle_errors()
+    @handle_errors(retries=2)
     async def get_balance(self, account: str) -> int:
         """
         Get account balance.
@@ -238,20 +169,11 @@ class RPCService(BaseService):
         if not self._validate_public_key(account):
             raise ValidationError(f"Invalid account address: {account}")
             
-        # Import AccountClient to use the centralized implementation
-        from solana_mcp.clients.account_client import AccountClient
-        
-        # Create an AccountClient with appropriate configuration
-        account_client = AccountClient(rpc_url=self.rpc_url, timeout=self.timeout)
-        
-        try:
-            # Delegate to the AccountClient implementation
-            return await account_client.get_balance(account)
-        finally:
-            # Clean up the client
-            await account_client.close()
+        params = [account]
+        result = await self.make_request("getBalance", params)
+        return result["value"]
     
-    @handle_errors()
+    @handle_errors(retries=2)
     async def get_token_accounts_by_owner(
         self, 
         owner: str, 
@@ -290,9 +212,10 @@ class RPCService(BaseService):
             ]
         
         params.append({"encoding": "jsonParsed"})
-        return await self.make_request("getTokenAccountsByOwner", params)
+        result = await self.make_request("getTokenAccountsByOwner", params)
+        return result["value"]
     
-    @handle_errors()
+    @handle_errors(retries=2)
     async def get_token_supply(self, mint: str) -> Dict[str, Any]:
         """
         Get token supply.
@@ -306,20 +229,11 @@ class RPCService(BaseService):
         if not self._validate_public_key(mint):
             raise ValidationError(f"Invalid mint address: {mint}")
         
-        # Import TokenClient to use the centralized implementation
-        from solana_mcp.clients.token_client import TokenClient
-        
-        # Create a TokenClient with appropriate configuration
-        token_client = TokenClient(rpc_url=self.rpc_url, timeout=self.timeout)
-        
-        try:
-            # Delegate to the TokenClient implementation
-            return await token_client.get_token_supply(mint)
-        finally:
-            # Clean up the client
-            await token_client.close()
+        params = [mint, {"commitment": "confirmed"}]
+        result = await self.make_request("getTokenSupply", params)
+        return result["value"]
     
-    @handle_errors()
+    @handle_errors(retries=2)
     async def get_token_largest_accounts(self, mint: str) -> List[Dict[str, Any]]:
         """
         Get largest token accounts by token mint.
@@ -333,20 +247,11 @@ class RPCService(BaseService):
         if not self._validate_public_key(mint):
             raise ValidationError(f"Invalid mint address: {mint}")
             
-        # Import TokenClient to use the centralized implementation
-        from solana_mcp.clients.token_client import TokenClient
-        
-        # Create a TokenClient with appropriate configuration
-        token_client = TokenClient(rpc_url=self.rpc_url, timeout=self.timeout)
-        
-        try:
-            # Delegate to the TokenClient implementation
-            return await token_client.get_token_largest_accounts(mint)
-        finally:
-            # Clean up the client
-            await token_client.close()
+        params = [mint]
+        result = await self.make_request("getTokenLargestAccounts", params)
+        return result["value"]
     
-    @handle_errors()
+    @handle_errors(retries=2)
     async def get_token_metadata(self, mint: str) -> Dict[str, Any]:
         """
         Get token metadata using the Metaplex standard.
@@ -360,20 +265,23 @@ class RPCService(BaseService):
         if not self._validate_public_key(mint):
             raise ValidationError(f"Invalid mint address: {mint}")
         
-        # Import TokenClient to use the centralized implementation
-        from solana_mcp.clients.token_client import TokenClient
+        # Find the metadata PDA for this mint
+        metadata_address = self._find_metadata_pda(mint)
         
-        # Create a TokenClient with appropriate configuration
-        token_client = TokenClient(rpc_url=self.rpc_url, timeout=self.timeout)
+        # Get the metadata account info
+        account_info = await self.get_account_info(metadata_address, encoding="base64")
         
-        try:
-            # Delegate to the TokenClient implementation
-            return await token_client.get_token_metadata(mint)
-        finally:
-            # Clean up the client
-            await token_client.close()
+        if not account_info["value"]:
+            raise ValidationError(f"No metadata found for mint: {mint}")
+            
+        # Here you would normally parse the metadata from the account data
+        # This is a simplified version that just returns the raw data
+        return {
+            "address": metadata_address,
+            "raw_data": account_info["value"]
+        }
     
-    @handle_errors()
+    @handle_errors(retries=2)
     async def get_program_accounts(
         self, 
         program_id: str, 
@@ -398,26 +306,22 @@ class RPCService(BaseService):
         if not self._validate_public_key(program_id):
             raise ValidationError(f"Invalid program ID: {program_id}")
             
-        # Import AccountClient to use the centralized implementation
-        from solana_mcp.clients.account_client import AccountClient
+        config: Dict[str, Any] = {"encoding": encoding}
         
-        # Create an AccountClient with appropriate configuration
-        account_client = AccountClient(rpc_url=self.rpc_url, timeout=self.timeout)
-        
-        try:
-            # Delegate to the AccountClient implementation
-            return await account_client.get_program_accounts(
-                program_id, 
-                filters=filters, 
-                encoding=encoding, 
-                limit=limit, 
-                offset=offset
-            )
-        finally:
-            # Clean up the client
-            await account_client.close()
+        if filters:
+            config["filters"] = filters
+            
+        if limit is not None:
+            config["limit"] = limit
+            
+        if offset is not None:
+            config["offset"] = offset
+            
+        params = [program_id, config]
+        result = await self.make_request("getProgramAccounts", params)
+        return result
     
-    @handle_errors()
+    @handle_errors(retries=2)
     async def get_signatures_for_address(
         self, 
         address: str, 
@@ -438,24 +342,15 @@ class RPCService(BaseService):
         if not self._validate_public_key(address):
             raise ValidationError(f"Invalid address: {address}")
             
-        # Import AccountClient to use the centralized implementation
-        from solana_mcp.clients.account_client import AccountClient
+        config: Dict[str, Any] = {"limit": limit}
         
-        # Create an AccountClient with appropriate configuration
-        account_client = AccountClient(rpc_url=self.rpc_url, timeout=self.timeout)
-        
-        try:
-            # Delegate to the AccountClient implementation
-            return await account_client.get_signatures_for_address(
-                address, 
-                before=before,
-                limit=limit
-            )
-        finally:
-            # Clean up the client
-            await account_client.close()
+        if before:
+            config["before"] = before
+            
+        params = [address, config]
+        return await self.make_request("getSignaturesForAddress", params)
     
-    @handle_errors()
+    @handle_errors(retries=2)
     async def get_transaction(self, signature: str) -> Dict[str, Any]:
         """
         Get transaction details.
@@ -466,18 +361,16 @@ class RPCService(BaseService):
         Returns:
             Transaction details
         """
-        # Import TransactionClient to use the centralized implementation
-        from solana_mcp.clients.transaction_client import TransactionClient
+        # Validate signature format (base58 encoded string)
+        if not signature or not isinstance(signature, str) or len(signature) < 32:
+            raise ValidationError(f"Invalid transaction signature: {signature}")
+            
+        params = [
+            signature, 
+            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+        ]
         
-        # Create a TransactionClient with appropriate configuration
-        transaction_client = TransactionClient(rpc_url=self.rpc_url, timeout=self.timeout)
-        
-        try:
-            # Delegate to the TransactionClient implementation
-            return await transaction_client.get_transaction(signature)
-        finally:
-            # Clean up the client
-            await transaction_client.close()
+        return await self.make_request("getTransaction", params)
     
     def _validate_public_key(self, pubkey: str) -> bool:
         """
@@ -500,36 +393,92 @@ class RPCService(BaseService):
         """
         Find the metadata PDA for a given mint address.
         
-        This is a simplified implementation. In a real system, this would
-        compute the actual PDA using the Metaplex metadata program.
-        
         Args:
-            mint_address: The token's mint address
+            mint_address: The mint address to find metadata for
             
         Returns:
-            The metadata account address
+            Metadata PDA address
+            
+        Note:
+            This is a simplified version that doesn't actually compute the PDA.
+            In a real implementation, you would derive this using the Metaplex SDK.
         """
-        # In a real implementation, you would compute this using:
-        # PublicKey.findProgramAddress(
-        #     [Buffer.from('metadata'), METADATA_PROGRAM_ID.toBytes(), mint.toBytes()],
-        #     METADATA_PROGRAM_ID
-        # )
-        
-        # This is a placeholder that just appends 'metadata' to the mint address
-        # In a real implementation, use the proper PDA derivation
-        return f"{mint_address}_metadata"
-
-
-@lru_cache()
-def get_rpc_service() -> RPCService:
-    """
-    Get or create an RPCService instance.
+        # This is a placeholder - in a real implementation, you would derive the PDA
+        # using the appropriate seeds and the Metaplex program ID
+        return f"metadata_for_{mint_address}"
     
-    Returns:
-        A singleton instance of RPCService
+    @handle_errors(retries=2)
+    async def get_block(self, slot: int) -> Dict[str, Any]:
+        """
+        Get block information.
+        
+        Args:
+            slot: The slot number
+            
+        Returns:
+            Block information
+        """
+        if not isinstance(slot, int) or slot < 0:
+            raise ValidationError(f"Invalid slot number: {slot}")
+            
+        params = [
+            slot, 
+            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+        ]
+        
+        return await self.make_request("getBlock", params)
+    
+    @handle_errors(retries=2)
+    async def get_blocks(self, start_slot: int, end_slot: Optional[int] = None) -> List[int]:
+        """
+        Get a list of confirmed blocks.
+        
+        Args:
+            start_slot: Start slot
+            end_slot: End slot (optional)
+            
+        Returns:
+            List of block slot numbers
+        """
+        if not isinstance(start_slot, int) or start_slot < 0:
+            raise ValidationError(f"Invalid start slot: {start_slot}")
+            
+        if end_slot is not None and (not isinstance(end_slot, int) or end_slot < start_slot):
+            raise ValidationError(f"Invalid end slot: {end_slot}")
+            
+        params = [start_slot]
+        if end_slot is not None:
+            params.append(end_slot)
+            
+        return await self.make_request("getBlocks", params)
+
+
+# Singleton accessor for the RPCService
+def get_rpc_service(
+    rpc_url: Optional[str] = None,
+    timeout: float = 30.0
+) -> RPCService:
     """
-    settings = get_settings()
-    return RPCService(
-        rpc_url=settings.SOLANA_RPC_URL,
-        timeout=settings.RPC_TIMEOUT
-    ) 
+    Get a singleton instance of the RPCService.
+    
+    This function will be replaced by the dependency injection system.
+    
+    Args:
+        rpc_url: Optional RPC URL override
+        timeout: Optional timeout override
+        
+    Returns:
+        Singleton RPCService instance
+    """
+    from solana_mcp.utils.dependency_injection import ServiceProvider
+    provider = ServiceProvider.get_instance()
+    
+    # Check if we already have a service instance
+    try:
+        service = provider.get(RPCService)
+    except KeyError:
+        # Create and register a new service instance
+        service = RPCService(rpc_url=rpc_url, timeout=timeout)
+        provider.register(RPCService, service)
+    
+    return service 
