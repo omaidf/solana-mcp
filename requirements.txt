@@ -18,6 +18,7 @@ ujson>=5.8.0
 structlog>=23.1.0
 python-json-logger>=2.0.7
 prometheus-client>=0.18.0
+cachetools>=5.3.0
 
 # Testing (optional for production)
 pytest>=7.4.3
