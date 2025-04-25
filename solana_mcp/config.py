@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 import re
 from decimal import Decimal, InvalidOperation
+import logging
 
 # Third-party library imports
 from dotenv import load_dotenv
@@ -184,6 +185,9 @@ class SolanaConfig:
     commitment: str = "confirmed"
     timeout: int = 30  # seconds
     
+    # Add API key for external services like Birdeye
+    birdeye_api_key: Optional[str] = None
+    
     @property
     def has_auth(self) -> bool:
         """Check if authentication credentials are provided.
@@ -206,14 +210,21 @@ def get_solana_config() -> SolanaConfig:
     Raises:
         ValueError: If environment variables fail validation
     """
+    # Get logger instance
+    logger = logging.getLogger(__name__)
+
+    # Hardcode the specific Helius RPC URL as requested
+    hardcoded_rpc_url = "https://mainnet.helius-rpc.com/?api-key=4ffc1228-f093-4974-ad2d-3edd8e5f7c03"
+    logger.warning(f"Using hardcoded Solana RPC URL: {hardcoded_rpc_url}. Environment variable SOLANA_RPC_URL will be ignored.")
+
     return SolanaConfig(
-        rpc_url=get_env_var("SOLANA_RPC_URL", "https://api.devnet.solana.com", 
-                            validator=url_validator),
-        rpc_user=get_env_var("SOLANA_RPC_USER"),
+        rpc_url=hardcoded_rpc_url, # Use the hardcoded URL
+        rpc_user=get_env_var("SOLANA_RPC_USER"), # Keep loading user/pass if needed for other RPCs someday
         rpc_password=get_env_var("SOLANA_RPC_PASSWORD"),
         commitment=get_env_var("SOLANA_COMMITMENT", "confirmed", 
                               validator=commitment_validator),
-        timeout=get_env_var("SOLANA_TIMEOUT", 30, validator=int_validator)
+        timeout=get_env_var("SOLANA_TIMEOUT", 30, validator=int_validator),
+        birdeye_api_key=get_env_var("BIRDEYE_API_KEY") # Keep loading Birdeye key separately
     )
 
 
@@ -321,7 +332,7 @@ class APIConfig:
 @dataclass
 class AnalysisConfig:
     """Configuration for Whale/Fresh wallet analysis."""
-    whale_holder_limit: int = 50
+    whale_holder_limit: int = 2
     whale_total_value_threshold_usd: Decimal = Decimal("50000")
     whale_supply_percentage_threshold: Decimal = Decimal("1.0")
     fresh_wallet_holder_limit: int = 100
@@ -337,7 +348,7 @@ class AnalysisConfig:
 def get_analysis_config() -> AnalysisConfig:
     """Get Analysis configuration from environment variables."""
     return AnalysisConfig(
-        whale_holder_limit=get_env_var("WHALE_HOLDER_LIMIT", 50, validator=int_validator),
+        whale_holder_limit=get_env_var("WHALE_HOLDER_LIMIT", 2, validator=int_validator),
         whale_total_value_threshold_usd=get_env_var("WHALE_TOTAL_VALUE_THRESHOLD_USD", Decimal("50000"), validator=decimal_validator),
         whale_supply_percentage_threshold=get_env_var("WHALE_SUPPLY_PERCENTAGE_THRESHOLD", Decimal("1.0"), validator=decimal_validator),
         fresh_wallet_holder_limit=get_env_var("FRESH_WALLET_HOLDER_LIMIT", 100, validator=int_validator),

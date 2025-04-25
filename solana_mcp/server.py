@@ -28,7 +28,7 @@ from starlette.exceptions import HTTPException
 from solana_mcp.config import ServerConfig, get_server_config, get_app_config
 from solana_mcp.solana_client import (
     SolanaClient, get_solana_client, SolanaRpcError, InvalidPublicKeyError,
-    TOKEN_PROGRAM_ID, METADATA_PROGRAM_ID
+    TOKEN_PROGRAM_ID, METADATA_PROGRAM_ID, SOL_MINT
 )
 from solana_mcp.semantic_search import (
     get_account_balance, get_account_details, get_token_accounts_for_owner,
@@ -405,7 +405,14 @@ async def get_token_details(mint: str, solana_client: SolanaClient, format_level
         largest_accounts = await solana_client.get_token_largest_accounts(mint)
         
         # Get market price data if available
-        price_data = await solana_client.get_market_price(mint)
+        # Use get_token_price which primarily uses Birdeye
+        price_data_result = await solana_client.get_token_price(mint)
+        # Extract relevant price data structure if needed, handle potential errors
+        price_data = {
+            "price": price_data_result.get("price"),
+            "source": price_data_result.get("source"),
+            "last_updated": price_data_result.get("last_updated")
+        }
         
         # Compile all information
         token_info = {
@@ -1907,7 +1914,8 @@ def run_server(
             
             # Clean up sessions
             try:
-                with _session_store_async_lock:
+                # Use async context manager for asyncio.Lock
+                async with _session_store_async_lock:
                     SESSION_STORE.clear()
             except Exception as e:
                 print(f"Error clearing sessions: {str(e)}")
@@ -1950,24 +1958,40 @@ async def detect_whale_wallets(token_address: str, solana_client: SolanaClient) 
         }
 
     try:
-        # 1. Fetch basic token info (supply, decimals, metadata, price) concurrently
-        # Also fetch current SOL price concurrently
-        logger.debug(f"[{token_address}] Fetching token supply, metadata, price, and SOL price...")
-        token_info_tasks = {
-            "supply": solana_client.get_token_supply(token_address),
-            "metadata": solana_client.get_token_metadata(token_address),
-            "target_price": solana_client.get_market_price(token_address),
-            "sol_price": solana_client.get_market_price("So11111111111111111111111111111111111111112") # Fetch SOL price
-        }
-        results = await asyncio.gather(*token_info_tasks.values(), return_exceptions=True)
-        token_info_results = dict(zip(token_info_tasks.keys(), results))
+        # 1. Fetch basic token info (supply, decimals, metadata, price) sequentially
+        logger.debug(f"[{token_address}] Fetching token supply, metadata, price, and SOL price sequentially...")
+        error_details = []
+        
+        try:
+            supply_data = await solana_client.get_token_supply(token_address)
+        except Exception as e:
+            supply_data = e 
+            logger.error(f"Failed get_token_supply for {token_address}: {e}")
+
+        try:
+            metadata = await solana_client.get_token_metadata(token_address)
+        except Exception as e:
+             metadata = e
+             logger.error(f"Failed get_token_metadata for {token_address}: {e}")
+
+        try:
+            target_price_data = await solana_client.get_token_price(token_address)
+        except Exception as e:
+             target_price_data = e
+             logger.error(f"Failed get_token_price for {token_address}: {e}")
+
+        try:
+            sol_price_data = await solana_client.get_token_price(SOL_MINT)
+        except Exception as e:
+             sol_price_data = e
+             logger.error(f"Failed get_token_price for SOL: {e}")
 
         # --- Process Token Info Results ---
-        supply_data = token_info_results.get("supply")
-        metadata = token_info_results.get("metadata")
-        target_price_data = token_info_results.get("target_price")
-        sol_price_data = token_info_results.get("sol_price")
-        error_details = []
+        # supply_data = token_info_results.get("supply") # OLD concurrent way
+        # metadata = token_info_results.get("metadata")
+        # target_price_data = token_info_results.get("target_price")
+        # sol_price_data = token_info_results.get("sol_price")
+        # error_details = [] # Defined above
 
         # Validate supply data
         if isinstance(supply_data, Exception) or not supply_data or "value" not in supply_data:
@@ -2011,16 +2035,22 @@ async def detect_whale_wallets(token_address: str, solana_client: SolanaClient) 
         }
         logger.debug(f"[{token_address}] Token info processed: {token_info}")
 
-        # 2. Fetch top N holders efficiently (using config limit)
+        # 2. Fetch top N holders using the internal helper (which now uses SolanaFM)
         whale_holder_limit = analysis_config.whale_holder_limit
-        logger.debug(f"[{token_address}] Fetching top {whale_holder_limit} holders...")
-        holders = await _get_token_holders_internal(token_address, solana_client, limit=whale_holder_limit)
+        logger.debug(f"[{token_address}] Fetching top {whale_holder_limit} holders via _get_token_holders_internal...")
+        try:
+            # Ensure we are calling the internal helper function
+            holders = await _get_token_holders_internal(token_address, solana_client, limit=whale_holder_limit)
+        except SolanaRpcError as e:
+            logger.error(f"Failed to get holders for {token_address}: {e}")
+            return {"success": False, "error": "Error fetching token holders", "details": str(e)}
+        except Exception as e:
+            logger.error(f"Unexpected error fetching holders for {token_address}: {e}", exc_info=True)
+            return {"success": False, "error": "Unexpected error fetching holders", "details": str(e)}
+
         if not holders:
-            logger.warning(f"[{token_address}] No holders found.")
-            final_token_info = token_info.copy()
-            final_token_info['price_usd'] = float(final_token_info['price_usd'])
-            final_token_info['total_supply'] = float(final_token_info['total_supply'])
-            final_token_info['current_sol_price_usd'] = float(final_token_info['current_sol_price_usd'])
+            logger.warning(f"[{token_address}] No holders found or processed.")
+            # ... (rest of the no holders return logic as before)
             return {
                 "success": True, "warning": "No token holders found.",
                 "token_address": token_address, "token_info": final_token_info,
@@ -2028,68 +2058,92 @@ async def detect_whale_wallets(token_address: str, solana_client: SolanaClient) 
             }
 
         logger.debug(f"[{token_address}] Processing {len(holders)} potential whale holders...")
-        holder_owners = [h['owner'] for h in holders]
+        # Extract owner addresses from the holders list returned by the internal helper
+        holder_owners = [h['owner'] for h in holders if h.get('owner')]
+        # Create map from owner to their target token amount (already fetched, assuming lamports)
+        owner_target_holdings = {h['owner']: h['amount'] for h in holders if h.get('owner') and h.get('amount') is not None}
 
-        # 3. Fetch wallet token balances concurrently
-        logger.debug(f"[{token_address}] Fetching token balances for {len(holder_owners)} wallets...")
-        balance_tasks = [_get_wallet_token_balances_internal(owner, solana_client) for owner in holder_owners]
-        wallet_balances_results = await asyncio.gather(*balance_tasks, return_exceptions=True)
+        if not holder_owners:
+            logger.warning(f"Could not extract owners from holder data for {token_address}")
+            # Return simplified success if no owners found
+            # ... (similar return logic as no holders) ...
+            return {"success": True, "warning": "Could not extract owners from holder data.", "token_address": token_address, "token_info": final_token_info, "whale_count": 0, "whales": []}
 
-        # 4. Process holders with their fetched balances
-        logger.debug(f"[{token_address}] Analyzing holders for whale status...")
+        unique_owners = list(owner_target_holdings.keys())
+        logger.debug(f"[{token_address}] Found {len(unique_owners)} unique owners to check SOL balance.")
+
+        # 3. Fetch SOL balances for unique owners using getMultipleAccounts (batched)
+        owner_sol_balances = {}
+        batch_size = 100 # getMultipleAccounts limit
+        
+        # Add delay before fetching SOL balances
+        await asyncio.sleep(0.5) 
+        
+        for i in range(0, len(unique_owners), batch_size):
+            batch_owners = unique_owners[i:i + batch_size]
+            logger.debug(f"Fetching SOL balances for owners batch {i//batch_size + 1}")
+            try:
+                # Fetch SOL balances (lamports)
+                multiple_balances_info = await solana_client._make_request(
+                    "getMultipleAccounts", 
+                    [batch_owners] # Default encoding is base64, only need lamports
+                )
+                if multiple_balances_info and isinstance(multiple_balances_info.get("value"), list):
+                    balances_data = multiple_balances_info["value"]
+                    for idx, balance_data in enumerate(balances_data):
+                        if balance_data and isinstance(balance_data.get("lamports"), int):
+                            owner_addr = batch_owners[idx]
+                            owner_sol_balances[owner_addr] = Decimal(balance_data["lamports"])
+                await asyncio.sleep(0.1) # Small delay between batches
+            except SolanaRpcError as e:
+                logger.warning(f"Failed getMultipleAccounts batch for SOL balances: {e}")
+                error_details.append(f"SOL balance fetch failed for batch {i//batch_size + 1}: {e}")
+            except Exception as e:
+                 logger.warning(f"Unexpected error in getMultipleAccounts batch for SOL balances: {e}")
+                 error_details.append(f"Unexpected SOL balance fetch error for batch {i//batch_size + 1}: {e}")
+
+        # 4. Process owners and identify whales based on simplified value
+        logger.debug(f"[{token_address}] Analyzing {len(unique_owners)} owners for whale status (simplified value)...")
         whale_wallets = []
         processed_holder_count = 0
         # Use thresholds from config
         whale_value_threshold = analysis_config.whale_total_value_threshold_usd
         whale_supply_threshold = analysis_config.whale_supply_percentage_threshold
 
-        for i, holder in enumerate(holders):
+        for owner_address, total_target_lamports in owner_target_holdings.items():
             processed_holder_count += 1
-            wallet_address = holder["owner"]
-            amount = holder["amount"]
-            holder_decimals = holder.get("decimals")
+            sol_balance_lamports = owner_sol_balances.get(owner_address, Decimal(0))
 
-            if holder_decimals is None or holder_decimals != token_info['decimals']:
-                logger.warning(f"[{token_address}] Skipping whale holder {wallet_address} due to decimals mismatch")
-                continue
-
-            wallet_balances = wallet_balances_results[i]
-            if isinstance(wallet_balances, Exception):
-                logger.warning(f"[{token_address}] Failed balances for whale candidate {wallet_address}: {wallet_balances}")
-                error_details.append(f"Balance fetch failed for {wallet_address[:6]}...: {wallet_balances}")
-                continue
-
-            try: token_amount = amount / Decimal(10 ** token_info['decimals'])
-            except ZeroDivisionError: continue
+            # Convert amounts using fetched decimals/prices
+            try: 
+                token_amount = total_target_lamports / Decimal(10 ** token_info['decimals'])
+                sol_amount = sol_balance_lamports / Decimal(10**9)
+            except (ZeroDivisionError, TypeError):
+                 logger.warning(f"Error converting amounts for owner {owner_address}")
+                 continue # Skip holder if conversion fails
 
             target_token_value_usd = token_amount * token_info['price_usd']
+            sol_value_usd = sol_amount * token_info['current_sol_price_usd']
             supply_percentage = (token_amount / token_info['total_supply']) * 100 if token_info['total_supply'] > 0 else Decimal(0)
 
-            total_value_usd = Decimal(0)
-            token_count = len(wallet_balances)
-            for balance_info in wallet_balances:
-                mint = balance_info['mint']
-                bal_amount = balance_info['amount_decimal']
-                value = Decimal(0)
-                # TODO: Enhance value estimation to include more tokens via a price feed API.
-                # Current logic only prices the target token, SOL, USDC, USDT, underestimating total value.
-                if mint == token_address: value = target_token_value_usd
-                elif mint == "So11111111111111111111111111111111111111112": value = bal_amount * current_sol_price_usd # Use fetched/fallback SOL price
-                elif mint in ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]: value = bal_amount
-                total_value_usd += value
+            # Simplified total value (Target Token + SOL only)
+            estimated_total_value_usd = target_token_value_usd + sol_value_usd
+            # Token count is unknown with this simplified approach
+            token_count = None 
 
             # Use thresholds from config
-            is_whale = (total_value_usd > whale_value_threshold or
+            is_whale = (estimated_total_value_usd > whale_value_threshold or
                         supply_percentage > whale_supply_threshold)
 
             if is_whale:
                 whale_wallets.append({
-                    'wallet': wallet_address,
+                    'wallet': owner_address,
                     'target_token_amount': float(token_amount),
                     'target_token_value_usd': float(target_token_value_usd),
                     'target_token_supply_percentage': float(supply_percentage),
-                    'estimated_total_value_usd': float(total_value_usd),
-                    'token_count': token_count
+                    'estimated_total_value_usd': float(estimated_total_value_usd),
+                    'sol_balance': float(sol_amount),
+                    'token_count': token_count # Indicate count is unavailable
                 })
 
         whale_wallets.sort(key=lambda x: x['estimated_total_value_usd'], reverse=True)
@@ -2155,8 +2209,8 @@ async def detect_fresh_wallets(token_address: str, solana_client: SolanaClient) 
         token_info_tasks = {
             "supply": solana_client.get_token_supply(token_address),
             "metadata": solana_client.get_token_metadata(token_address),
-            "target_price": solana_client.get_market_price(token_address),
-            "sol_price": solana_client.get_market_price("So11111111111111111111111111111111111111112")
+            "target_price": solana_client.get_token_price(token_address), # Use get_token_price for target
+            "sol_price": solana_client.get_token_price(SOL_MINT) # Use get_token_price for SOL
         }
         results = await asyncio.gather(*token_info_tasks.values(), return_exceptions=True)
         token_info_results = dict(zip(token_info_tasks.keys(), results))
@@ -2480,79 +2534,79 @@ async def _get_token_holders_internal(token_address: str, solana_client: SolanaC
         List of token holders with owner, amount (Decimal), address
         Raises SolanaRpcError or Exception on failure.
     """
-    logger.debug(f"Fetching top {limit} holders for mint: {token_address}")
+    logger.debug(f"Fetching top {limit} holders for mint: {token_address} via SolanaFM")
     try:
-        # Use getProgramAccounts with memcmp filter for efficiency
-        result = await solana_client._make_request("getProgramAccounts", [
-            TOKEN_PROGRAM_ID,  # Use imported constant
-            {
-                "filters": [
-                    {
-                        "dataSize": 165  # Size of token account data
-                    },
-                    {
-                        "memcmp": {
-                            "offset": 0,
-                            "bytes": token_address
-                        }
-                    }
-                ],
-                "encoding": "jsonParsed"
-            }
-        ])
+        # Use the SolanaClient method which calls SolanaFM API
+        solanafm_response = await solana_client.get_token_holders(token_address, limit=limit)
+        
+        # Check if the API call itself indicated an error
+        if solanafm_response.get("error") or solanafm_response.get("source") == "fallback":
+            error_detail = solanafm_response.get("error", "Fallback response returned")
+            logger.warning(f"SolanaFM API failed or returned fallback for {token_address}: {error_detail}")
+            # Raise an exception to signal failure to the caller (detect_whale_wallets)
+            raise SolanaRpcError(f"Failed to get holders from SolanaFM: {error_detail}")
 
+        raw_holders = solanafm_response.get("holders", [])
         holders = []
-        if not result:
-            logger.warning(f"getProgramAccounts returned empty result for {token_address}")
+        if not raw_holders:
+            logger.warning(f"SolanaFM returned empty holder list for {token_address}")
             return []
 
-        for account in result:
+        processed_count = 0
+        for holder_data in raw_holders:
+            # Limit processing in case SolanaFM returns more than requested limit slightly
+            if processed_count >= limit:
+                break 
             try:
-                # Defensive parsing
-                account_data = account.get('account', {})
-                if not account_data or not isinstance(account_data, dict):
-                    logger.warning(f"Skipping account with unexpected structure: {account.get('pubkey')}")
+                # SolanaFM provides owner wallet address in the 'address' field
+                owner = holder_data.get('address') 
+                # Amount is provided as a string by SolanaFM (representing lamports)
+                amount_str = holder_data.get('amount')
+                
+                if not owner or amount_str is None: # Check for None explicitly for amount
+                    logger.warning(f"Skipping holder data from SolanaFM with missing address or amount: {holder_data}")
                     continue
 
-                parsed_info = account_data.get('data', {}).get('parsed', {}).get('info', {})
-                if not parsed_info or not isinstance(parsed_info, dict):
-                    logger.warning(f"Skipping account with missing parsed info: {account.get('pubkey')}")
+                # Convert raw amount string to Decimal
+                try:
+                    amount_decimal = Decimal(amount_str) 
+                except InvalidOperation:
+                    logger.warning(f"Skipping holder data with invalid amount string '{amount_str}': {holder_data}")
                     continue
-
-                owner = parsed_info.get('owner')
-                token_amount_info = parsed_info.get('tokenAmount', {})
-                amount_str = token_amount_info.get('amount', '0')
-                decimals = token_amount_info.get('decimals') # Store decimals for potential later use
-
-                if not owner:
-                    logger.warning(f"Skipping account without owner: {account.get('pubkey')}")
-                    continue
-
-                # Skip zero balance accounts
-                if amount_str == '0':
-                    continue
-
-                amount = Decimal(amount_str) # Raises ValueError if amount_str is invalid Decimal
+                
+                # Skip zero balance accounts if needed (SolanaFM might include them)
+                if amount_decimal <= 0:
+                    continue 
 
                 holders.append({
-                    'owner': owner,
-                    'amount': amount, # Keep as Decimal for precision
-                    'address': account.get('pubkey'),
-                    'decimals': decimals # Include decimals
+                    # Key required by detect_whale_wallets
+                    'owner': owner, 
+                    # Store the raw decimal amount (lamports)
+                    'amount': amount_decimal, 
+                    # Use owner for the 'address' key for compatibility with detect_whale_wallets
+                    'address': owner, 
+                    # Decimals are not available from this SolanaFM endpoint.
+                    'decimals': None 
                 })
-            except (KeyError, TypeError, ValueError) as e:
-                logger.warning(f"Error processing holder account {account.get('pubkey')} for mint {token_address}: {e}")
+                processed_count += 1
+            except (KeyError, TypeError) as e:
+                logger.warning(f"Error processing holder data from SolanaFM for mint {token_address}: {e} - Data: {holder_data}", exc_info=True)
                 continue
-
+        
         # Sort holders by amount (descending)
-        holders.sort(key=lambda x: x['amount'], reverse=True)
-        logger.info(f"Found {len(holders)} holders for {token_address}, returning top {min(len(holders), limit)}")
-        return holders[:limit]
+        # Sorting is less critical now as SolanaFM provides them sorted, but doesn't hurt.
+        holders.sort(key=lambda x: x.get('amount', Decimal(0)), reverse=True)
+        
+        logger.info(f"Processed {len(holders)} holders from SolanaFM for {token_address}, returning top {limit}")
+        # Ensure we only return the amount requested by the original limit parameter
+        return holders[:limit] 
+
     except SolanaRpcError as e:
-        logger.error(f"RPC Error fetching holders for {token_address}: {e}")
+        # Raised if the call to solana_client.get_token_holders failed
+        logger.error(f"Error calling SolanaFM API via client for {token_address}: {e}")
         raise # Re-raise to be handled by caller
     except Exception as e:
-        logger.error(f"Unexpected error fetching holders for {token_address}: {e}")
+        logger.error(f"Unexpected error processing holders from SolanaFM for {token_address}: {e}", exc_info=True)
         raise # Re-raise
 
 

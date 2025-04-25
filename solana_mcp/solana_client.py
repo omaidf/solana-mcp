@@ -21,11 +21,11 @@ from cachetools import TTLCache, cached
 # Internal imports
 from solana_mcp.config import SolanaConfig, get_solana_config
 from solana_mcp.logging_config import get_logger, log_with_context
-from solana_mcp.utils.batching import BatchProcessor
 from solana_mcp.utils.validation import validate_public_key, InvalidPublicKeyError, validate_transaction_signature
 from solana_mcp.constants import (
     TOKEN_PROGRAM_ID, METADATA_PROGRAM_ID, METAPLEX_PROGRAM_ID, 
-    RAYDIUM_PROGRAM_ID, JUPITER_PROGRAM_ID, ORCA_PROGRAM_ID
+    RAYDIUM_PROGRAM_ID, JUPITER_PROGRAM_ID, ORCA_PROGRAM_ID,
+    USDC_MINT, USDT_MINT, SOL_MINT
 )
 
 # Get logger
@@ -46,65 +46,6 @@ class SolanaRpcError(Exception):
         super().__init__(message)
         self.error_data = error_data or {}
 
-class PublicKey:
-    """Solana public key class."""
-    
-    def __init__(self, value: Union[str, bytes, List[int]]):
-        """Initialize a public key.
-        
-        Args:
-            value: The public key value as a string (base58), bytes, or list of integers
-            
-        Raises:
-            ValueError: If the public key is invalid
-        """
-        if isinstance(value, str):
-            if not validate_public_key(value):
-                raise ValueError(f"Invalid public key format: {value}")
-            self._key = value
-        elif isinstance(value, bytes) or isinstance(value, List) or isinstance(value, bytearray):
-            # Convert bytes to string
-            bytes_data = bytes(value) if not isinstance(value, bytes) else value
-            self._key = bytes_data.hex()
-        else:
-            raise ValueError(f"Unsupported public key format: {type(value)}")
-    
-    def __str__(self) -> str:
-        """Get the public key as a string.
-        
-        Returns:
-            The public key as a string
-        """
-        return self._key
-    
-    def to_bytes(self) -> bytes:
-        """Get the public key as bytes.
-        
-        Returns:
-            The public key as bytes
-        """
-        if len(self._key) % 2 == 1:
-            self._key = "0" + self._key
-        return bytes.fromhex(self._key)
-    
-    @staticmethod
-    def find_program_address(seeds: List[bytes], program_id: "PublicKey") -> Tuple[str, int]:
-        """Find a program address.
-        
-        Args:
-            seeds: The seeds to use to find the program address
-            program_id: The program ID
-            
-        Returns:
-            (address, bump_seed)
-        """
-        # This is a placeholder. In a real implementation, this would compute
-        # the actual program address using the provided seeds and program ID.
-        # For testing purposes, we'll return a synthetic address
-        seed_str = b"".join(seeds).hex()
-        program_str = str(program_id)
-        return f"{program_str[:8]}_{seed_str[:16]}_program", 255
-
 class SolanaClient:
     """Client for interacting with Solana blockchain."""
     
@@ -122,10 +63,12 @@ class SolanaClient:
         if self.config.rpc_user and self.config.rpc_password:
             self.auth = (self.config.rpc_user, self.config.rpc_password)
         
+        # Store Birdeye API key if available
+        self.birdeye_api_key = self.config.birdeye_api_key
+        
         # Shared HTTP client for better performance
         self._http_client = None
         self.batch_size = 10
-        self.batch_processor = BatchProcessor(batch_size=self.batch_size)
     
     async def _make_request(self, method: str, params: List[Any] = None) -> Dict[str, Any]:
         """Make a JSON-RPC request to the Solana node.
@@ -143,6 +86,11 @@ class SolanaClient:
             httpx.RequestError: If there's a network or request error
             asyncio.TimeoutError: If the request times out
         """
+        # Add temporary logging to trace calls
+        log_params = json.dumps(params) if params else "[]"
+        if len(log_params) > 200: log_params = log_params[:197] + "..."
+        logger.info(f"_make_request called: method={method}, params={log_params}")
+
         if params is None:
             params = []
             
@@ -187,128 +135,121 @@ class SolanaClient:
         initial_retry_delay = 1.0  # starting delay in seconds
         max_retry_delay = 10.0  # maximum delay in seconds
         
-        # Initialize the HTTP client if needed
-        client_created_here = False
+        # Initialize the HTTP client if needed (assuming it's managed externally by __aenter__/__aexit__)
         if self._http_client is None:
+            # This should ideally not happen if client is used within context manager
+            logger.warning("Re-initializing httpx client within _make_request. Was SolanaClient used outside its context manager?")
             self._http_client = httpx.AsyncClient(
                 timeout=self.config.timeout,
                 auth=self.auth,
                 limits=httpx.Limits(max_keepalive_connections=10, max_connections=20)
             )
-            client_created_here = True
         
-        try:
-            # Categorize errors for retry decision
-            retriable_status_codes = {408, 429, 500, 502, 503, 504}
-            last_exception = None
-            
-            for retry_count in range(max_retries + 1):
-                try:
-                    # Log the attempt if it's a retry
-                    if retry_count > 0:
-                        logger.info(f"Retry attempt {retry_count}/{max_retries} for {method}")
-                    
-                    response = await self._http_client.post(
-                        self.config.rpc_url,
-                        headers=self.headers,
-                        json=payload
+        # Categorize errors for retry decision
+        retriable_status_codes = {408, 429, 500, 502, 503, 504}
+        last_exception = None
+        
+        for retry_count in range(max_retries + 1):
+            try:
+                # Log the attempt if it's a retry
+                if retry_count > 0:
+                    logger.info(f"Retry attempt {retry_count}/{max_retries} for {method}")
+                
+                response = await self._http_client.post(
+                    self.config.rpc_url,
+                    headers=self.headers,
+                    json=payload
+                )
+                
+                # Handle HTTP status errors
+                if response.status_code in retriable_status_codes and retry_count < max_retries:
+                    wait_time = min(
+                        initial_retry_delay * (2 ** retry_count), 
+                        max_retry_delay
                     )
+                    logger.warning(f"HTTP status {response.status_code}, retrying in {wait_time}s: {method}")
+                    await asyncio.sleep(wait_time)
+                    continue
+                
+                # Raise for other HTTP status errors
+                response.raise_for_status()
+                
+                # Parse JSON response
+                result = response.json()
+                
+                # Handle RPC errors
+                if "error" in result:
+                    error = result["error"]
+                    message = f"Solana RPC error: {error.get('message', 'Unknown error')}"
+                    if "data" in error:
+                        message += f" - {json.dumps(error['data'])}"
                     
-                    # Handle HTTP status errors
-                    if response.status_code in retriable_status_codes and retry_count < max_retries:
+                    # Check for rate limiting errors and retry if possible
+                    if ("rate limited" in message.lower() or 
+                        error.get("code") == -32005) and retry_count < max_retries:
                         wait_time = min(
                             initial_retry_delay * (2 ** retry_count), 
                             max_retry_delay
                         )
-                        logger.warning(f"HTTP status {response.status_code}, retrying in {wait_time}s: {method}")
+                        logger.warning(f"Rate limited, retrying in {wait_time}s: {method}")
                         await asyncio.sleep(wait_time)
                         continue
                     
-                    # Raise for other HTTP status errors
-                    response.raise_for_status()
-                    
-                    # Parse JSON response
-                    result = response.json()
-                    
-                    # Handle RPC errors
-                    if "error" in result:
-                        error = result["error"]
-                        message = f"Solana RPC error: {error.get('message', 'Unknown error')}"
-                        if "data" in error:
-                            message += f" - {json.dumps(error['data'])}"
-                        
-                        # Check for rate limiting errors and retry if possible
-                        if ("rate limited" in message.lower() or 
-                            error.get("code") == -32005) and retry_count < max_retries:
-                            wait_time = min(
-                                initial_retry_delay * (2 ** retry_count), 
-                                max_retry_delay
-                            )
-                            logger.warning(f"Rate limited, retrying in {wait_time}s: {method}")
-                            await asyncio.sleep(wait_time)
-                            continue
-                        
-                        # Non-retriable RPC error or max retries reached
-                        raise SolanaRpcError(message, error)
-                    
-                    # Success case - return the result
-                    return result["result"]
-                    
-                except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout, 
-                        httpx.ConnectTimeout, httpx.NetworkError, json.JSONDecodeError) as e:
-                    last_exception = e
-                    
-                    # Determine if we should retry based on the error type
-                    should_retry = (
-                        retry_count < max_retries and 
-                        (isinstance(e, httpx.ConnectError) or 
-                         isinstance(e, httpx.ConnectTimeout) or
-                         isinstance(e, httpx.ReadTimeout) or
-                         isinstance(e, httpx.NetworkError) or
-                         (isinstance(e, httpx.HTTPStatusError) and e.response.status_code in retriable_status_codes) or
-                         (isinstance(e, json.JSONDecodeError) and retry_count == 0))  # Only retry JSON errors once
+                    # Non-retriable RPC error or max retries reached
+                    raise SolanaRpcError(message, error)
+                
+                # Success case - return the result
+                return result["result"]
+                
+            except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout, 
+                    httpx.ConnectTimeout, httpx.NetworkError, json.JSONDecodeError) as e:
+                last_exception = e
+                
+                # Determine if we should retry based on the error type
+                should_retry = (
+                    retry_count < max_retries and 
+                    (isinstance(e, httpx.ConnectError) or 
+                     isinstance(e, httpx.ConnectTimeout) or
+                     isinstance(e, httpx.ReadTimeout) or
+                     isinstance(e, httpx.NetworkError) or
+                     (isinstance(e, httpx.HTTPStatusError) and e.response.status_code in retriable_status_codes) or
+                     (isinstance(e, json.JSONDecodeError) and retry_count == 0))  # Only retry JSON errors once
+                )
+                
+                if should_retry:
+                    wait_time = min(
+                        initial_retry_delay * (2 ** retry_count), 
+                        max_retry_delay
                     )
-                    
-                    if should_retry:
-                        wait_time = min(
-                            initial_retry_delay * (2 ** retry_count), 
-                            max_retry_delay
-                        )
-                        logger.warning(f"Request failed, retrying in {wait_time}s: {str(e)}")
-                        await asyncio.sleep(wait_time)
-                    else:
-                        # Max retries reached or non-retriable error
-                        logger.error(f"Request failed after {retry_count} attempts: {str(e)}")
-                        raise
-                except asyncio.CancelledError:
-                    # Don't catch cancellation, let it propagate
+                    logger.warning(f"Request failed, retrying in {wait_time}s: {str(e)}")
+                    await asyncio.sleep(wait_time)
+                else:
+                    # Max retries reached or non-retriable error
+                    logger.error(f"Request failed after {retry_count} attempts: {str(e)}")
                     raise
-                except Exception as e:
-                    # Catch and log any other unexpected errors
-                    logger.error(f"Unexpected error in _make_request: {str(e)}", exc_info=True)
-                    last_exception = e
-                    
-                    if retry_count < max_retries:
-                        wait_time = min(
-                            initial_retry_delay * (2 ** retry_count), 
-                            max_retry_delay
-                        )
-                        logger.warning(f"Unexpected error, retrying in {wait_time}s: {str(e)}")
-                        await asyncio.sleep(wait_time)
-                    else:
-                        raise
-            
-            # We should never reach here due to the raise in the loop, but just in case
-            if last_exception:
-                raise last_exception
-            else:
-                raise RuntimeError("Unexpected error in _make_request: Max retries reached without an exception")
-        finally:
-            # If we created a client just for this request and not using it as a persistent client,
-            # close it to avoid resource leaks
-            if client_created_here:
-                await self._http_client.aclose()
-                self._http_client = None
+            except asyncio.CancelledError:
+                # Don't catch cancellation, let it propagate
+                raise
+            except Exception as e:
+                # Catch and log any other unexpected errors
+                logger.error(f"Unexpected error in _make_request: {str(e)}", exc_info=True)
+                last_exception = e
+                
+                if retry_count < max_retries:
+                    wait_time = min(
+                        initial_retry_delay * (2 ** retry_count), 
+                        max_retry_delay
+                    )
+                    logger.warning(f"Unexpected error, retrying in {wait_time}s: {str(e)}")
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
+        
+        # We should never reach here due to the raise in the loop, but just in case
+        if last_exception:
+            raise last_exception
+        else:
+            raise RuntimeError("Unexpected error in _make_request: Max retries reached without an exception")
     
     async def get_account_info(self, account: str, encoding: str = "base64") -> Dict[str, Any]:
         """Get account information.
@@ -326,14 +267,11 @@ class SolanaClient:
         if not validate_public_key(account):
             raise InvalidPublicKeyError(account)
             
-        # Import here to avoid circular import issues
-        from solana_mcp.clients.account_client import AccountClient
-        
-        # Create an AccountClient instance with the same config
-        account_client = AccountClient(self.config)
-        
-        # Delegate to the AccountClient implementation
-        return await account_client.get_account_info(account, encoding)
+        # Logic moved from AccountClient
+        return await self._make_request(
+            "getAccountInfo", 
+            [account, {"encoding": encoding}]
+        )
     
     async def get_balance(self, account: str) -> int:
         """Get account balance.
@@ -350,14 +288,8 @@ class SolanaClient:
         if not validate_public_key(account):
             raise InvalidPublicKeyError(account)
             
-        # Import here to avoid circular import issues
-        from solana_mcp.clients.account_client import AccountClient
-        
-        # Create an AccountClient instance with the same config
-        account_client = AccountClient(self.config)
-        
-        # Delegate to the AccountClient implementation
-        return await account_client.get_balance(account)
+        # Logic moved from AccountClient
+        return await self._make_request("getBalance", [account])
     
     async def get_token_accounts_by_owner(
         self, 
@@ -454,20 +386,28 @@ class SolanaClient:
         if not validate_public_key(program_id):
             raise InvalidPublicKeyError(program_id)
             
-        # Import here to avoid circular import issues
-        from solana_mcp.clients.account_client import AccountClient
+        # Logic moved from AccountClient
+        params = [program_id, {"encoding": encoding}]
+        config = {}
+        if filters:
+            config["filters"] = filters
+        if limit is not None:
+            config["limit"] = limit # Note: getProgramAccounts might not support limit/offset directly in std RPC
+        if offset is not None:
+            # Offset might not be supported by standard getProgramAccounts
+            # Check RPC documentation if this feature is needed
+            logger.warning("Offset parameter might not be supported by standard getProgramAccounts RPC call.")
+            # params[1]["offset"] = offset # Assuming offset is part of config dict
+            pass # Currently ignoring offset as it's unlikely to be supported this way
         
-        # Create an AccountClient instance with the same config
-        account_client = AccountClient(self.config)
-        
-        # Delegate to the AccountClient implementation
-        return await account_client.get_program_accounts(
-            program_id, 
-            filters=filters, 
-            encoding=encoding, 
-            limit=limit, 
-            offset=offset
-        )
+        # Ensure config dict is added only if it contains something
+        if config:
+             params.append(config)
+        elif len(params) == 1: # Only program_id was provided
+            # Add encoding object if no other config exists
+             params.append({"encoding": encoding})
+
+        return await self._make_request("getProgramAccounts", params)
     
     async def get_recent_blockhash(self) -> Dict[str, Any]:
         """Get a recent blockhash.
@@ -493,14 +433,73 @@ class SolanaClient:
         if not validate_public_key(mint):
             raise InvalidPublicKeyError(mint)
         
-        # Import here to avoid circular import issues
-        from solana_mcp.clients.token_client import TokenClient
-        
-        # Create a TokenClient instance with the same config
-        token_client = TokenClient(self.config)
-        
-        # Delegate to the TokenClient implementation
-        return await token_client.get_token_supply(mint)
+        # Logic moved from TokenClient
+        try:
+            # Set default supply info structure matching RPC response
+            default_rpc_response_structure = {
+                 "value": {
+                      "amount": "0",
+                      "decimals": 0,
+                      "uiAmount": 0.0,
+                      "uiAmountString": "0"
+                 }
+             }
+            
+            # Get token supply using more robust error handling
+            logger.debug(f"Fetching token supply for mint: {mint}")
+            
+            # _make_request already extracts the "result" field which contains the "value" dict
+            response_value = await self._make_request("getTokenSupply", [mint]) 
+            
+            # Check the nested structure: response = {"context":..., "value": {"amount":..., "decimals":...}}
+            if response_value and isinstance(response_value.get("value"), dict) and \
+               "amount" in response_value["value"] and "decimals" in response_value["value"]:
+                    supply_value = response_value["value"] # Extract the inner value dict
+                    
+                    # Validate supply value structure
+                    decimals = int(supply_value.get("decimals", 0))
+                    amount = supply_value.get("amount", "0")
+                    
+                    # Calculate UI amount (human-readable)
+                    try:
+                        # Use Decimal for precision before converting to float
+                        from decimal import Decimal, InvalidOperation
+                        ui_amount = float(Decimal(amount) / (Decimal(10) ** decimals)) if decimals >= 0 else float(Decimal(amount))
+                        # Format with correct decimals using Decimal
+                        ui_amount_string = f"{Decimal(amount) / (Decimal(10) ** decimals) if decimals >=0 else Decimal(amount):f}" 
+                    except (InvalidOperation, ValueError, TypeError):
+                        logger.warning(f"Could not calculate uiAmount for {mint}", exc_info=True)
+                        ui_amount = 0.0
+                        ui_amount_string = "0"
+                    
+                    # Return structure matching RPC response's "value" field
+                    # Wrap the validated value in the expected {"value": ...} structure
+                    result_to_return = {
+                         "value": {
+                             "amount": amount,
+                             "decimals": decimals,
+                             "uiAmount": ui_amount,
+                             "uiAmountString": ui_amount_string
+                         }
+                     }
+                    logger.debug(f"Returning successfully parsed token supply for {mint}: {result_to_return}")
+                    return result_to_return
+            
+            # If parsing failed or structure was wrong, log and raise an error instead of returning default
+            err_msg = f"Failed to parse token supply data for {mint}. Response: {response_value}"
+            logger.warning(err_msg)
+            raise SolanaRpcError(err_msg, error_data=response_value)
+            
+        except SolanaRpcError as rpc_err:
+             logger.error(f"RPC Error fetching token supply for {mint}: {rpc_err}", exc_info=True)
+             raise # Re-raise RPC errors
+        except InvalidPublicKeyError:
+             logger.error(f"Invalid public key error for {mint} in get_token_supply", exc_info=True)
+             raise # Re-raise validation errors
+        except Exception as e:
+            # Catch unexpected errors during processing
+            logger.error(f"Unexpected error processing token supply for {mint}: {str(e)}", exc_info=True)
+            raise SolanaRpcError(f"Unexpected error processing supply for {mint}: {e}") from e
     
     async def get_signatures_for_address(
         self,
@@ -526,18 +525,17 @@ class SolanaClient:
         if not validate_public_key(address):
             raise InvalidPublicKeyError(address)
             
-        # Import here to avoid circular import issues
-        from solana_mcp.clients.account_client import AccountClient
-        
-        # Create an AccountClient instance with the same config
-        account_client = AccountClient(self.config)
-        
-        # Delegate to the AccountClient implementation
-        return await account_client.get_signatures_for_address(
-            address, 
-            before=before, 
-            until=until,
-            limit=limit
+        # Logic moved from AccountClient
+        options: Dict[str, Any] = {"limit": limit}
+        if before:
+            options["before"] = before
+        if until:
+            options["until"] = until
+            
+        # Pass options dict as the second parameter
+        return await self._make_request(
+            "getSignaturesForAddress",
+            [address, options]
         )
     
     async def get_token_accounts_by_delegate(
@@ -581,29 +579,34 @@ class SolanaClient:
         params.append({"encoding": "jsonParsed"})
         return await self._make_request("getTokenAccountsByDelegate", params)
     
-    async def get_token_largest_accounts(self, mint: str) -> List[Dict[str, Any]]:
+    async def get_token_largest_accounts(self, mint: str, limit: int = 20) -> List[Dict[str, Any]]:
         """Get the largest accounts for a token.
         
         Args:
             mint: The mint address
+            limit: The maximum number of accounts to return.
             
         Returns:
-            List of token accounts sorted by balance
+            List of token accounts sorted by balance (structure from RPC: {address, amount, decimals, uiAmount, uiAmountString})
             
         Raises:
             InvalidPublicKeyError: If the mint is not a valid Solana public key
         """
         if not validate_public_key(mint):
             raise InvalidPublicKeyError(mint)
-            
-        # Import here to avoid circular import issues
-        from solana_mcp.clients.token_client import TokenClient
         
-        # Create a TokenClient instance with the same config
-        token_client = TokenClient(self.config)
-        
-        # Delegate to the TokenClient implementation
-        return await token_client.get_token_largest_accounts(mint)
+        # Logic moved from TokenClient
+        # _make_request extracts the 'result', which should be the 'value' array
+        # Pass limit as an option
+        params = [mint, {"limit": limit}]
+        response_value = await self._make_request("getTokenLargestAccounts", params)
+        # The RPC response structure is { "context": {...}, "value": [...] } 
+        # _make_request returns the value part directly if successful
+        if isinstance(response_value, list):
+            return response_value
+        else:
+            logger.warning(f"Unexpected format for getTokenLargestAccounts for {mint}: {response_value}")
+            return [] # Return empty list on unexpected format
     
     async def get_block(self, slot: int) -> Dict[str, Any]:
         """Get information about a block.
@@ -703,14 +706,117 @@ class SolanaClient:
         Raises:
             InvalidPublicKeyError: If the mint address is invalid
         """
-        # Import here to avoid circular import issues
-        from solana_mcp.clients.token_client import TokenClient
+        if not validate_public_key(mint):
+            raise InvalidPublicKeyError(mint)
+            
+        # Logic moved from TokenClient - Including Metaplex parsing and Jupiter fallback
+        # Default metadata if metadata doesn't exist
+        default_metadata = {
+            "name": "Unknown Token",
+            "symbol": "UNKNOWN",
+            "uri": "",
+            "source": "none"
+        }
         
-        # Create a TokenClient instance with the same config
-        token_client = TokenClient(self.config)
-        
-        # Delegate to the TokenClient implementation
-        return await token_client.get_token_metadata(mint)
+        try:
+            logger.debug(f"Fetching token metadata for mint: {mint} via Metaplex")
+            
+            # Find Metaplex metadata account PDA
+            # This requires the findProgramAddress logic from solana-py or equivalent
+            # Re-implementing basic PDA finding for this specific case:
+            try:
+                 seeds = [b'metadata', bytes(Pubkey.from_string(METADATA_PROGRAM_ID)), bytes(Pubkey.from_string(mint))]
+                 metadata_pda, _ = Pubkey.find_program_address(seeds, Pubkey.from_string(METADATA_PROGRAM_ID))
+                 logger.debug(f"Calculated metadata PDA for {mint}: {metadata_pda}")
+            except Exception as pda_err:
+                 logger.warning(f"Could not calculate metadata PDA for {mint}: {pda_err}")
+                 metadata_pda = None
+
+            if metadata_pda:
+                 # Fetch account info for the PDA
+                 account_data = await self._make_request("getAccountInfo", [str(metadata_pda), {"encoding": "base64"}])
+
+                 if account_data and isinstance(account_data, dict) and account_data.get("value") and account_data["value"].get("data"):
+                      data_base64 = account_data["value"]["data"][0]
+                      decoded_data = base64.b64decode(data_base64)
+                      
+                      # Basic parsing based on Metaplex Token Metadata standard structure
+                      # WARNING: This manual parsing is fragile and might break with future Metaplex versions.
+                      # Using an SDK (like mpl-token-metadata for Python) is recommended for robustness.
+                      try:
+                          # Simplified parsing - assumes standard layout
+                          # Key (1 byte), UpdateAuthority (32), Mint (32), Data struct marker (1) = 66 bytes offset? Check standard.
+                          # Let's assume Data struct starts after Mint: 1 + 32 + 32 = 65 bytes offset
+                          data_struct_offset = 65 
+                          if len(decoded_data) > data_struct_offset + 4: # Need at least name length
+                               name_len = int.from_bytes(decoded_data[data_struct_offset : data_struct_offset+4], 'little')
+                               name_start = data_struct_offset + 4
+                               name_end = name_start + name_len
+                               name = decoded_data[name_start:name_end].decode('utf-8').rstrip('\x00')
+                               
+                               symbol_len_offset = name_end
+                               if len(decoded_data) > symbol_len_offset + 4:
+                                    symbol_len = int.from_bytes(decoded_data[symbol_len_offset : symbol_len_offset+4], 'little')
+                                    symbol_start = symbol_len_offset + 4
+                                    symbol_end = symbol_start + symbol_len
+                                    symbol = decoded_data[symbol_start:symbol_end].decode('utf-8').rstrip('\x00')
+
+                                    uri_len_offset = symbol_end
+                                    if len(decoded_data) > uri_len_offset + 4:
+                                         uri_len = int.from_bytes(decoded_data[uri_len_offset : uri_len_offset+4], 'little')
+                                         uri_start = uri_len_offset + 4
+                                         uri_end = uri_start + uri_len
+                                         uri = decoded_data[uri_start:uri_end].decode('utf-8').rstrip('\x00')
+
+                                         metadata = {
+                                              "name": name if name else default_metadata["name"],
+                                              "symbol": symbol if symbol else default_metadata["symbol"],
+                                              "uri": uri if uri else default_metadata["uri"],
+                                              "source": "metaplex"
+                                         }
+                                         logger.debug(f"Successfully parsed Metaplex metadata for {mint}: {metadata}")
+                                         return metadata
+                      except Exception as parse_err:
+                          logger.warning(f"Failed to parse Metaplex metadata for {mint} from PDA {metadata_pda}: {parse_err}", exc_info=True)
+                 else:
+                      logger.warning(f"Metaplex metadata account not found or empty for PDA {metadata_pda}")
+            
+            # If Metaplex parsing failed or PDA not found, try Jupiter token list API
+            logger.debug(f"Falling back to Jupiter token list for {mint} metadata")
+            try:
+                # Use httpx directly as this isn't a standard RPC call
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    # Using the strict list first as it might be smaller/faster
+                    for list_url in ["https://token.jup.ag/strict", "https://token.jup.ag/all"]:
+                        try:
+                             response = await client.get(list_url)
+                             if response.status_code == 200:
+                                 tokens = response.json()
+                                 for token in tokens:
+                                     if token.get("address") == mint:
+                                         logger.info(f"Found metadata for {mint} in Jupiter list: {list_url}")
+                                         return {
+                                             "name": token.get("name", default_metadata["name"]),
+                                             "symbol": token.get("symbol", default_metadata["symbol"]),
+                                             "uri": token.get("logoURI", default_metadata["uri"]),
+                                             "source": "jupiter"
+                                         }
+                        except Exception as http_err:
+                             logger.warning(f"Error fetching from Jupiter list {list_url}: {http_err}")
+                             if list_url == "https://token.jup.ag/strict": # Don't retry if strict fails badly
+                                  await asyncio.sleep(0.5) # Small delay before trying full list
+                             else:
+                                  raise # Re-raise error from 'all' list
+            except Exception as e:
+                logger.warning(f"Error fetching metadata from Jupiter API for {mint}: {str(e)}")
+                
+            # If all methods fail, return the default metadata
+            logger.warning(f"Could not find metadata for {mint} from any source, returning default.")
+            return default_metadata
+            
+        except Exception as e:
+            logger.error(f"Unexpected error fetching token metadata for {mint}: {str(e)}", exc_info=True)
+            return default_metadata
     
     async def get_token_price_birdeye(self, token_mint: str) -> Dict[str, Any]:
         """Get token price data from Birdeye API.
@@ -739,38 +845,66 @@ class SolanaClient:
             "source": "fallback"
         }
         
+        # Check if API key is available
+        if not self.birdeye_api_key:
+            logger.warning("Birdeye API key not configured. Cannot fetch price from Birdeye.")
+            return default_price_data
+            
         try:
-            # Birdeye API endpoint
-            BIRDEYE_API = "https://public-api.birdeye.so/public/price"
+            # Correct Birdeye API endpoint for single price
+            BIRDEYE_API = "https://public-api.birdeye.so/defi/price"
             headers = {
-                "Content-Type": "application/json",
-                "x-chain": "solana"
+                "accept": "application/json",
+                "x-chain": "solana",
+                "X-API-KEY": self.birdeye_api_key # Use the configured API key
             }
             
+            # Define query parameters
+            params = {"address": token_mint}
+            
             # Use httpx instead of requests to maintain async
-            async with httpx.AsyncClient(timeout=self.config.timeout) as client:
-                response = await client.get(
-                    f"{BIRDEYE_API}?address={token_mint}",
-                    headers=headers
-                )
-                response.raise_for_status()
-                data = response.json()
-                
-                if data.get('success'):
-                    price_data = data['data']
+            # Use the shared client if available, otherwise create a temporary one
+            # Ensure client is initialized if None (shouldn't happen with context mgr)
+            http_client = self._http_client or httpx.AsyncClient(timeout=self.config.timeout)
+            client_was_none = self._http_client is None
+            
+            try:
+                 response = await http_client.get(
+                      BIRDEYE_API,
+                      headers=headers,
+                      params=params # Pass address as query parameter
+                 )
+                 response.raise_for_status()
+                 data = response.json()
+            finally:
+                 # Close client only if we created it temporarily here
+                 if client_was_none:
+                      await http_client.aclose()
+
+            if data.get('success'):
+                price_data = data['data']
+                # Check if price_data is not None before accessing keys
+                if price_data:
                     return {
                         "mint": token_mint,
-                        "price": price_data['value'],
-                        "price_change_24h": price_data['change24h'],
-                        "last_updated": datetime.datetime.fromtimestamp(price_data['updateUnixTime']).isoformat(),
+                        "price": price_data.get('value'), # Birdeye uses 'value' for price
+                        "price_change_24h": price_data.get('change24h', 0.0), # Add default for robustness
+                        "last_updated": datetime.datetime.fromtimestamp(price_data['updateUnixTime']).isoformat() if price_data.get('updateUnixTime') else datetime.datetime.now().isoformat(),
                         "source": "birdeye"
                     }
-                
-                logger.warning(f"Birdeye API returned unsuccessful response for {token_mint}: {data}")
-                return default_price_data
-                
+                else:
+                    logger.warning(f"Birdeye API returned success=true but data is null for {token_mint}")
+                    return default_price_data
+            
+            logger.warning(f"Birdeye API returned unsuccessful response for {token_mint}: {data}")
+            return default_price_data
+            
+        except httpx.HTTPStatusError as e:
+            # Log specific HTTP errors
+            logger.error(f"HTTP error fetching price from Birdeye for {token_mint}: {e.response.status_code} - {e.response.text}", exc_info=True)
+            return default_price_data
         except Exception as e:
-            logger.error(f"Error fetching price from Birdeye for {token_mint}: {str(e)}")
+            logger.error(f"Error fetching price from Birdeye for {token_mint}: {str(e)}", exc_info=True)
             return default_price_data
             
     async def get_token_price(self, token_mint: str) -> Dict[str, Any]:
@@ -791,248 +925,59 @@ class SolanaClient:
         if birdeye_price.get("price", 0) > 0 and birdeye_price.get("source") != "fallback":
             return birdeye_price
             
-        # Fall back to our DEX-based price calculation
-        dex_price = await self.get_market_price(token_mint)
-        price_data = dex_price.get("price_data", {})
-        
-        # If we got a valid price from DEX, use it
-        if price_data.get("price_usd") and price_data.get("price_usd") > 0:
-            return {
-                "mint": token_mint,
-                "price": price_data.get("price_usd"),
-                "price_change_24h": 0.0,  # DEX doesn't provide change data
-                "last_updated": price_data.get("last_updated"),
-                "source": price_data.get("source", "dex")
-            }
-            
         # If all else fails, return the Birdeye result (which might be the fallback)
+        logger.warning(f"Falling back to Birdeye result (potentially default) for {token_mint} price.")
         return birdeye_price
     
     async def get_market_price(self, token_mint: str) -> Dict[str, Any]:
-        """Get market price data for a token.
+        """(Simplified) Get market price data, primarily focused on SOL/USD.
         
-        This method fetches price information for a token from available DEX liquidity.
-        It uses various sources to determine the token price in SOL and USD.
+        This method now primarily fetches the SOL/USD price via Birdeye.
+        The complex and brittle DEX pool logic has been removed.
         
         Args:
-            token_mint: The mint address of the token
+            token_mint: The mint address of the token (largely ignored now, but kept for signature compatibility).
             
         Returns:
-            Price information including:
-            - price_sol: Price in SOL
-            - price_usd: Estimated price in USD (if SOL price is available)
-            - liquidity: Estimated liquidity information
-            - source: Data source used for the price
+            Price information containing SOL/USD price if available.
             
         Raises:
             InvalidPublicKeyError: If the token_mint is not a valid Solana public key
         """
+        # Validate the input mint, although it's not directly used for SOL price
         if not validate_public_key(token_mint):
             raise InvalidPublicKeyError(token_mint)
             
         result = {
-            "mint": token_mint,
+            "mint": token_mint, # Keep the original mint for context
             "price_data": {
-                "price_sol": None,
-                "price_usd": None,
-                "liquidity": None,
+                "price_sol": None, # No longer calculated
+                "price_usd": None, # This will hold SOL/USD price
+                "liquidity": None, # No longer calculated
                 "source": None,
                 "last_updated": datetime.datetime.now().isoformat()
             }
         }
         
         try:
-            # Constants - common token mints for price references
-            USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-            USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-            SOL_MINT = "So11111111111111111111111111111111111111112"  # Native SOL wrapped mint
+            # Fetch SOL/USD price using the Birdeye wrapper
+            sol_price_data = await self.get_token_price_birdeye(SOL_MINT)
             
-            # Fetch SOL/USD price first to convert SOL prices to USD
-            sol_usd_price = 0
-            
-            # Try Raydium pools for SOL/USDC price
-            sol_usdc_pools = await self._make_request(
-                "getProgramAccounts",
-                [
-                    RAYDIUM_PROGRAM_ID,
-                    {
-                        "encoding": "base64",
-                        "filters": [
-                            {"memcmp": {"offset": 200, "bytes": SOL_MINT}},
-                            {"memcmp": {"offset": 232, "bytes": USDC_MINT}}
-                        ]
-                    }
-                ]
-            )
-            
-            if sol_usdc_pools and len(sol_usdc_pools["result"]) > 0:
-                # Get the largest pool by reserves
-                largest_pool = None
-                max_reserves = 0
-                
-                for pool in sol_usdc_pools["result"]:
-                    if "account" in pool and "data" in pool["account"]:
-                        data = pool["account"]["data"]
-                        if isinstance(data, list) and data[1] == "base64":
-                            decoded_data = base64.b64decode(data[0])
-                            
-                            # Extract reserves data (simplified, actual layout may vary)
-                            sol_reserves = int.from_bytes(decoded_data[264:272], byteorder="little")
-                            usdc_reserves = int.from_bytes(decoded_data[296:304], byteorder="little")
-                            
-                            if sol_reserves > max_reserves:
-                                max_reserves = sol_reserves
-                                largest_pool = {
-                                    "sol_reserves": sol_reserves,
-                                    "usdc_reserves": usdc_reserves
-                                }
-                
-                if largest_pool:
-                    # Calculate SOL/USD price from pool data
-                    # USDC has 6 decimals, SOL has 9 decimals
-                    sol_usd_price = (largest_pool["usdc_reserves"] / 10**6) / (largest_pool["sol_reserves"] / 10**9)
-            
-            # If we couldn't get SOL/USD price from Raydium, try Jupiter
-            if not sol_usd_price:
-                # Jupiter price API call (simplified)
-                try:
-                    price_response = await self._make_request(
-                        "getLatestBlockhash",  # Updated from getRecentBlockhash to getLatestBlockhash
-                        []
-                    )
-                    
-                    # Use a default SOL price if we can't get it from pools
-                    # In a production system, you'd use a proper price oracle
-                    sol_usd_price = 100  # Default fallback price
-                except Exception as e:
-                    logger.warning(f"Error getting SOL/USD price from Jupiter: {str(e)}")
-                    sol_usd_price = 100  # Default fallback price
-            
-            # Now find pools containing our token
-            token_pools = []
-            
-            # Check Raydium pools
-            raydium_pools = await self._make_request(
-                "getProgramAccounts",
-                [
-                    RAYDIUM_PROGRAM_ID,
-                    {
-                        "encoding": "base64",
-                        "filters": [
-                            {"memcmp": {"offset": 200, "bytes": token_mint}}
-                        ]
-                    }
-                ]
-            )
-            
-            if raydium_pools and "result" in raydium_pools:
-                for pool in raydium_pools["result"]:
-                    if "account" in pool and "data" in pool["account"]:
-                        data = pool["account"]["data"]
-                        if isinstance(data, list) and data[1] == "base64":
-                            decoded_data = base64.b64decode(data[0])
-                            
-                            # Extract pool data
-                            token_a_mint_bytes = decoded_data[200:232]
-                            token_b_mint_bytes = decoded_data[232:264]
-                            
-                            token_a_mint = str(Pubkey.from_string(base58.encode(bytes(token_a_mint_bytes))))
-                            token_b_mint = str(Pubkey.from_string(base58.encode(bytes(token_b_mint_bytes))))
-                            
-                            token_a_reserves = int.from_bytes(decoded_data[264:272], byteorder="little")
-                            token_b_reserves = int.from_bytes(decoded_data[296:304], byteorder="little")
-                            
-                            # Determine which token is our target and which is the paired token
-                            if token_a_mint == token_mint:
-                                token_reserves = token_a_reserves
-                                paired_token_mint = token_b_mint
-                                paired_token_reserves = token_b_reserves
-                            else:
-                                token_reserves = token_b_reserves
-                                paired_token_mint = token_a_mint
-                                paired_token_reserves = token_a_reserves
-                            
-                            # Get decimal information for both tokens
-                            token_decimal_info = await self.get_token_supply(token_mint)
-                            token_decimals = token_decimal_info.get("value", {}).get("decimals", 9)
-                            
-                            paired_decimal_info = await self.get_token_supply(paired_token_mint)
-                            paired_decimals = paired_decimal_info.get("value", {}).get("decimals", 9)
-                            
-                            # Calculate price based on the paired token
-                            price_in_paired = (paired_token_reserves / 10**paired_decimals) / (token_reserves / 10**token_decimals)
-                            
-                            # Calculate SOL and USD prices
-                            price_sol = 0
-                            price_usd = 0
-                            
-                            if paired_token_mint == SOL_MINT:
-                                price_sol = price_in_paired
-                                price_usd = price_sol * sol_usd_price
-                            elif paired_token_mint == USDC_MINT or paired_token_mint == USDT_MINT:
-                                price_usd = price_in_paired
-                                price_sol = price_usd / sol_usd_price if sol_usd_price > 0 else 0
-                            else:
-                                # If paired with another token, try to get its price first
-                                # This is a simplified approach
-                                paired_price_data = await self.get_market_price(paired_token_mint)
-                                paired_price_usd = paired_price_data.get("price_data", {}).get("price_usd", 0)
-                                
-                                if paired_price_usd > 0:
-                                    price_usd = price_in_paired * paired_price_usd
-                                    price_sol = price_usd / sol_usd_price if sol_usd_price > 0 else 0
-                            
-                            # Calculate liquidity
-                            liquidity_usd = 0
-                            if price_usd > 0:
-                                token_liquidity = (token_reserves / 10**token_decimals) * price_usd
-                                paired_liquidity = 0
-                                
-                                if paired_token_mint == USDC_MINT or paired_token_mint == USDT_MINT:
-                                    paired_liquidity = paired_token_reserves / 10**paired_decimals
-                                elif paired_token_mint == SOL_MINT and sol_usd_price > 0:
-                                    paired_liquidity = (paired_token_reserves / 10**paired_decimals) * sol_usd_price
-                                elif paired_price_usd > 0:
-                                    paired_liquidity = (paired_token_reserves / 10**paired_decimals) * paired_price_usd
-                                
-                                liquidity_usd = token_liquidity + paired_liquidity
-                            
-                            token_pools.append({
-                                "protocol": "raydium",
-                                "pair": f"{token_mint}-{paired_token_mint}",
-                                "price_sol": price_sol,
-                                "price_usd": price_usd,
-                                "liquidity_usd": liquidity_usd
-                            })
-            
-            # Similar approach for Orca pools would be implemented here
-            # For now we'll use only Raydium pools
-            
-            # Select the best pool based on liquidity
-            if token_pools:
-                # Sort pools by liquidity (highest first)
-                sorted_pools = sorted(token_pools, key=lambda x: x.get("liquidity_usd", 0), reverse=True)
-                best_pool = sorted_pools[0]
-                
-                result["price_data"] = {
-                    "price_sol": best_pool.get("price_sol", 0),
-                    "price_usd": best_pool.get("price_usd", 0),
-                    "liquidity": {
-                        "total_usd": best_pool.get("liquidity_usd", 0),
-                        "best_pool_protocol": best_pool.get("protocol", "unknown"),
-                        "best_pool_pair": best_pool.get("pair", "unknown")
-                    },
-                    "source": f"{best_pool.get('protocol', 'dex')}",
-                    "last_updated": datetime.datetime.now().isoformat()
-                }
+            if sol_price_data and sol_price_data.get("source") != "fallback":
+                sol_usd_price = sol_price_data.get("price")
+                if sol_usd_price:
+                    result["price_data"]["price_usd"] = float(sol_usd_price)
+                    result["price_data"]["source"] = f"sol_price_from_{sol_price_data.get('source', 'unknown')}"
+                    result["price_data"]["last_updated"] = sol_price_data.get("last_updated", result["price_data"]["last_updated"])
+                else:
+                     logger.warning(f"Could not extract SOL/USD price from Birdeye response: {sol_price_data}")
             else:
-                # If no pools found, return empty result
-                logger.warning(f"No liquidity pools found for token {token_mint}")
-                
+                logger.warning(f"Failed to get SOL/USD price via Birdeye: {sol_price_data}")
+
         except Exception as e:
-            # Log and return error information
-            logger.error(f"Error fetching price data for {token_mint}: {str(e)}", exc_info=True)
-            result["error"] = str(e)
+            # Log and potentially include error in result
+            logger.error(f"Error fetching SOL price data for market context: {str(e)}", exc_info=True)
+            result["error"] = f"Failed to get SOL market price context: {str(e)}"
             
         return result
     
@@ -1044,7 +989,9 @@ class SolanaClient:
             limit: Maximum number of holders to return
             
         Returns:
-            Dict containing list of holders with their balances
+            Dict containing list of holders with their balances and source information.
+            Example format: {"mint": ..., "holders": [{"address": ..., "amount": ..., "ui_amount": ..., "percentage": ...}], "total_holders": ..., "source": "solana_fm"}
+            Returns a default structure with source='fallback' on error.
             
         Raises:
             InvalidPublicKeyError: If the token_mint is not a valid Solana public key
@@ -1064,39 +1011,157 @@ class SolanaClient:
             # Solana FM API endpoint
             SOLANA_FM_API = f"https://api.solana.fm/v0/tokens/{token_mint}/holders?limit={limit}"
             
-            # Use httpx instead of requests to maintain async
+            # Use httpx for the external API call
             async with httpx.AsyncClient(timeout=self.config.timeout) as client:
                 response = await client.get(SOLANA_FM_API)
-                response.raise_for_status()
+                response.raise_for_status() # Raise HTTP errors
                 data = response.json()
                 
                 # Process and return the holder data
-                if "data" in data and "items" in data["data"]:
+                # Check structure based on SolanaFM documentation/examples
+                if data.get("status") == "success" and isinstance(data.get("result"), dict):
+                    result_data = data["result"]
+                    holders_list = result_data.get("data", [])
+                    # Ensure holders_list is actually a list
+                    if not isinstance(holders_list, list):
+                         logger.warning(f"Unexpected format for Solana FM holders data: {holders_list}")
+                         return default_response
+
                     holders = []
-                    for holder in data["data"]["items"]:
-                        try:
-                            holders.append({
-                                "address": holder.get("address", ""),
-                                "amount": holder.get("amount", "0"),
-                                "ui_amount": holder.get("uiAmount", 0),
-                                "percentage": holder.get("percentage", 0)
-                            })
-                        except (KeyError, TypeError) as e:
-                            logger.warning(f"Error parsing holder data: {str(e)}")
+                    for holder in holders_list:
+                        # Validate individual holder structure if necessary
+                        if isinstance(holder, dict) and "address" in holder and "amount" in holder:
+                            try:
+                                # Amount is usually string, uiAmount might be float/int
+                                holders.append({
+                                    "address": holder.get("address", ""),
+                                    "amount": holder.get("amount", "0"), # Keep as string from API
+                                    "ui_amount": holder.get("uiAmount", 0.0), # Use provided uiAmount
+                                    "percentage": holder.get("percentage", 0.0)
+                                })
+                            except (KeyError, TypeError, ValueError) as e:
+                                logger.warning(f"Error parsing individual holder data from SolanaFM: {holder}, Error: {e}")
+                        else:
+                            logger.warning(f"Skipping invalid holder data item from SolanaFM: {holder}")
                     
                     return {
                         "mint": token_mint,
                         "holders": holders,
-                        "total_holders": data["data"].get("totalItems", len(holders)),
+                        # Use pagination total if available, otherwise count returned items
+                        "total_holders": result_data.get("pagination", {}).get("total", len(holders)), 
                         "source": "solana_fm"
                     }
+                else:
+                    logger.warning(f"Unexpected response status or structure from Solana FM API for {token_mint}: {data.get('status')}")
+                    return default_response
                 
-                logger.warning(f"Unexpected response format from Solana FM API for {token_mint}")
-                return default_response
-                
+        except httpx.HTTPStatusError as e:
+             logger.error(f"HTTP error fetching holders from Solana FM for {token_mint}: {e.response.status_code} - {e.response.text}")
+             return {**default_response, "error": f"HTTP {e.response.status_code}"}
         except Exception as e:
-            logger.error(f"Error fetching holders from Solana FM for {token_mint}: {str(e)}")
-            return default_response
+            logger.error(f"Error fetching holders from Solana FM for {token_mint}: {str(e)}", exc_info=True)
+            return {**default_response, "error": str(e)}
+    
+    async def get_all_token_data(self, token_mint: str, holder_limit: int = 10) -> Dict[str, Any]:
+        """Get comprehensive token data combining metadata, supply, price, and holder information.
+        
+        Args:
+            token_mint: The mint address of the token
+            holder_limit: Maximum number of holders to return. Defaults to 10.
+            
+        Returns:
+            Consolidated token data including metadata, supply, price, and holders
+            
+        Raises:
+            InvalidPublicKeyError: If the token_mint is not a valid Solana public key
+        """
+        if not validate_public_key(token_mint):
+            raise InvalidPublicKeyError(token_mint)
+        
+        # Fetch data concurrently
+        results = await asyncio.gather(
+            self.get_token_metadata(token_mint),
+            self.get_token_supply(token_mint),
+            self.get_token_price(token_mint), # Uses Birdeye primarily
+            self.get_token_holders(token_mint, limit=holder_limit), # Uses Solana FM
+            return_exceptions=True # Return exceptions instead of raising them immediately
+        )
+
+        metadata, supply_data, price_data, holders_data = results
+
+        # Process results, checking for exceptions
+        errors = []
+        final_metadata = default_metadata = {"name": "Unknown", "symbol": "UNKNOWN", "uri": "", "source": "error"}
+        final_supply = default_supply = {"amount": "0", "decimals": 0, "ui_amount": 0.0, "ui_amount_string": "0"}
+        final_price = default_price = {"current_price_usd": 0.0, "price_change_24h": 0.0, "last_updated": datetime.datetime.now().isoformat(), "source": "error"}
+        final_holders = default_holders = {"total_holders": 0, "top_holders": []}
+
+        if isinstance(metadata, Exception):
+            errors.append({"metadata_error": str(metadata)})
+            logger.error(f"Failed get_token_metadata for {token_mint}: {metadata}")
+        else:
+            final_metadata = metadata
+
+        if isinstance(supply_data, Exception):
+            errors.append({"supply_error": str(supply_data)})
+            logger.error(f"Failed get_token_supply for {token_mint}: {supply_data}")
+        elif isinstance(supply_data, dict): # Supply returns the value dict directly now
+            final_supply = supply_data
+        else:
+            errors.append({"supply_error": f"Unexpected supply data format: {type(supply_data)}"})
+            logger.error(f"Unexpected supply data format for {token_mint}: {type(supply_data)}")
+
+        if isinstance(price_data, Exception):
+            errors.append({"price_error": str(price_data)})
+            logger.error(f"Failed get_token_price for {token_mint}: {price_data}")
+        elif isinstance(price_data, dict):
+            # Adapt structure from get_token_price
+            final_price = {
+                 "current_price_usd": price_data.get("price", 0.0),
+                 "price_change_24h": price_data.get("price_change_24h", 0.0),
+                 "last_updated": price_data.get("last_updated"),
+                 "source": price_data.get("source", "unknown")
+             }
+        else:
+             errors.append({"price_error": f"Unexpected price data format: {type(price_data)}"})
+             logger.error(f"Unexpected price data format for {token_mint}: {type(price_data)}")
+
+        if isinstance(holders_data, Exception):
+            errors.append({"holders_error": str(holders_data)})
+            logger.error(f"Failed get_token_holders for {token_mint}: {holders_data}")
+        elif isinstance(holders_data, dict):
+             final_holders = {
+                 "total_holders": holders_data.get("total_holders", 0),
+                 "top_holders": holders_data.get("holders", [])
+             }
+        else:
+             errors.append({"holders_error": f"Unexpected holders data format: {type(holders_data)}"})
+             logger.error(f"Unexpected holders data format for {token_mint}: {type(holders_data)}")
+
+        # Combine all data into a comprehensive response
+        result = {
+            "token_mint": token_mint,
+            "name": final_metadata.get("name"),
+            "symbol": final_metadata.get("symbol"),
+            "decimals": final_supply.get("decimals"),
+            "supply": {
+                "amount": final_supply.get("amount"),
+                "ui_amount": final_supply.get("uiAmount"),
+                "ui_amount_string": final_supply.get("uiAmountString")
+            },
+            "price": final_price,
+            "holders": final_holders,
+            "metadata": {
+                "uri": final_metadata.get("uri"),
+                "source": final_metadata.get("source")
+            },
+            "last_updated": datetime.datetime.now().isoformat()
+        }
+        
+        if errors:
+            result["errors"] = errors
+            
+        return result
     
     async def __aenter__(self):
         """Async context manager entry.
@@ -1122,6 +1187,81 @@ class SolanaClient:
             await self._http_client.aclose()
             self._http_client = None
 
+    # New method using Helius specific getTokenAccounts
+    async def helius_get_token_accounts_by_mint(
+        self, 
+        mint_address: str, 
+        max_accounts_to_fetch: int = 2000 # Limit total accounts fetched via pagination
+    ) -> List[Dict[str, Any]]:
+        """Get token accounts for a mint using Helius' enhanced getTokenAccounts method.
+
+        Handles pagination to fetch multiple pages up to `max_accounts_to_fetch`.
+
+        Args:
+            mint_address: The token mint address.
+            max_accounts_to_fetch: The approximate maximum number of accounts to retrieve via pagination.
+
+        Returns:
+            List of token account details [{'address': str, 'mint': str, 'owner': str, 'amount': int, ...}].
+            Returns empty list on error or if no accounts found.
+
+        Raises:
+            InvalidPublicKeyError: If the mint address is invalid.
+            SolanaRpcError: If the underlying RPC call fails after retries.
+        """
+        if not validate_public_key(mint_address):
+            raise InvalidPublicKeyError(mint_address)
+
+        all_token_accounts = []
+        page = 1
+        limit_per_page = 1000 # Helius limit per page
+        
+        logger.info(f"Fetching token accounts for {mint_address} using Helius getTokenAccounts (max ~{max_accounts_to_fetch})")
+
+        while True:
+            try:
+                logger.debug(f"Fetching page {page} for {mint_address}...")
+                params = {
+                    "page": page,
+                    "limit": limit_per_page,
+                    "mint": mint_address,
+                    "displayOptions": { # Optional: customize displayed fields if needed
+                        # "showZeroBalance": False # Default is False
+                    }
+                }
+                
+                # Note: _make_request extracts the "result" field automatically
+                page_result = await self._make_request("getTokenAccounts", params)
+
+                if not page_result or not isinstance(page_result.get("token_accounts"), list):
+                    logger.warning(f"Helius getTokenAccounts returned unexpected result for {mint_address}, page {page}: {page_result}")
+                    break # Stop pagination on unexpected result
+
+                token_accounts_on_page = page_result["token_accounts"]
+                all_token_accounts.extend(token_accounts_on_page)
+                
+                logger.debug(f"Fetched {len(token_accounts_on_page)} accounts on page {page} for {mint_address}. Total fetched: {len(all_token_accounts)}")
+
+                # Stop if no more accounts on the page or we've fetched enough
+                if len(token_accounts_on_page) < limit_per_page or len(all_token_accounts) >= max_accounts_to_fetch:
+                    break
+
+                page += 1
+                # Add a small delay between pages to be nice to the API
+                await asyncio.sleep(0.1)
+
+            except SolanaRpcError as e:
+                logger.error(f"RPC error fetching page {page} for {mint_address} via Helius getTokenAccounts: {e}")
+                # Depending on the error, we might stop or continue, for now stop.
+                raise # Re-raise the error to be handled by the caller
+            except Exception as e:
+                logger.error(f"Unexpected error during Helius getTokenAccounts pagination for {mint_address} (page {page}): {e}", exc_info=True)
+                # Stop pagination on unexpected errors
+                break
+        
+        logger.info(f"Finished fetching Helius token accounts for {mint_address}. Total found: {len(all_token_accounts)}")
+        return all_token_accounts
+
 
 @asynccontextmanager
 async def get_solana_client():
@@ -1134,5 +1274,5 @@ async def get_solana_client():
     try:
         yield client
     finally:
-        # No cleanup needed for now, but could add connection pool management later
-        pass 
+        # Ensure the client's resources are released
+        await client.close()
