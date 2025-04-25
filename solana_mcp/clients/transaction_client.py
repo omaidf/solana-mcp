@@ -15,17 +15,26 @@ from solana_mcp.models.token_transfer import TokenTransfer
 from solana_mcp.services.rpc_service import RPCService
 from solana_mcp.solana_client import SolanaClient
 from solana_mcp.utils.constants import ZERO_PUBKEY
-from solana_mcp.utils.dependency_injection import inject
-from solana_mcp.utils.error_handling import TransactionError, NotFoundError, handle_errors
+from solana_mcp.utils.dependency_injection import inject_by_type
+from solana_mcp.utils.error_handling import (
+    SolanaMCPError,
+    TransactionError,
+    ValidationError,
+    DataError,
+    ErrorCode,
+    handle_async_exceptions,
+    handle_async_data_exceptions,
+    map_rpc_errors,
+    validate_async_parameters
+)
 from solana_mcp.utils.transaction_parser import (
     extract_sol_transfers,
     extract_token_transfers,
     parse_instruction_logs,
 )
 
-from solana_mcp.clients.base_client import BaseSolanaClient, InvalidPublicKeyError, validate_public_key
+from solana_mcp.clients.base_client import BaseSolanaClient
 from solana_mcp.logging_config import get_logger
-from solana_mcp.utils.validation import validate_transaction_signature
 from solana_mcp.constants import SYSTEM_PROGRAM_ID, TOKEN_PROGRAM_ID, PROGRAM_NAMES
 
 # Get logger
@@ -34,7 +43,7 @@ logger = get_logger(__name__)
 class TransactionClient:
     """Client for transaction-related operations."""
 
-    @inject
+    @inject_by_type
     def __init__(self, solana_client: Optional[SolanaClient] = None, rpc_service: Optional[RPCService] = None):
         """Initialize transaction client.
 
@@ -44,11 +53,16 @@ class TransactionClient:
         """
         self.solana_client = solana_client
         self.rpc_service = rpc_service
+        self.logger = logger
 
-    @handle_errors(error_map={
-        Exception: TransactionError,
-        ValueError: NotFoundError
-    })
+    @validate_async_parameters
+    @map_rpc_errors
+    @handle_async_exceptions(
+        (ValueError, TransactionError),
+        log_level=logging.WARNING,
+        reraise=False,
+        default_error=TransactionError
+    )
     async def get_transaction(
         self, signature: str, encoding: Optional[str] = None
     ) -> EnhancedTransaction:
@@ -62,28 +76,38 @@ class TransactionClient:
             Enhanced transaction details
         
         Raises:
-            NotFoundError: If transaction not found
-            TransactionError: For any other transaction-related error
+            TransactionError: If transaction not found or for any other transaction-related error
         """
+        # Validate transaction signature
+        if not signature or not isinstance(signature, str) or len(signature) < 32:
+            raise ValidationError(
+                f"Invalid transaction signature: {signature}",
+                details={"signature": signature}
+            )
+            
         # Get transaction from RPC
-        tx_response = await self.rpc_service.get_transaction(signature, encoding)
+        tx_response = await self.rpc_service.get_transaction(signature)
         if not tx_response or not tx_response.get("transaction"):
-            raise NotFoundError(f"Transaction not found: {signature}")
+            raise TransactionError(
+                f"Transaction not found: {signature}",
+                ErrorCode.NOT_IMPLEMENTED_ERROR,
+                details={"signature": signature}
+            )
 
         # Parse transaction
         return await self.parse_transaction(tx_response)
 
-    @handle_errors(error_map={
-        Exception: TransactionError
-    })
-    async def get_block(
-        self, slot: int, encoding: Optional[str] = None
-    ) -> Dict[str, Any]:
+    @validate_async_parameters
+    @map_rpc_errors
+    @handle_async_exceptions(
+        default_error=TransactionError,
+        log_level=logging.WARNING
+    )
+    async def get_block(self, slot: int) -> Dict[str, Any]:
         """Get block details.
 
         Args:
             slot: Block slot
-            encoding: Encoding type
 
         Returns:
             Block details
@@ -91,12 +115,18 @@ class TransactionClient:
         Raises:
             TransactionError: For any transaction-related error
         """
-        block = await self.rpc_service.get_block(slot, encoding)
+        if not isinstance(slot, int) or slot < 0:
+            raise ValidationError(f"Invalid slot number: {slot}", details={"slot": slot})
+            
+        block = await self.rpc_service.get_block(slot)
         return block
 
-    @handle_errors(error_map={
-        Exception: TransactionError
-    })
+    @validate_async_parameters
+    @map_rpc_errors
+    @handle_async_exceptions(
+        default_error=TransactionError,
+        log_level=logging.WARNING
+    )
     async def get_blocks(
         self, start_slot: int, end_slot: Optional[int] = None
     ) -> List[int]:
@@ -112,12 +142,19 @@ class TransactionClient:
         Raises:
             TransactionError: For any transaction-related error
         """
+        if not isinstance(start_slot, int) or start_slot < 0:
+            raise ValidationError(f"Invalid start slot: {start_slot}", details={"start_slot": start_slot})
+            
+        if end_slot is not None and (not isinstance(end_slot, int) or end_slot < start_slot):
+            raise ValidationError(
+                f"Invalid end slot: {end_slot}",
+                details={"start_slot": start_slot, "end_slot": end_slot}
+            )
+            
         blocks = await self.rpc_service.get_blocks(start_slot, end_slot)
         return blocks
 
-    @handle_errors(error_map={
-        Exception: TransactionError
-    })
+    @handle_async_data_exceptions
     async def parse_transaction(self, tx_data: Dict[str, Any]) -> EnhancedTransaction:
         """Parse transaction data into enhanced transaction model.
 
@@ -128,11 +165,26 @@ class TransactionClient:
             Enhanced transaction object
         
         Raises:
-            TransactionError: For any transaction-related error
+            DataError: If there is an error parsing the transaction data
+            TransactionError: For any other transaction-related error
         """
+        if not tx_data or not isinstance(tx_data, dict):
+            raise DataError(
+                "Invalid transaction data structure",
+                ErrorCode.PARSING_ERROR,
+                details={"data_type": type(tx_data).__name__}
+            )
+            
         # Extract transaction data
         meta = tx_data.get("meta", {})
         transaction = tx_data.get("transaction", {})
+
+        if not transaction:
+            raise DataError(
+                "Missing transaction information in transaction data",
+                ErrorCode.PARSING_ERROR,
+                details={"available_keys": list(tx_data.keys())}
+            )
 
         # Extract transaction data
         signature = transaction.get("signatures", [""])[0]
@@ -149,9 +201,17 @@ class TransactionClient:
         fee = meta.get("fee", 0)
 
         # Extract account keys
-        account_keys = [
-            PublicKey(key) for key in transaction.get("message", {}).get("accountKeys", [])
-        ]
+        message = transaction.get("message", {})
+        account_keys_raw = message.get("accountKeys", [])
+        
+        try:
+            account_keys = [PublicKey(key) for key in account_keys_raw]
+        except ValueError as e:
+            raise DataError(
+                f"Invalid public key in transaction: {str(e)}",
+                ErrorCode.PARSING_ERROR,
+                details={"account_keys": account_keys_raw}
+            )
 
         # Extract SOL transfers
         pre_balances = meta.get("preBalances", [])
@@ -260,113 +320,4 @@ class TransactionClient:
             return "TokenInstruction"
             
         # For other programs, return generic type
-        return "Instruction"
-    
-    def _extract_token_transfers(
-        self,
-        pre_balances: List[Dict[str, Any]],
-        post_balances: List[Dict[str, Any]],
-        account_keys: List[str]
-    ) -> List[Dict[str, Any]]:
-        """Extract token transfers from pre and post token balances.
-        
-        Args:
-            pre_balances: Pre-execution token balances
-            post_balances: Post-execution token balances
-            account_keys: Account keys in the transaction
-            
-        Returns:
-            List of token transfers
-        """
-        transfers = []
-        
-        # Create maps of pre and post balances by account index and mint
-        pre_map = {}
-        for balance in pre_balances:
-            idx = balance.get("accountIndex")
-            mint = balance.get("mint")
-            key = f"{idx}:{mint}"
-            pre_map[key] = balance
-        
-        # Compare with post balances to find transfers
-        for post in post_balances:
-            idx = post.get("accountIndex")
-            mint = post.get("mint")
-            key = f"{idx}:{mint}"
-            
-            if key in pre_map:
-                pre = pre_map[key]
-                pre_amount = int(pre.get("uiTokenAmount", {}).get("amount", "0"))
-                post_amount = int(post.get("uiTokenAmount", {}).get("amount", "0"))
-                
-                # Check if balance changed
-                if post_amount != pre_amount:
-                    owner = post.get("owner", "unknown")
-                    account = account_keys[idx] if idx < len(account_keys) else "unknown"
-                    
-                    transfers.append({
-                        "token_account": account,
-                        "owner": owner,
-                        "mint": mint,
-                        "pre_amount": pre_amount,
-                        "post_amount": post_amount,
-                        "change": post_amount - pre_amount,
-                        "decimals": post.get("uiTokenAmount", {}).get("decimals", 0)
-                    })
-            else:
-                # New token account might have been created
-                owner = post.get("owner", "unknown")
-                account = account_keys[idx] if idx < len(account_keys) else "unknown"
-                amount = int(post.get("uiTokenAmount", {}).get("amount", "0"))
-                
-                if amount > 0:
-                    transfers.append({
-                        "token_account": account,
-                        "owner": owner,
-                        "mint": mint,
-                        "pre_amount": 0,
-                        "post_amount": amount,
-                        "change": amount,
-                        "decimals": post.get("uiTokenAmount", {}).get("decimals", 0)
-                    })
-        
-        return transfers
-    
-    def _extract_sol_transfers(
-        self,
-        pre_balances: List[int],
-        post_balances: List[int],
-        account_keys: List[str]
-    ) -> List[Dict[str, Any]]:
-        """Extract SOL transfers from pre and post balances.
-        
-        Args:
-            pre_balances: Pre-execution SOL balances in lamports
-            post_balances: Post-execution SOL balances in lamports
-            account_keys: Account keys in the transaction
-            
-        Returns:
-            List of SOL transfers
-        """
-        transfers = []
-        
-        min_length = min(len(pre_balances), len(post_balances), len(account_keys))
-        
-        for i in range(min_length):
-            pre = pre_balances[i]
-            post = post_balances[i]
-            account = account_keys[i]
-            
-            if post != pre:
-                change = post - pre
-                # Ignore very small changes that might be due to rent changes
-                if abs(change) >= 10000:  # 0.00001 SOL threshold
-                    transfers.append({
-                        "account": account,
-                        "pre_balance": pre,
-                        "post_balance": post,
-                        "change": change,
-                        "change_sol": change / 1_000_000_000  # Convert lamports to SOL
-                    })
-        
-        return transfers 
+        return "Instruction" 

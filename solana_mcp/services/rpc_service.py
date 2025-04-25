@@ -11,14 +11,20 @@ import logging
 from typing import Any, Dict, List, Optional, Union
 
 import httpx
+from solana.rpc.core import RPCException
 
 from solana_mcp.services.base_service import BaseService
 from solana_mcp.utils.error_handling import (
-    handle_errors,
-    ConnectionError,
-    RPCError,
+    SolanaMCPError,
+    NetworkError,
     ValidationError,
-    SolanaMCPError
+    RPCError, 
+    DataError,
+    ErrorCode,
+    handle_async_exceptions,
+    async_retry,
+    map_rpc_errors,
+    validate_async_parameters
 )
 from solana_mcp.utils.config import get_settings
 
@@ -60,7 +66,22 @@ class RPCService(BaseService):
         await self.client.aclose()
         self.logger.info("RPCService closed")
     
-    @handle_errors(retries=3, retry_exceptions=[ConnectionError, httpx.RequestError], retry_delay=1.0)
+    @async_retry(
+        max_attempts=3,
+        retry_delay=1.0,
+        backoff_factor=2.0,
+        retryable_exceptions=[httpx.RequestError, asyncio.TimeoutError],
+        log_level=logging.WARNING
+    )
+    @handle_async_exceptions(
+        (httpx.HTTPStatusError, NetworkError),
+        (httpx.RequestError, NetworkError),
+        (asyncio.TimeoutError, NetworkError),
+        (json.JSONDecodeError, DataError),
+        log_level=logging.ERROR,
+        reraise=False,
+        default_error=RPCError
+    )
     async def make_request(self, method: str, params: List[Any]) -> Dict[str, Any]:
         """
         Make an RPC request to the Solana API.
@@ -73,8 +94,9 @@ class RPCService(BaseService):
             RPC response data
             
         Raises:
-            ConnectionError: If there is a connection error
+            NetworkError: If there is a network or connection error
             RPCError: If the RPC request fails
+            DataError: If there is an error parsing the response
         """
         payload = {
             "jsonrpc": "2.0",
@@ -83,57 +105,56 @@ class RPCService(BaseService):
             "params": params
         }
         
-        try:
-            async with self.log_timing(f"rpc_request.{method}"):
-                response = await self.client.post(
-                    self.rpc_url,
-                    json=payload,
-                    headers={"Content-Type": "application/json"}
+        async with self.log_timing(f"rpc_request.{method}"):
+            response = await self.client.post(
+                self.rpc_url,
+                json=payload,
+                headers={"Content-Type": "application/json"}
+            )
+            
+            # Raise for HTTP status errors
+            response.raise_for_status()
+            
+            # Parse JSON response
+            result = response.json()
+            
+            # Handle RPC errors
+            if "error" in result:
+                error = result["error"]
+                error_code = error.get("code", 0)
+                error_message = error.get("message", "Unknown error")
+                error_data = error.get("data")
+                
+                # Map error code to our error codes
+                if error_code == -32002:
+                    err_code = ErrorCode.RPC_RATE_LIMIT_ERROR
+                elif error_code == -32602:
+                    err_code = ErrorCode.RPC_INVALID_PARAMETER_ERROR
+                elif error_code == -32601:
+                    err_code = ErrorCode.RPC_METHOD_NOT_FOUND_ERROR
+                else:
+                    err_code = ErrorCode.RPC_ERROR
+                    
+                # Raise standardized RPCError
+                raise RPCError(
+                    f"RPC error in {method}: {error_message}",
+                    err_code,
+                    details={"rpc_error_code": error_code, "rpc_error_data": error_data}
+                )
+            
+            # Success case - return the result
+            if "result" not in result:
+                raise DataError(
+                    f"Invalid RPC response - missing 'result' field",
+                    ErrorCode.PARSING_ERROR,
+                    details={"response": result}
                 )
                 
-                # Raise for HTTP status errors
-                response.raise_for_status()
-                
-                # Parse JSON response
-                result = response.json()
-                
-                # Handle RPC errors
-                if "error" in result:
-                    error = result["error"]
-                    code = error.get("code", 0)
-                    message = error.get("message", "Unknown error")
-                    data = error.get("data")
-                    
-                    # Raise standardized RPCError
-                    raise RPCError(method, code, message, data)
-                
-                # Success case - return the result
-                return result["result"]
-                
-        except httpx.HTTPStatusError as e:
-            raise RPCError(
-                method, 
-                e.response.status_code, 
-                f"HTTP error: {e.response.status_code}", 
-                {"response": e.response.text}
-            )
-            
-        except httpx.RequestError as e:
-            raise ConnectionError(f"Connection error during RPC request to {method}: {str(e)}")
-            
-        except RPCError:
-            # Pass through our custom RPCError
-            raise
-            
-        except Exception as e:
-            raise RPCError(
-                method, 
-                -1, 
-                f"Unexpected error: {str(e)}"
-            )
+            return result["result"]
     
     # Solana RPC methods
-    @handle_errors(retries=2)
+    @validate_async_parameters
+    @map_rpc_errors
     async def get_account_info(self, account: str, encoding: str = "base64") -> Dict[str, Any]:
         """
         Get account information.
@@ -146,7 +167,7 @@ class RPCService(BaseService):
             Account information
         """
         if not self._validate_public_key(account):
-            raise ValidationError(f"Invalid account address: {account}")
+            raise ValidationError(f"Invalid account address: {account}", details={"account": account})
             
         params = [
             account,
@@ -155,7 +176,8 @@ class RPCService(BaseService):
         
         return await self.make_request("getAccountInfo", params)
     
-    @handle_errors(retries=2)
+    @validate_async_parameters
+    @map_rpc_errors
     async def get_balance(self, account: str) -> int:
         """
         Get account balance.
@@ -167,13 +189,14 @@ class RPCService(BaseService):
             Account balance in lamports
         """
         if not self._validate_public_key(account):
-            raise ValidationError(f"Invalid account address: {account}")
+            raise ValidationError(f"Invalid account address: {account}", details={"account": account})
             
         params = [account]
         result = await self.make_request("getBalance", params)
         return result["value"]
     
-    @handle_errors(retries=2)
+    @validate_async_parameters
+    @map_rpc_errors
     async def get_token_accounts_by_owner(
         self, 
         owner: str, 
@@ -192,13 +215,13 @@ class RPCService(BaseService):
             List of token accounts
         """
         if not self._validate_public_key(owner):
-            raise ValidationError(f"Invalid owner address: {owner}")
+            raise ValidationError(f"Invalid owner address: {owner}", details={"owner": owner})
             
         if mint and not self._validate_public_key(mint):
-            raise ValidationError(f"Invalid mint address: {mint}")
+            raise ValidationError(f"Invalid mint address: {mint}", details={"mint": mint})
             
         if program_id and not self._validate_public_key(program_id):
-            raise ValidationError(f"Invalid program ID: {program_id}")
+            raise ValidationError(f"Invalid program ID: {program_id}", details={"program_id": program_id})
             
         if mint:
             params = [owner, {"mint": mint}]
@@ -215,7 +238,8 @@ class RPCService(BaseService):
         result = await self.make_request("getTokenAccountsByOwner", params)
         return result["value"]
     
-    @handle_errors(retries=2)
+    @validate_async_parameters
+    @map_rpc_errors
     async def get_token_supply(self, mint: str) -> Dict[str, Any]:
         """
         Get token supply.
@@ -227,13 +251,14 @@ class RPCService(BaseService):
             Token supply information
         """
         if not self._validate_public_key(mint):
-            raise ValidationError(f"Invalid mint address: {mint}")
+            raise ValidationError(f"Invalid mint address: {mint}", details={"mint": mint})
         
         params = [mint, {"commitment": "confirmed"}]
         result = await self.make_request("getTokenSupply", params)
         return result["value"]
     
-    @handle_errors(retries=2)
+    @validate_async_parameters
+    @map_rpc_errors
     async def get_token_largest_accounts(self, mint: str) -> List[Dict[str, Any]]:
         """
         Get largest token accounts by token mint.
@@ -245,13 +270,14 @@ class RPCService(BaseService):
             List of largest token accounts
         """
         if not self._validate_public_key(mint):
-            raise ValidationError(f"Invalid mint address: {mint}")
+            raise ValidationError(f"Invalid mint address: {mint}", details={"mint": mint})
             
         params = [mint]
         result = await self.make_request("getTokenLargestAccounts", params)
         return result["value"]
     
-    @handle_errors(retries=2)
+    @validate_async_parameters
+    @map_rpc_errors
     async def get_token_metadata(self, mint: str) -> Dict[str, Any]:
         """
         Get token metadata using the Metaplex standard.
@@ -263,7 +289,7 @@ class RPCService(BaseService):
             Token metadata
         """
         if not self._validate_public_key(mint):
-            raise ValidationError(f"Invalid mint address: {mint}")
+            raise ValidationError(f"Invalid mint address: {mint}", details={"mint": mint})
         
         # Find the metadata PDA for this mint
         metadata_address = self._find_metadata_pda(mint)
@@ -272,7 +298,10 @@ class RPCService(BaseService):
         account_info = await self.get_account_info(metadata_address, encoding="base64")
         
         if not account_info["value"]:
-            raise ValidationError(f"No metadata found for mint: {mint}")
+            raise ValidationError(
+                f"No metadata found for mint: {mint}",
+                details={"mint": mint, "metadata_address": metadata_address}
+            )
             
         # Here you would normally parse the metadata from the account data
         # This is a simplified version that just returns the raw data
@@ -281,7 +310,8 @@ class RPCService(BaseService):
             "raw_data": account_info["value"]
         }
     
-    @handle_errors(retries=2)
+    @validate_async_parameters
+    @map_rpc_errors
     async def get_program_accounts(
         self, 
         program_id: str, 
@@ -304,7 +334,7 @@ class RPCService(BaseService):
             List of program accounts
         """
         if not self._validate_public_key(program_id):
-            raise ValidationError(f"Invalid program ID: {program_id}")
+            raise ValidationError(f"Invalid program ID: {program_id}", details={"program_id": program_id})
             
         config: Dict[str, Any] = {"encoding": encoding}
         
@@ -321,7 +351,8 @@ class RPCService(BaseService):
         result = await self.make_request("getProgramAccounts", params)
         return result
     
-    @handle_errors(retries=2)
+    @validate_async_parameters
+    @map_rpc_errors
     async def get_signatures_for_address(
         self, 
         address: str, 
@@ -340,7 +371,7 @@ class RPCService(BaseService):
             List of transaction signatures
         """
         if not self._validate_public_key(address):
-            raise ValidationError(f"Invalid address: {address}")
+            raise ValidationError(f"Invalid address: {address}", details={"address": address})
             
         config: Dict[str, Any] = {"limit": limit}
         
@@ -350,7 +381,8 @@ class RPCService(BaseService):
         params = [address, config]
         return await self.make_request("getSignaturesForAddress", params)
     
-    @handle_errors(retries=2)
+    @validate_async_parameters
+    @map_rpc_errors
     async def get_transaction(self, signature: str) -> Dict[str, Any]:
         """
         Get transaction details.
@@ -363,7 +395,10 @@ class RPCService(BaseService):
         """
         # Validate signature format (base58 encoded string)
         if not signature or not isinstance(signature, str) or len(signature) < 32:
-            raise ValidationError(f"Invalid transaction signature: {signature}")
+            raise ValidationError(
+                f"Invalid transaction signature: {signature}",
+                details={"signature": signature}
+            )
             
         params = [
             signature, 
@@ -407,7 +442,8 @@ class RPCService(BaseService):
         # using the appropriate seeds and the Metaplex program ID
         return f"metadata_for_{mint_address}"
     
-    @handle_errors(retries=2)
+    @validate_async_parameters
+    @map_rpc_errors
     async def get_block(self, slot: int) -> Dict[str, Any]:
         """
         Get block information.
@@ -419,7 +455,7 @@ class RPCService(BaseService):
             Block information
         """
         if not isinstance(slot, int) or slot < 0:
-            raise ValidationError(f"Invalid slot number: {slot}")
+            raise ValidationError(f"Invalid slot number: {slot}", details={"slot": slot})
             
         params = [
             slot, 
@@ -428,7 +464,8 @@ class RPCService(BaseService):
         
         return await self.make_request("getBlock", params)
     
-    @handle_errors(retries=2)
+    @validate_async_parameters
+    @map_rpc_errors
     async def get_blocks(self, start_slot: int, end_slot: Optional[int] = None) -> List[int]:
         """
         Get a list of confirmed blocks.
@@ -441,27 +478,50 @@ class RPCService(BaseService):
             List of block slot numbers
         """
         if not isinstance(start_slot, int) or start_slot < 0:
-            raise ValidationError(f"Invalid start slot: {start_slot}")
+            raise ValidationError(f"Invalid start slot: {start_slot}", details={"start_slot": start_slot})
             
         if end_slot is not None and (not isinstance(end_slot, int) or end_slot < start_slot):
-            raise ValidationError(f"Invalid end slot: {end_slot}")
+            raise ValidationError(
+                f"Invalid end slot: {end_slot}",
+                details={"start_slot": start_slot, "end_slot": end_slot}
+            )
             
         params = [start_slot]
         if end_slot is not None:
             params.append(end_slot)
             
         return await self.make_request("getBlocks", params)
+    
+    @validate_async_parameters
+    @map_rpc_errors
+    async def get_slot(self, commitment: str = "finalized") -> int:
+        """
+        Get current slot.
+        
+        Args:
+            commitment: Commitment level (finalized, confirmed, processed)
+            
+        Returns:
+            Current slot number
+        """
+        valid_commitments = ["finalized", "confirmed", "processed"]
+        if commitment not in valid_commitments:
+            raise ValidationError(
+                f"Invalid commitment level: {commitment}",
+                details={"commitment": commitment, "valid_commitments": valid_commitments}
+            )
+            
+        params = [{"commitment": commitment}]
+        return await self.make_request("getSlot", params)
 
 
-# Singleton accessor for the RPCService
+# Get a singleton instance of the RPCService using dependency injection
 def get_rpc_service(
     rpc_url: Optional[str] = None,
     timeout: float = 30.0
 ) -> RPCService:
     """
     Get a singleton instance of the RPCService.
-    
-    This function will be replaced by the dependency injection system.
     
     Args:
         rpc_url: Optional RPC URL override
@@ -474,11 +534,11 @@ def get_rpc_service(
     provider = ServiceProvider.get_instance()
     
     # Check if we already have a service instance
-    try:
-        service = provider.get(RPCService)
-    except KeyError:
-        # Create and register a new service instance
-        service = RPCService(rpc_url=rpc_url, timeout=timeout)
-        provider.register(RPCService, service)
+    if provider.has_service(RPCService):
+        return provider.get_service(RPCService)
+    
+    # Create and register a new service instance
+    service = RPCService(rpc_url=rpc_url, timeout=timeout)
+    provider.register_singleton(RPCService, service)
     
     return service 
