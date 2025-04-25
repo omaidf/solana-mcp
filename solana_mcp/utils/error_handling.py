@@ -15,11 +15,21 @@ import traceback
 import time
 from enum import Enum
 from functools import wraps
-from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, Union, cast, Awaitable
 from dataclasses import dataclass
 
 import aiohttp
 from solana.rpc.core import RPCException
+# Remove solana import and define our own RPCException class
+# from solana.rpc.core import RPCException
+
+# Define our own RPCException class
+class RPCException(Exception):
+    """Exception raised when an RPC request fails."""
+    def __init__(self, message: str, code: int = 0, data: Any = None):
+        super().__init__(message)
+        self.code = code
+        self.data = data
 
 # Get logger
 logger = logging.getLogger(__name__)
@@ -27,7 +37,41 @@ logger = logging.getLogger(__name__)
 # Type variable for function return types
 T = TypeVar('T')
 F = TypeVar('F', bound=Callable[..., Any])
-AsyncF = TypeVar('AsyncF', bound=Callable[..., asyncio.coroutine])
+AsyncF = TypeVar('AsyncF', bound=Callable[..., Awaitable[Any]])
+
+
+class ErrorCode(Enum):
+    """Error codes for Solana MCP."""
+    # General errors
+    UNKNOWN_ERROR = 1000
+    CONFIGURATION_ERROR = 1001
+    VALIDATION_ERROR = 1002
+    NOT_IMPLEMENTED_ERROR = 1003
+    
+    # Network errors
+    NETWORK_ERROR = 2000
+    CONNECTION_ERROR = 2001
+    TIMEOUT_ERROR = 2002
+    REQUEST_ERROR = 2003
+    
+    # RPC errors
+    RPC_ERROR = 3000
+    RPC_RATE_LIMIT_ERROR = 3001
+    RPC_INVALID_PARAMETER_ERROR = 3002
+    RPC_METHOD_NOT_FOUND_ERROR = 3003
+    
+    # Data errors
+    DATA_ERROR = 4000
+    PARSING_ERROR = 4001
+    SERIALIZATION_ERROR = 4002
+    DESERIALIZATION_ERROR = 4003
+    
+    # Transaction errors
+    TRANSACTION_ERROR = 5000
+    TRANSACTION_CONFIRMATION_ERROR = 5001
+    TRANSACTION_SIMULATION_ERROR = 5002
+    TRANSACTION_SIGNING_ERROR = 5003
+
 
 # Base exception classes
 class SolanaMCPError(Exception):
@@ -471,39 +515,6 @@ def catch_and_log_exceptions(
             return cast(F, sync_wrapper)
     
     return decorator 
-
-
-class ErrorCode(Enum):
-    """Error codes for Solana MCP."""
-    # General errors
-    UNKNOWN_ERROR = 1000
-    CONFIGURATION_ERROR = 1001
-    VALIDATION_ERROR = 1002
-    NOT_IMPLEMENTED_ERROR = 1003
-    
-    # Network errors
-    NETWORK_ERROR = 2000
-    CONNECTION_ERROR = 2001
-    TIMEOUT_ERROR = 2002
-    REQUEST_ERROR = 2003
-    
-    # RPC errors
-    RPC_ERROR = 3000
-    RPC_RATE_LIMIT_ERROR = 3001
-    RPC_INVALID_PARAMETER_ERROR = 3002
-    RPC_METHOD_NOT_FOUND_ERROR = 3003
-    
-    # Data errors
-    DATA_ERROR = 4000
-    PARSING_ERROR = 4001
-    SERIALIZATION_ERROR = 4002
-    DESERIALIZATION_ERROR = 4003
-    
-    # Transaction errors
-    TRANSACTION_ERROR = 5000
-    TRANSACTION_CONFIRMATION_ERROR = 5001
-    TRANSACTION_SIMULATION_ERROR = 5002
-    TRANSACTION_SIGNING_ERROR = 5003
 
 
 def handle_exceptions(
