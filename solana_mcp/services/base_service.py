@@ -200,6 +200,69 @@ class BaseService:
             return_exceptions=False
         )
     
+    async def execute_with_fallback(
+        self,
+        coro: Awaitable[T],
+        fallback_value: T,
+        error_message: str = "Operation failed"
+    ) -> T:
+        """
+        Execute a coroutine with a fallback value if it fails.
+        
+        Args:
+            coro: The coroutine to execute
+            fallback_value: The value to return if the coroutine fails
+            error_message: The error message to log if the coroutine fails
+            
+        Returns:
+            The result of the coroutine, or the fallback value if it fails
+        """
+        try:
+            return await coro
+        except Exception as e:
+            self.logger.warning(f"{error_message}: {str(e)}")
+            return fallback_value
+    
+    async def execute_with_timeout(
+        self,
+        coro: Awaitable[T],
+        timeout: float,
+        fallback_value: T,
+        error_message: str = "Operation timed out"
+    ) -> T:
+        """
+        Execute a coroutine with a timeout and a fallback value if it times out.
+        
+        Args:
+            coro: The coroutine to execute
+            timeout: The timeout in seconds
+            fallback_value: The value to return if the coroutine times out
+            error_message: The error message to log if the coroutine times out
+            
+        Returns:
+            The result of the coroutine, or the fallback value if it times out
+        """
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            self.logger.warning(f"{error_message} after {timeout}s")
+            return fallback_value
+        except Exception as e:
+            self.logger.warning(f"{error_message}: {str(e)}")
+            return fallback_value
+    
+    def log_with_context(self, level: str, message: str, **context):
+        """
+        Log a message with context.
+        
+        Args:
+            level: The log level (debug, info, warning, error)
+            message: The message to log
+            **context: Additional context to include in the log
+        """
+        log_method = getattr(self.logger, level)
+        log_method(message, extra={"context": context})
+    
     def log_timing(self, operation_name: str) -> "TimingContextManager":
         """
         Create a context manager to log timing information.

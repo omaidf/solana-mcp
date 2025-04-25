@@ -124,6 +124,24 @@ class ConnectionError(SolanaMCPError):
         super().__init__(message)
 
 
+class NetworkError(SolanaMCPError):
+    """Error related to network communication issues."""
+    
+    def __init__(
+        self, 
+        message: str,
+        details: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Initialize the network error.
+        
+        Args:
+            message: Error message
+            details: Additional error details
+        """
+        super().__init__(message, ErrorCode.NETWORK_ERROR, details)
+
+
 class RPCError(SolanaMCPError):
     """Exception for RPC-related errors."""
     
@@ -173,6 +191,24 @@ class ConfigurationError(SolanaMCPError):
 class ParseError(SolanaMCPError):
     """Error related to parsing failures."""
     pass
+
+
+class DataError(SolanaMCPError):
+    """Error related to data handling or processing failures."""
+    
+    def __init__(
+        self, 
+        message: str,
+        details: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Initialize the data error.
+        
+        Args:
+            message: Error message
+            details: Additional error details
+        """
+        super().__init__(message, ErrorCode.DATA_ERROR, details)
 
 
 class ProgramError(SolanaMCPError):
@@ -977,4 +1013,40 @@ handle_async_data_exceptions = functools.partial(
     *COMMON_DATA_EXCEPTIONS,
     log_level=logging.WARNING,
     default_error=DataError
-) 
+)
+
+# Ensure NetworkError and DataError are properly defined
+def _ensure_error_classes():
+    """Ensure that all required error classes are defined."""
+    global NetworkError, DataError
+    
+    # Check if NetworkError exists in the global namespace
+    if 'NetworkError' not in globals():
+        class NetworkError(SolanaMCPError):
+            """Error related to network communication issues."""
+            
+            def __init__(
+                self, 
+                message: str,
+                details: Optional[Dict[str, Any]] = None
+            ):
+                super().__init__(message, ErrorCode.NETWORK_ERROR, details)
+        
+        globals()['NetworkError'] = NetworkError
+    
+    # Check if DataError exists in the global namespace
+    if 'DataError' not in globals():
+        class DataError(SolanaMCPError):
+            """Error related to data handling or processing failures."""
+            
+            def __init__(
+                self, 
+                message: str,
+                details: Optional[Dict[str, Any]] = None
+            ):
+                super().__init__(message, ErrorCode.DATA_ERROR, details)
+        
+        globals()['DataError'] = DataError
+
+# Call the function to ensure classes are defined
+_ensure_error_classes() 
