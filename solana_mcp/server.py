@@ -2540,9 +2540,109 @@ async def detect_whale_wallets(token_address: str, solana_client: SolanaClient) 
     Returns:
         Whale wallet information
     """
-    # This function has been moved to solana_mcp/services/whale_detector/detector.py
-    # Delegating to the imported implementation
-    return await detect_whale_wallets(token_address, solana_client)
+    try:
+        if not validate_public_key(token_address):
+            return {
+                "error": "Invalid token address format",
+                "error_explanation": "The provided token address is not a valid Solana public key"
+            }
+        
+        # Get token info
+        try:
+            supply_data = await solana_client.get_token_supply(token_address)
+            decimals = supply_data["value"]["decimals"]
+            total_supply = Decimal(supply_data["value"]["amount"]) / Decimal(10 ** decimals)
+            
+            # Get token metadata
+            metadata = await solana_client.get_token_metadata(token_address)
+            symbol = metadata.get("symbol", token_address[:6])
+            
+            # Get token price
+            price_data = await solana_client.get_market_price(token_address)
+            price_usd = Decimal(str(price_data.get("price", 0.01)))
+            
+            token_info = {
+                'decimals': decimals,
+                'symbol': symbol,
+                'price_usd': price_usd,
+                'total_supply': total_supply
+            }
+        except SolanaRpcError as e:
+            return {
+                "error": f"Error fetching token info: {str(e)}",
+                "error_explanation": "Failed to get token information from the Solana blockchain"
+            }
+        
+        # Get top token holders
+        try:
+            holders = await get_token_holders(token_address, solana_client)
+            if not holders:
+                return {
+                    "error": "No token holders found",
+                    "error_explanation": "Could not find any holders for this token"
+                }
+        except SolanaRpcError as e:
+            return {
+                "error": f"Error fetching token holders: {str(e)}",
+                "error_explanation": "Failed to get token holders from the Solana blockchain"
+            }
+        
+        # Process top holders to find whales
+        whale_wallets = []
+        for holder in holders[:25]:  # Limit to top 25 for API response time
+            wallet_address = holder["owner"]
+            amount = holder["amount"]
+            
+            # Calculate token amount and value
+            token_amount = amount / Decimal(10 ** token_info['decimals'])
+            token_value = token_amount * token_info['price_usd']
+            supply_percentage = (token_amount / token_info['total_supply']) * 100 if token_info['total_supply'] > 0 else 0
+            
+            # Get wallet tokens to calculate total value
+            wallet_tokens = await get_wallet_tokens_for_owner(wallet_address, solana_client)
+            
+            # Calculate total wallet value (simplified for API speed)
+            total_value = token_value  # Start with target token value
+            token_count = len(wallet_tokens)
+            
+            # Add value of common tokens (simplified estimate)
+            for token in wallet_tokens:
+                if token["mint"] == "So11111111111111111111111111111111111111112":  # SOL
+                    # Add SOL value (estimated at $150 per SOL)
+                    total_value += Decimal(token["amount"]) * Decimal(150)
+                elif token["mint"] in ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
+                    # USDC, USDT (stablecoins valued at 1:1)
+                    total_value += Decimal(token["amount"])
+            
+            # Determine if this is a whale based on value threshold (simplified)
+            # Consider as whale if total value > $50,000 or holding >1% of supply
+            is_whale = total_value > 50000 or supply_percentage > 1
+            
+            if is_whale:
+                whale_wallets.append({
+                    'wallet': wallet_address,
+                    'target_token_amount': float(token_amount),
+                    'target_token_value_usd': float(token_value),
+                    'target_token_supply_percentage': float(supply_percentage),
+                    'total_value_usd': float(total_value),
+                    'token_count': token_count
+                })
+        
+        # Sort whale wallets by total value
+        whale_wallets.sort(key=lambda x: x['total_value_usd'], reverse=True)
+        
+        return {
+            "token_address": token_address,
+            "token_symbol": token_info['symbol'],
+            "token_price_usd": float(token_info['price_usd']),
+            "whale_count": len(whale_wallets),
+            "whales": whale_wallets
+        }
+    except Exception as e:
+        return {
+            "error": f"Unexpected error: {str(e)}",
+            "error_explanation": "An unexpected error occurred during whale detection"
+        }
 
 
 async def detect_fresh_wallets(token_address: str, solana_client: SolanaClient) -> Dict[str, Any]:
@@ -2555,9 +2655,332 @@ async def detect_fresh_wallets(token_address: str, solana_client: SolanaClient) 
     Returns:
         Fresh wallet information
     """
-    # This function has been moved to solana_mcp/services/fresh_wallet/detector.py
-    # Delegating to the imported implementation
-    return await detect_fresh_wallets(token_address, solana_client)
+    try:
+        if not validate_public_key(token_address):
+            return {
+                "error": "Invalid token address format",
+                "error_explanation": "The provided token address is not a valid Solana public key"
+            }
+        
+        # Get token info
+        try:
+            supply_data = await solana_client.get_token_supply(token_address)
+            decimals = supply_data["value"]["decimals"]
+            
+            # Get token metadata
+            metadata = await solana_client.get_token_metadata(token_address)
+            symbol = metadata.get("symbol", token_address[:6])
+            
+            # Get token price
+            price_data = await solana_client.get_market_price(token_address)
+            price_usd = Decimal(str(price_data.get("price", 0.01)))
+            
+            token_info = {
+                'decimals': decimals,
+                'symbol': symbol,
+                'price_usd': price_usd
+            }
+        except SolanaRpcError as e:
+            return {
+                "error": f"Error fetching token info: {str(e)}",
+                "error_explanation": "Failed to get token information from the Solana blockchain"
+            }
+        
+        # Get top token holders
+        try:
+            holders = await get_token_holders(token_address, solana_client)
+            if not holders:
+                return {
+                    "error": "No token holders found",
+                    "error_explanation": "Could not find any holders for this token"
+                }
+        except SolanaRpcError as e:
+            return {
+                "error": f"Error fetching token holders: {str(e)}",
+                "error_explanation": "Failed to get token holders from the Solana blockchain"
+            }
+        
+        # Process top holders to find fresh wallets
+        fresh_wallets = []
+        processed_holders = 0
+        
+        for holder in holders[:50]:  # Limit to top 50 for API response time
+            processed_holders += 1
+            wallet_address = holder["owner"]
+            amount = holder["amount"]
+            
+            # Calculate token amount and value
+            token_amount = amount / Decimal(10 ** token_info['decimals'])
+            token_value = token_amount * token_info['price_usd']
+            
+            # 1. Check token diversity (main indicator of a fresh wallet)
+            wallet_tokens = await get_wallet_tokens_for_owner(wallet_address, solana_client)
+            token_count = len(wallet_tokens)
+            non_dust_token_count = 0
+            
+            # Count non-dust tokens
+            for token in wallet_tokens:
+                if token["mint"] in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
+                    # SOL, USDC, USDT - count if more than $1
+                    price = Decimal(150) if token["mint"] == "So11111111111111111111111111111111111111112" else Decimal(1)
+                    if Decimal(token["amount"]) * price > 1:
+                        non_dust_token_count += 1
+                else:
+                    # For other tokens, assume they have some value
+                    non_dust_token_count += 1
+            
+            # 2. Check wallet age
+            try:
+                signatures = await solana_client.get_signatures_for_address(wallet_address, limit=10)
+                wallet_age_days = None
+                
+                if signatures and len(signatures) > 0:
+                    oldest_tx = signatures[-1]
+                    if "blockTime" in oldest_tx:
+                        created_at = datetime.datetime.fromtimestamp(oldest_tx["blockTime"])
+                        wallet_age_days = (datetime.datetime.now() - created_at).days
+            except:
+                wallet_age_days = None
+            
+            # 3. Simplified transaction analysis (check if recent txs involve this token)
+            token_tx_ratio = 0.0
+            if signatures and len(signatures) > 0:
+                # For each signature, get the transaction
+                token_tx_count = 0
+                for sig_info in signatures[:5]:  # Check just a few recent txs
+                    try:
+                        # Simplified detection - just see if the token address appears in the transaction data
+                        tx_data = await solana_client.get_transaction(sig_info["signature"])
+                        if token_address in str(tx_data):
+                            token_tx_count += 1
+                    except:
+                        pass
+                
+                token_tx_ratio = token_tx_count / len(signatures[:5])
+            
+            # Determine if this is a fresh wallet
+            is_new_wallet = wallet_age_days is not None and wallet_age_days <= 30
+            is_fresh = (
+                (is_new_wallet and non_dust_token_count < 5) or  # New wallet with few tokens
+                (non_dust_token_count < 4) or  # Very few tokens
+                token_tx_ratio > 0.5  # High ratio of token transactions
+            )
+            
+            # Calculate freshness score
+            freshness_score = 0.0
+            if is_fresh:
+                freshness_score = (1 - (non_dust_token_count / 10)) * 0.5
+                if is_new_wallet:
+                    freshness_score += 0.3
+                freshness_score += min(0.2, token_tx_ratio * 0.3)
+                freshness_score = min(0.95, freshness_score)  # Cap at 0.95
+            
+            if is_fresh:
+                fresh_wallets.append({
+                    'wallet': wallet_address,
+                    'is_fresh': True,
+                    'token_count': token_count,
+                    'non_dust_token_count': non_dust_token_count,
+                    'token_tx_ratio': float(token_tx_ratio),
+                    'wallet_age_days': wallet_age_days,
+                    'target_token_amount': float(token_amount),
+                    'target_token_value_usd': float(token_value),
+                    'freshness_score': float(freshness_score)
+                })
+        
+        # Sort fresh wallets by freshness score
+        fresh_wallets.sort(key=lambda x: x['freshness_score'], reverse=True)
+        
+        return {
+            "token_address": token_address,
+            "token_symbol": token_info['symbol'],
+            "token_price_usd": float(token_info['price_usd']),
+            "fresh_wallet_count": len(fresh_wallets),
+            "total_analyzed_wallets": processed_holders,
+            "fresh_wallets": fresh_wallets
+        }
+    except Exception as e:
+        return {
+            "error": f"Unexpected error: {str(e)}",
+            "error_explanation": "An unexpected error occurred during fresh wallet detection"
+        }
+
+
+# Add helper functions for the detectors
+async def get_token_holders(token_address: str, solana_client: SolanaClient, limit: int = 100) -> List[Dict[str, Any]]:
+    """Get token holders for a mint.
+    
+    Args:
+        token_address: Token mint address
+        solana_client: Solana client
+        limit: Maximum holders to return
+        
+    Returns:
+        List of token holders
+    """
+    # Get all token accounts for the mint
+    result = await solana_client._make_request("getProgramAccounts", [
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token program ID
+        {
+            "filters": [
+                {
+                    "dataSize": 165  # Size of token account data
+                },
+                {
+                    "memcmp": {
+                        "offset": 0,
+                        "bytes": token_address
+                    }
+                }
+            ],
+            "encoding": "jsonParsed"
+        }
+    ])
+    
+    # Process the accounts
+    holders = []
+    
+    for account in result:
+        try:
+            parsed_info = account.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
+            owner = parsed_info.get('owner')
+            amount_str = parsed_info.get('tokenAmount', {}).get('amount', '0')
+            
+            # Skip empty accounts
+            if amount_str == '0':
+                continue
+                
+            amount = Decimal(amount_str)
+            
+            holders.append({
+                'owner': owner,
+                'amount': amount,
+                'address': account.get('pubkey')
+            })
+        except (KeyError, TypeError) as e:
+            continue
+            
+    # Sort holders by amount (descending) and limit to top holders
+    holders.sort(key=lambda x: x['amount'], reverse=True)
+    return holders[:limit]
+
+
+async def get_wallet_tokens_for_owner(owner_address: str, solana_client: SolanaClient) -> List[Dict[str, Any]]:
+    """Get all tokens owned by a wallet.
+    
+    Args:
+        owner_address: Owner address
+        solana_client: Solana client
+        
+    Returns:
+        List of tokens
+    """
+    # Get native SOL balance
+    sol_balance_response = await solana_client.get_balance(owner_address)
+    sol_balance = Decimal(sol_balance_response) / Decimal(10**9)  # SOL has 9 decimals
+    
+    # Get token accounts owned by the wallet
+    token_accounts = await solana_client.get_token_accounts_by_owner(owner_address)
+    
+    # Initialize with SOL
+    balances = [
+        {
+            'token': 'SOL',
+            'mint': 'So11111111111111111111111111111111111111112',  # Native SOL mint
+            'amount': str(sol_balance),
+            'decimals': 9
+        }
+    ]
+    
+    # Process all token accounts
+    for account in token_accounts:
+        try:
+            account_data = account.get("data", {})
+            if not account_data or not isinstance(account_data, dict):
+                continue
+                
+            parsed_data = account_data.get("parsed", {})
+            info = parsed_data.get("info", {})
+            
+            mint = info.get("mint")
+            token_amount = info.get("tokenAmount", {})
+            amount = token_amount.get("amount", "0")
+            decimals = token_amount.get("decimals", 0)
+            
+            # Skip empty accounts
+            if amount == "0":
+                continue
+            
+            # Calculate actual token amount
+            token_amount_decimal = Decimal(amount) / Decimal(10 ** decimals)
+            
+            balances.append({
+                'token': mint[:6],  # Use first 6 chars as shorthand
+                'mint': mint,
+                'amount': str(token_amount_decimal),
+                'decimals': decimals
+            })
+        except (KeyError, TypeError) as e:
+            continue
+            
+    return balances
+
+
+# Add the REST API endpoint functions
+async def rest_whale_detector(request):
+    """REST API endpoint for detecting whale wallets."""
+    try:
+        body = await request.json()
+    except:
+        return JSONResponse({
+            "error": "Invalid JSON body",
+            "error_explanation": "The request body must be valid JSON"
+        }, status_code=400)
+    
+    token_address = body.get("token_address")
+    
+    if not token_address:
+        return JSONResponse({
+            "error": "Missing token_address parameter",
+            "error_explanation": "Please provide a token_address in the request body"
+        }, status_code=400)
+    
+    solana_client = request.app.state.solana_client
+    result = await detect_whale_wallets(token_address, solana_client)
+    
+    # Return error status code if result contains an error
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    
+    return JSONResponse(result)
+
+
+async def rest_fresh_wallet_detector(request):
+    """REST API endpoint for detecting fresh wallets."""
+    try:
+        body = await request.json()
+    except:
+        return JSONResponse({
+            "error": "Invalid JSON body",
+            "error_explanation": "The request body must be valid JSON"
+        }, status_code=400)
+    
+    token_address = body.get("token_address")
+    
+    if not token_address:
+        return JSONResponse({
+            "error": "Missing token_address parameter",
+            "error_explanation": "Please provide a token_address in the request body"
+        }, status_code=400)
+    
+    solana_client = request.app.state.solana_client
+    result = await detect_fresh_wallets(token_address, solana_client)
+    
+    # Return error status code if result contains an error
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    
+    return JSONResponse(result)
 
 
 # Add a new function for starting the cleanup task
