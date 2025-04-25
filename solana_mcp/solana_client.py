@@ -351,10 +351,14 @@ class SolanaClient:
         if not validate_public_key(account):
             raise InvalidPublicKeyError(account)
             
-        return await self._make_request(
-            "getAccountInfo", 
-            [account, {"encoding": encoding}]
-        )
+        # Import here to avoid circular import issues
+        from solana_mcp.clients.account_client import AccountClient
+        
+        # Create an AccountClient instance with the same config
+        account_client = AccountClient(self.config)
+        
+        # Delegate to the AccountClient implementation
+        return await account_client.get_account_info(account, encoding)
     
     async def get_balance(self, account: str) -> int:
         """Get account balance.
@@ -371,7 +375,14 @@ class SolanaClient:
         if not validate_public_key(account):
             raise InvalidPublicKeyError(account)
             
-        return await self._make_request("getBalance", [account])
+        # Import here to avoid circular import issues
+        from solana_mcp.clients.account_client import AccountClient
+        
+        # Create an AccountClient instance with the same config
+        account_client = AccountClient(self.config)
+        
+        # Delegate to the AccountClient implementation
+        return await account_client.get_balance(account)
     
     async def get_token_accounts_by_owner(
         self, 
@@ -433,10 +444,14 @@ class SolanaClient:
         if not re.match(r"^[1-9A-HJ-NP-Za-km-z]{43,128}$", signature):
             raise ValueError(f"Invalid transaction signature format: {signature}")
         
-        return await self._make_request(
-            "getTransaction", 
-            [signature, {"encoding": "json"}]
-        )
+        # Import here to avoid circular import issues
+        from solana_mcp.clients.transaction_client import TransactionClient
+        
+        # Create a TransactionClient instance with the same config
+        transaction_client = TransactionClient(self.config)
+        
+        # Delegate to the TransactionClient implementation
+        return await transaction_client.get_transaction(signature)
     
     async def get_program_accounts(
         self, 
@@ -464,17 +479,20 @@ class SolanaClient:
         if not validate_public_key(program_id):
             raise InvalidPublicKeyError(program_id)
             
-        params = [program_id, {"encoding": encoding}]
-        if filters:
-            params[1]["filters"] = filters
-            
-        # Add pagination if specified
-        if limit is not None:
-            params[1]["limit"] = limit
-        if offset is not None:
-            params[1]["offset"] = offset
+        # Import here to avoid circular import issues
+        from solana_mcp.clients.account_client import AccountClient
         
-        return await self._make_request("getProgramAccounts", params)
+        # Create an AccountClient instance with the same config
+        account_client = AccountClient(self.config)
+        
+        # Delegate to the AccountClient implementation
+        return await account_client.get_program_accounts(
+            program_id, 
+            filters=filters, 
+            encoding=encoding, 
+            limit=limit, 
+            offset=offset
+        )
     
     async def get_recent_blockhash(self) -> Dict[str, Any]:
         """Get a recent blockhash.
@@ -500,42 +518,14 @@ class SolanaClient:
         if not validate_public_key(mint):
             raise InvalidPublicKeyError(mint)
         
-        # Set default supply info
-        default_supply_info = {
-            "mint": mint,
-            "amount": "0",
-            "decimals": 0,
-            "uiAmount": 0.0,
-            "uiAmountString": "0"
-        }
+        # Import here to avoid circular import issues
+        from solana_mcp.clients.token_client import TokenClient
         
-        try:
-            logger.debug(f"Fetching token supply for mint: {mint}")
-            
-            # Direct RPC call to get token supply
-            response = await self._make_request("getTokenSupply", [mint])
-            
-            # Check if we got a valid response
-            if not response or "value" not in response:
-                logger.warning(f"No supply info found for mint: {mint}")
-                return default_supply_info
-            
-            # Return the value directly, which should contain amount, decimals, etc.
-            supply_data = response["value"]
-            
-            # Ensure the response includes expected fields
-            if "amount" not in supply_data or "decimals" not in supply_data:
-                logger.warning(f"Invalid supply data format for {mint}: {supply_data}")
-                return default_supply_info
-                
-            return {
-                "mint": mint,
-                **supply_data
-            }
-            
-        except Exception as e:
-            logger.error(f"Error fetching token supply for {mint}: {str(e)}")
-            return {**default_supply_info, "error": str(e)}
+        # Create a TokenClient instance with the same config
+        token_client = TokenClient(self.config)
+        
+        # Delegate to the TokenClient implementation
+        return await token_client.get_token_supply(mint)
     
     async def get_signatures_for_address(
         self,
@@ -561,15 +551,18 @@ class SolanaClient:
         if not validate_public_key(address):
             raise InvalidPublicKeyError(address)
             
-        options: Dict[str, Any] = {"limit": limit}
-        if before:
-            options["before"] = before
-        if until:
-            options["until"] = until
-            
-        return await self._make_request(
-            "getSignaturesForAddress",
-            [address, options]
+        # Import here to avoid circular import issues
+        from solana_mcp.clients.account_client import AccountClient
+        
+        # Create an AccountClient instance with the same config
+        account_client = AccountClient(self.config)
+        
+        # Delegate to the AccountClient implementation
+        return await account_client.get_signatures_for_address(
+            address, 
+            before=before, 
+            until=until,
+            limit=limit
         )
     
     async def get_token_accounts_by_delegate(
@@ -628,7 +621,14 @@ class SolanaClient:
         if not validate_public_key(mint):
             raise InvalidPublicKeyError(mint)
             
-        return await self._make_request("getTokenLargestAccounts", [mint])
+        # Import here to avoid circular import issues
+        from solana_mcp.clients.token_client import TokenClient
+        
+        # Create a TokenClient instance with the same config
+        token_client = TokenClient(self.config)
+        
+        # Delegate to the TokenClient implementation
+        return await token_client.get_token_largest_accounts(mint)
     
     async def get_block(self, slot: int) -> Dict[str, Any]:
         """Get information about a block.
@@ -639,10 +639,14 @@ class SolanaClient:
         Returns:
             Block information
         """
-        return await self._make_request(
-            "getBlock",
-            [slot, {"encoding": "json", "transactionDetails": "full", "rewards": True}]
-        )
+        # Import here to avoid circular import issues
+        from solana_mcp.clients.transaction_client import TransactionClient
+        
+        # Create a TransactionClient instance with the same config
+        transaction_client = TransactionClient(self.config)
+        
+        # Delegate to the TransactionClient implementation
+        return await transaction_client.get_block(slot)
     
     async def get_blocks(
         self, 
@@ -660,13 +664,14 @@ class SolanaClient:
         Returns:
             List of block slots
         """
-        params = [start_slot]
-        if end_slot is not None:
-            params.append(end_slot)
-        if commitment:
-            params.append({"commitment": commitment})
+        # Import here to avoid circular import issues
+        from solana_mcp.clients.transaction_client import TransactionClient
         
-        return await self._make_request("getBlocks", params)
+        # Create a TransactionClient instance with the same config
+        transaction_client = TransactionClient(self.config)
+        
+        # Delegate to the TransactionClient implementation
+        return await transaction_client.get_blocks(start_slot, end_slot, commitment)
     
     async def get_cluster_nodes(self) -> List[Dict[str, Any]]:
         """Get information about all the nodes participating in the cluster.

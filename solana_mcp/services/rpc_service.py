@@ -211,10 +211,18 @@ class RPCService(BaseService):
         if not self._validate_public_key(account):
             raise ValidationError(f"Invalid account address: {account}")
             
-        return await self.make_request(
-            "getAccountInfo", 
-            [account, {"encoding": encoding}]
-        )
+        # Import AccountClient to use the centralized implementation
+        from solana_mcp.clients.account_client import AccountClient
+        
+        # Create an AccountClient with appropriate configuration
+        account_client = AccountClient(rpc_url=self.rpc_url, timeout=self.timeout)
+        
+        try:
+            # Delegate to the AccountClient implementation
+            return await account_client.get_account_info(account, encoding)
+        finally:
+            # Clean up the client
+            await account_client.close()
     
     @handle_errors()
     async def get_balance(self, account: str) -> int:
@@ -230,7 +238,18 @@ class RPCService(BaseService):
         if not self._validate_public_key(account):
             raise ValidationError(f"Invalid account address: {account}")
             
-        return await self.make_request("getBalance", [account])
+        # Import AccountClient to use the centralized implementation
+        from solana_mcp.clients.account_client import AccountClient
+        
+        # Create an AccountClient with appropriate configuration
+        account_client = AccountClient(rpc_url=self.rpc_url, timeout=self.timeout)
+        
+        try:
+            # Delegate to the AccountClient implementation
+            return await account_client.get_balance(account)
+        finally:
+            # Clean up the client
+            await account_client.close()
     
     @handle_errors()
     async def get_token_accounts_by_owner(
@@ -286,8 +305,19 @@ class RPCService(BaseService):
         """
         if not self._validate_public_key(mint):
             raise ValidationError(f"Invalid mint address: {mint}")
-            
-        return await self.make_request("getTokenSupply", [mint])
+        
+        # Import TokenClient to use the centralized implementation
+        from solana_mcp.clients.token_client import TokenClient
+        
+        # Create a TokenClient with appropriate configuration
+        token_client = TokenClient(rpc_url=self.rpc_url, timeout=self.timeout)
+        
+        try:
+            # Delegate to the TokenClient implementation
+            return await token_client.get_token_supply(mint)
+        finally:
+            # Clean up the client
+            await token_client.close()
     
     @handle_errors()
     async def get_token_largest_accounts(self, mint: str) -> List[Dict[str, Any]]:
@@ -303,7 +333,18 @@ class RPCService(BaseService):
         if not self._validate_public_key(mint):
             raise ValidationError(f"Invalid mint address: {mint}")
             
-        return await self.make_request("getTokenLargestAccounts", [mint])
+        # Import TokenClient to use the centralized implementation
+        from solana_mcp.clients.token_client import TokenClient
+        
+        # Create a TokenClient with appropriate configuration
+        token_client = TokenClient(rpc_url=self.rpc_url, timeout=self.timeout)
+        
+        try:
+            # Delegate to the TokenClient implementation
+            return await token_client.get_token_largest_accounts(mint)
+        finally:
+            # Clean up the client
+            await token_client.close()
     
     @handle_errors()
     async def get_token_metadata(self, mint: str) -> Dict[str, Any]:
@@ -357,17 +398,24 @@ class RPCService(BaseService):
         if not self._validate_public_key(program_id):
             raise ValidationError(f"Invalid program ID: {program_id}")
             
-        config = {"encoding": encoding}
-        if filters:
-            config["filters"] = filters
+        # Import AccountClient to use the centralized implementation
+        from solana_mcp.clients.account_client import AccountClient
         
-        # Implement pagination for large result sets if needed
-        if limit is not None and limit > 0:
-            config["limit"] = limit
-        if offset is not None and offset >= 0:
-            config["offset"] = offset
-            
-        return await self.make_request("getProgramAccounts", [program_id, config])
+        # Create an AccountClient with appropriate configuration
+        account_client = AccountClient(rpc_url=self.rpc_url, timeout=self.timeout)
+        
+        try:
+            # Delegate to the AccountClient implementation
+            return await account_client.get_program_accounts(
+                program_id, 
+                filters=filters, 
+                encoding=encoding, 
+                limit=limit, 
+                offset=offset
+            )
+        finally:
+            # Clean up the client
+            await account_client.close()
     
     @handle_errors()
     async def get_signatures_for_address(
@@ -390,11 +438,22 @@ class RPCService(BaseService):
         if not self._validate_public_key(address):
             raise ValidationError(f"Invalid address: {address}")
             
-        config = {"limit": limit}
-        if before:
-            config["before"] = before
-            
-        return await self.make_request("getSignaturesForAddress", [address, config])
+        # Import AccountClient to use the centralized implementation
+        from solana_mcp.clients.account_client import AccountClient
+        
+        # Create an AccountClient with appropriate configuration
+        account_client = AccountClient(rpc_url=self.rpc_url, timeout=self.timeout)
+        
+        try:
+            # Delegate to the AccountClient implementation
+            return await account_client.get_signatures_for_address(
+                address, 
+                before=before,
+                limit=limit
+            )
+        finally:
+            # Clean up the client
+            await account_client.close()
     
     @handle_errors()
     async def get_transaction(self, signature: str) -> Dict[str, Any]:
@@ -407,10 +466,18 @@ class RPCService(BaseService):
         Returns:
             Transaction details
         """
-        return await self.make_request(
-            "getTransaction", 
-            [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
-        )
+        # Import TransactionClient to use the centralized implementation
+        from solana_mcp.clients.transaction_client import TransactionClient
+        
+        # Create a TransactionClient with appropriate configuration
+        transaction_client = TransactionClient(rpc_url=self.rpc_url, timeout=self.timeout)
+        
+        try:
+            # Delegate to the TransactionClient implementation
+            return await transaction_client.get_transaction(signature)
+        finally:
+            # Clean up the client
+            await transaction_client.close()
     
     def _validate_public_key(self, pubkey: str) -> bool:
         """

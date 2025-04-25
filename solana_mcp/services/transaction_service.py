@@ -44,18 +44,32 @@ class TransactionService(BaseService):
             if cached_tx:
                 return cached_tx
         
-        # Get transaction details
-        tx = await self.execute_with_fallback(
-            self.client.get_transaction(signature),
-            fallback_value=None,
-            error_message=f"Error fetching transaction {signature}"
+        # Import TransactionClient to use the centralized implementation
+        from solana_mcp.clients.transaction_client import TransactionClient
+        
+        # Create a TransactionClient with appropriate configuration
+        transaction_client = TransactionClient(
+            # Pass the same configuration the client would have
+            rpc_url=self.client.config.rpc_url if hasattr(self.client, 'config') else None,
+            timeout=self.timeout
         )
         
-        if tx and self.cache:
-            # Cache for a long time since transactions are immutable
-            self.cache.set(f"tx:{signature}", tx, ttl=3600)
+        try:
+            # Get transaction details using TransactionClient
+            tx = await self.execute_with_fallback(
+                transaction_client.get_transaction(signature),
+                fallback_value=None,
+                error_message=f"Error fetching transaction {signature}"
+            )
             
-        return tx
+            if tx and self.cache:
+                # Cache for a long time since transactions are immutable
+                self.cache.set(f"tx:{signature}", tx, ttl=3600)
+                
+            return tx
+        finally:
+            # Clean up the client
+            await transaction_client.close()
     
     @validate_solana_key
     async def get_transactions_for_address(
@@ -196,55 +210,28 @@ class TransactionService(BaseService):
         if not transaction:
             return {}
             
+        # Import TransactionClient to use the centralized implementation
+        from solana_mcp.clients.transaction_client import TransactionClient
+        
+        # Create a TransactionClient with appropriate configuration
+        transaction_client = TransactionClient(
+            # Pass the same configuration the client would have
+            rpc_url=self.client.config.rpc_url if hasattr(self.client, 'config') else None,
+            timeout=self.timeout
+        )
+        
         try:
-            # Extract basic transaction info
-            result = {
-                "signature": transaction.get("transaction", {}).get("signatures", [""])[0],
-                "slot": transaction.get("slot"),
-                "block_time": transaction.get("blockTime"),
-                "recent_block_hash": transaction.get("transaction", {}).get("message", {}).get("recentBlockhash"),
-                "fee": transaction.get("meta", {}).get("fee"),
-                "status": "success" if not transaction.get("meta", {}).get("err") else "failed",
-                "error": transaction.get("meta", {}).get("err"),
-            }
-            
-            # Extract instructions if available
-            instructions = []
-            if "transaction" in transaction and "message" in transaction["transaction"]:
-                message = transaction["transaction"]["message"]
-                
-                # Get accounts
-                accounts = message.get("accountKeys", [])
-                result["accounts"] = accounts
-                
-                # Parse instructions
-                for idx, instr in enumerate(message.get("instructions", [])):
-                    program_id_idx = instr.get("programIdIndex")
-                    program_id = accounts[program_id_idx] if program_id_idx is not None and program_id_idx < len(accounts) else None
-                    
-                    instruction = {
-                        "program_id": program_id,
-                        "accounts": [accounts[i] for i in instr.get("accounts", []) if i < len(accounts)],
-                        "data": instr.get("data"),
-                    }
-                    
-                    # Add some basic instruction type detection
-                    if program_id:
-                        # Here we could add specific parsing logic based on program IDs
-                        # For common programs like Token Program, System Program, etc.
-                        instruction["program_name"] = self._get_program_name(program_id)
-                    
-                    instructions.append(instruction)
-            
-            result["instructions"] = instructions
-            return result
-            
+            # Use TransactionClient's parse_transaction implementation
+            return await transaction_client.parse_transaction(transaction)
         except Exception as e:
             self.logger.error(f"Error parsing transaction: {str(e)}", exc_info=True)
             return {
                 "signature": transaction.get("transaction", {}).get("signatures", [""])[0] if transaction else "",
                 "error": "Error parsing transaction data"
             }
+        finally:
+            # Clean up the client
+            await transaction_client.close()
     
     def _get_program_name(self, program_id: str) -> str:
         """Map program IDs to human-readable names.
