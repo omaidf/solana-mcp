@@ -1,279 +1,148 @@
-"""Caching functionality for Solana MCP server."""
+"""
+Caching system for Solana RPC responses to reduce load and improve performance.
+"""
 
-import asyncio
-import functools
-import json
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, TypeVar, cast
+import json
+import logging
+import asyncio
+from typing import Any, Dict, Callable, List, Optional, Union
+from functools import wraps
 
-# Type variable for function return type
-T = TypeVar('T')
+# Setup logging
+logger = logging.getLogger(__name__)
 
-@dataclass
-class CacheConfig:
-    """Configuration for the cache mechanism."""
+class RPCCache:
+    """In-memory cache for RPC call results with time-based expiration."""
     
-    # Whether caching is enabled
-    enabled: bool = True
-    
-    # Default TTL in seconds
-    default_ttl: int = 30
-    
-    # TTLs for specific data types (in seconds)
-    ttls: Dict[str, int] = None
-    
-    # Maximum memory cache size (item count)
-    max_items: int = 10000
-    
-    def __post_init__(self):
-        """Initialize default TTLs if not provided."""
-        if self.ttls is None:
-            self.ttls = {
-                # Account data generally doesn't change that often
-                "account": 60,
-                # NFT metadata rarely changes
-                "metadata": 3600,
-                # Balance changes frequently
-                "balance": 10,
-                # Transaction data is immutable
-                "transaction": 3600,
-                # Token supply doesn't change often
-                "token_supply": 300,
-                # Network data changes frequently
-                "network": 10,
-                # Program data rarely changes
-                "program": 600,
-                # Block data is immutable
-                "block": 3600
-            }
-
-
-class MemoryCache:
-    """Simple in-memory cache with TTL support."""
-    
-    def __init__(self, config: CacheConfig = None):
-        """Initialize the cache.
+    def __init__(self, default_ttl: int = 300):
+        """Initialize the cache with a default time-to-live.
         
         Args:
-            config: Cache configuration. Defaults to default config.
+            default_ttl: Default cache TTL in seconds (default: 5 minutes)
         """
-        self.config = config or CacheConfig()
-        self._cache: Dict[str, Dict[str, Any]] = {}
-        self._cleanup_task = None
+        self.cache = {}  # type: Dict[str, Dict[str, Any]]
+        self.default_ttl = default_ttl
+        self.locks = {}  # Per-key locks to prevent thundering herd
     
-    def start_cleanup_task(self):
-        """Start the background cleanup task."""
-        if self._cleanup_task is None:
-            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-    
-    async def _cleanup_loop(self):
-        """Periodically clean up expired cache entries."""
-        while True:
-            try:
-                self._cleanup()
-                # Run cleanup every 30 seconds
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                # Log the error but don't crash the task
-                await asyncio.sleep(60)  # Longer delay on error
-    
-    def _cleanup(self):
-        """Remove expired cache entries."""
-        current_time = time.time()
-        keys_to_remove = []
-        
-        for key, entry in self._cache.items():
-            if entry["expires_at"] < current_time:
-                keys_to_remove.append(key)
-        
-        for key in keys_to_remove:
-            self._cache.pop(key, None)
-        
-        # If we're over the max items limit, remove oldest entries
-        if len(self._cache) > self.config.max_items:
-            # Sort by expiration time (oldest first)
-            sorted_keys = sorted(
-                self._cache.keys(), 
-                key=lambda k: self._cache[k]["expires_at"]
-            )
-            # Remove oldest entries until we're under the limit
-            for key in sorted_keys[:len(self._cache) - self.config.max_items]:
-                self._cache.pop(key, None)
-    
-    def get(self, key: str) -> Optional[Any]:
-        """Get a value from the cache.
+    async def get_or_fetch(self, cache_key: str, fetch_func: Callable, ttl: Optional[int] = None) -> Any:
+        """Get data from cache or fetch using the provided function.
         
         Args:
-            key: The cache key
+            cache_key: Unique key for identifying the cached data
+            fetch_func: Async function to call if cache miss
+            ttl: Time-to-live in seconds (defaults to self.default_ttl)
             
         Returns:
-            The cached value, or None if not found or expired
+            Cached data or freshly fetched data
         """
-        if not self.config.enabled:
-            return None
-            
-        entry = self._cache.get(key)
-        if entry is None:
-            return None
-            
-        # Check if expired
-        if entry["expires_at"] < time.time():
-            self._cache.pop(key, None)
-            return None
-            
-        return entry["value"]
-    
-    def set(self, key: str, value: Any, ttl: int = None, category: str = None):
-        """Set a value in the cache.
+        ttl = ttl or self.default_ttl
+        now = time.time()
         
-        Args:
-            key: The cache key
-            value: The value to cache
-            ttl: Time to live in seconds. Defaults to category or default TTL.
-            category: Data category for determining TTL. Defaults to None.
-        """
-        if not self.config.enabled:
-            return
+        # Check if we have a valid cached entry
+        if cache_key in self.cache and (now - self.cache[cache_key]['timestamp'] < ttl):
+            logger.debug(f"Cache hit for key: {cache_key}")
+            return self.cache[cache_key]['data']
+        
+        # Acquire a lock for this key to prevent multiple fetches
+        if cache_key not in self.locks:
+            self.locks[cache_key] = asyncio.Lock()
+        
+        async with self.locks[cache_key]:
+            # Check again in case another request fetched while we were waiting
+            if cache_key in self.cache and (now - self.cache[cache_key]['timestamp'] < ttl):
+                logger.debug(f"Cache hit after lock for key: {cache_key}")
+                return self.cache[cache_key]['data']
             
-        # Determine TTL
-        if ttl is None:
-            if category and category in self.config.ttls:
-                ttl = self.config.ttls[category]
-            else:
-                ttl = self.config.default_ttl
-                
-        # Set the cache entry
-        self._cache[key] = {
-            "value": value,
-            "expires_at": time.time() + ttl,
-            "category": category
-        }
+            # Fetch fresh data
+            logger.debug(f"Cache miss for key: {cache_key}, fetching fresh data")
+            try:
+                data = await fetch_func()
+                self.cache[cache_key] = {
+                    'data': data,
+                    'timestamp': time.time()
+                }
+                return data
+            except Exception as e:
+                logger.error(f"Error fetching data for key {cache_key}: {str(e)}")
+                # If we have stale data, return it rather than failing
+                if cache_key in self.cache:
+                    logger.warning(f"Returning stale data for key: {cache_key}")
+                    self.cache[cache_key]['stale'] = True
+                    return self.cache[cache_key]['data']
+                raise
     
-    def invalidate(self, key: str):
+    def invalidate(self, cache_key: str) -> None:
         """Invalidate a specific cache entry.
         
         Args:
-            key: The cache key to invalidate
+            cache_key: The key to invalidate
         """
-        self._cache.pop(key, None)
+        if cache_key in self.cache:
+            del self.cache[cache_key]
+            logger.debug(f"Invalidated cache key: {cache_key}")
     
-    def invalidate_by_prefix(self, prefix: str):
-        """Invalidate all cache entries with keys starting with the prefix.
-        
-        Args:
-            prefix: The key prefix
-        """
-        keys_to_remove = [k for k in self._cache.keys() if k.startswith(prefix)]
-        for key in keys_to_remove:
-            self._cache.pop(key, None)
-    
-    def invalidate_by_category(self, category: str):
-        """Invalidate all cache entries of a specific category.
-        
-        Args:
-            category: The category to invalidate
-        """
-        keys_to_remove = [
-            k for k, v in self._cache.items() 
-            if v.get("category") == category
-        ]
-        for key in keys_to_remove:
-            self._cache.pop(key, None)
-    
-    def clear(self):
+    def clear(self) -> None:
         """Clear the entire cache."""
-        self._cache.clear()
-    
-    def stop(self):
-        """Stop the cache cleanup task."""
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            self._cleanup_task = None
+        self.cache.clear()
+        logger.debug("Cleared entire cache")
+
+    def cleanup(self) -> None:
+        """Remove expired entries from the cache."""
+        now = time.time()
+        expired_keys = [
+            key for key, value in self.cache.items()
+            if now - value['timestamp'] > self.default_ttl
+        ]
+        
+        for key in expired_keys:
+            del self.cache[key]
+        
+        if expired_keys:
+            logger.debug(f"Cleaned up {len(expired_keys)} expired cache entries")
 
 
-# Global memory cache instance
-_memory_cache = MemoryCache()
-
-
-def get_cache() -> MemoryCache:
-    """Get the global memory cache instance.
-    
-    Returns:
-        The memory cache instance
-    """
-    return _memory_cache
-
-
-def cache(ttl: int = None, category: str = None, key_builder: Callable = None):
-    """Decorator for caching function results.
+def cached(ttl: int = None):
+    """Decorator to cache results of async functions.
     
     Args:
-        ttl: Time to live in seconds. Defaults to category default.
-        category: Data category for TTL. Defaults to None.
-        key_builder: Function to build cache key. Defaults to args-based key.
+        ttl: Optional cache TTL in seconds
         
     Returns:
         Decorated function
     """
     def decorator(func):
-        @functools.wraps(func)
+        # Create a cache instance specific to this function
+        func_cache = RPCCache(default_ttl=ttl or 300)
+        
+        @wraps(func)
         async def wrapper(*args, **kwargs):
-            if not _memory_cache.config.enabled:
-                return await func(*args, **kwargs)
-                
-            # Build cache key
-            if key_builder:
-                cache_key = key_builder(*args, **kwargs)
-            else:
-                # Default key is function name + args + kwargs
-                key_parts = [func.__module__, func.__name__]
-                
-                # Add args (excluding self/cls for methods)
-                if args:
-                    if hasattr(args[0], '__dict__'):
-                        # Skip self/cls
-                        arg_part = json.dumps([str(a) for a in args[1:]])
-                    else:
-                        arg_part = json.dumps([str(a) for a in args])
-                    key_parts.append(arg_part)
-                
-                # Add kwargs
-                if kwargs:
-                    kwargs_part = json.dumps(
-                        {k: str(v) for k, v in sorted(kwargs.items())}
-                    )
-                    key_parts.append(kwargs_part)
-                
-                cache_key = ":".join(key_parts)
+            # Create a cache key from function name and arguments
+            # Exclude 'self' from the key if it's a method
+            arg_key = []
+            for i, arg in enumerate(args):
+                if i == 0 and hasattr(args[0], '__dict__'):
+                    # Skip 'self' for methods
+                    continue
+                arg_key.append(str(arg))
             
-            # Check cache
-            cached_value = _memory_cache.get(cache_key)
-            if cached_value is not None:
-                return cached_value
-                
-            # Call function and cache result
-            result = await func(*args, **kwargs)
-            _memory_cache.set(cache_key, result, ttl=ttl, category=category)
-            return result
+            # Add kwargs to the cache key
+            for k, v in sorted(kwargs.items()):
+                arg_key.append(f"{k}={v}")
             
+            cache_key = f"{func.__module__}.{func.__name__}:{':'.join(arg_key)}"
+            
+            # Get or fetch the result
+            return await func_cache.get_or_fetch(
+                cache_key,
+                lambda: func(*args, **kwargs)
+            )
+        
+        # Add a reference to the cache instance
+        wrapper.cache = func_cache
         return wrapper
+    
     return decorator
 
-
-def init_cache(config: CacheConfig = None):
-    """Initialize the cache with provided configuration.
-    
-    Args:
-        config: Cache configuration. Defaults to default config.
-    """
-    global _memory_cache
-    _memory_cache = MemoryCache(config or CacheConfig())
-    _memory_cache.start_cleanup_task()
-
-
-def shutdown_cache():
-    """Shutdown the cache and cleanup tasks."""
-    _memory_cache.stop() 
+# Create a global cache instance
+global_cache = RPCCache() 

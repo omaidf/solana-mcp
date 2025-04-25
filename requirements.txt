@@ -1,19 +1,31 @@
-anyio
-base58
-cachetools
-click
-colorama
-fastapi
-httpx
-itsdangerous
-mcp
-prometheus-client
-pydantic
-python-dotenv
-python-json-logger
-requests
-solana
-starlette
-structlog
-ujson
-uvicorn 
+# Core dependencies
+fastapi>=0.110.0
+uvicorn[standard]>=0.25.0
+starlette>=0.37.0
+pydantic>=2.0.0
+
+# HTTP client
+httpx>=0.25.0
+aiohttp>=3.9.1
+
+# Solana-specific
+solana>=0.30.2
+base58>=2.1.1
+
+# Utilities
+python-dotenv>=1.0.0
+ujson>=5.8.0
+structlog>=23.1.0
+python-json-logger>=2.0.7
+prometheus-client>=0.18.0
+
+# Testing (optional for production)
+pytest>=7.4.3
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+
+# Development tools (optional for production)
+black>=23.0.0
+isort>=5.12.0
+mypy>=1.8.0
+ruff>=0.1.0 

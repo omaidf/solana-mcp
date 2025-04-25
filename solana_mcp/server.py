@@ -6,12 +6,19 @@ import json
 import uuid
 import re
 import asyncio
+import subprocess
+import sys
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, AsyncIterator, Union, Tuple, Set
 import datetime
 import threading
 import logging
+import time
+from decimal import Decimal
+import random
+import requests
 
 from mcp.server.fastmcp import Context, FastMCP
 import mcp.types as types
@@ -32,16 +39,41 @@ from solana_mcp.solana_client import (
 from solana_mcp.semantic_search import (
     get_account_balance, get_account_details, get_token_accounts_for_owner,
     get_token_details, get_transaction_history_for_address, get_nft_details,
-    parse_natural_language_query, semantic_transaction_search
+    semantic_transaction_search
 )
 
+# Import the refactored modules
+from solana_mcp.nlp.parser import parse_natural_language_query
+from solana_mcp.nlp.formatter import format_response
+from solana_mcp.services.whale_detector.detector import detect_whale_wallets
+from solana_mcp.services.fresh_wallet.detector import detect_fresh_wallets
+
+# Import wallet classifier (internal module)
+from solana_mcp.wallet_classifier import WalletClassifier
+
 # Global session store with thread safety - replace the existing SESSION_STORE declaration
-_session_store_lock = threading.Lock()
-SESSION_STORE = {}
 _session_store_async_lock = asyncio.Lock()
+SESSION_STORE = {}
 SESSION_EXPIRY = 30  # Session expiry in minutes
+_cleanup_task = None  # Task for periodic cleanup
 
 logger = logging.getLogger(__name__)
+
+# Solana public key validation pattern (base58 format)
+PUBKEY_PATTERN = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+def validate_public_key(pubkey: str) -> bool:
+    """Validate a Solana public key.
+    
+    Args:
+        pubkey: The public key to validate
+        
+    Returns:
+        True if the public key is valid, False otherwise
+    """
+    if not pubkey or not isinstance(pubkey, str):
+        return False
+    return bool(PUBKEY_PATTERN.match(pubkey))
 
 @dataclass
 class Session:
@@ -105,33 +137,8 @@ class Session:
         return datetime.datetime.now() > expiry_time
 
 
-async def get_or_create_session_async(session_id: Optional[str] = None) -> Session:
-    """Get an existing session or create a new one with async support.
-    
-    Args:
-        session_id: Optional session ID
-        
-    Returns:
-        The session
-    """
-    # Clean expired sessions asynchronously
-    await clean_expired_sessions_async()
-    
-    async with _session_store_async_lock:
-        # Create new session if ID not provided or not found
-        if not session_id or session_id not in SESSION_STORE:
-            new_session = Session(id=str(uuid.uuid4()))
-            SESSION_STORE[new_session.id] = new_session
-            return new_session
-        
-        # Update access time for existing session
-        session = SESSION_STORE[session_id]
-        session.update_access_time()
-        return session
-
-
-def get_or_create_session(session_id: Optional[str] = None) -> Session:
-    """Get an existing session or create a new one (synchronous version).
+async def get_or_create_session(session_id: Optional[str] = None) -> Session:
+    """Get an existing session or create a new one.
     
     Args:
         session_id: Optional session ID
@@ -140,9 +147,9 @@ def get_or_create_session(session_id: Optional[str] = None) -> Session:
         The session
     """
     # Clean expired sessions
-    clean_expired_sessions()
+    await clean_expired_sessions()
     
-    with _session_store_lock:
+    async with _session_store_async_lock:
         # Create new session if ID not provided or not found
         if not session_id or session_id not in SESSION_STORE:
             new_session = Session(id=str(uuid.uuid4()))
@@ -155,8 +162,12 @@ def get_or_create_session(session_id: Optional[str] = None) -> Session:
         return session
 
 
-async def clean_expired_sessions_async():
-    """Remove expired sessions from the store (async version)."""
+async def clean_expired_sessions():
+    """Remove expired sessions from the store.
+    
+    Returns:
+        int: The number of sessions removed
+    """
     to_remove = []
     async with _session_store_async_lock:
         # First collect the expired sessions
@@ -167,32 +178,8 @@ async def clean_expired_sessions_async():
         # Then remove them - safer than modifying during iteration
         for session_id in to_remove:
             del SESSION_STORE[session_id]
-
-
-def clean_expired_sessions():
-    """Remove expired sessions from the store (sync version)."""
-    to_remove = []
-    with _session_store_lock:
-        # First collect the expired sessions
-        for session_id, session in SESSION_STORE.items():
-            if session.is_expired():
-                to_remove.append(session_id)
-        
-        # Then remove them - safer than modifying during iteration
-        for session_id in to_remove:
-            del SESSION_STORE[session_id]
-
-
-async def periodic_session_cleanup():
-    """Periodically clean up expired sessions."""
-    while True:
-        try:
-            await clean_expired_sessions_async()
-        except Exception as e:
-            print(f"Error cleaning sessions: {str(e)}")
-        
-        # Run cleanup every 5 minutes
-        await asyncio.sleep(300)
+            
+    return len(to_remove)
 
 
 @dataclass
@@ -212,19 +199,18 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     Yields:
         The application context.
     """
-    # Initialize resources, tasks and connections
+    # Initialize resources and connections
     solana_client = None
-    cleanup_task = None
     logger.info("Starting Solana MCP server lifespan...")
     
     try:
-        # Start session cleanup task
-        cleanup_task = asyncio.create_task(periodic_session_cleanup())
-        cleanup_task.set_name("session_cleanup")
-        
         # Initialize Solana client
         async with get_solana_client() as solana_client:
             logger.info("Solana client initialized successfully")
+            
+            # Start session cleanup task
+            await start_session_cleanup_task()
+            logger.info("Session management initialized")
             
             # Yield the application context
             yield AppContext(solana_client=solana_client)
@@ -236,18 +222,14 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     finally:
         logger.info("Cleaning up application resources...")
         
-        # Cancel cleanup task
-        if cleanup_task and not cleanup_task.done():
-            logger.info("Cancelling session cleanup task")
-            cleanup_task.cancel()
+        # Cancel the session cleanup task if it's running
+        if _cleanup_task is not None and not _cleanup_task.done():
+            _cleanup_task.cancel()
             try:
-                await cleanup_task
+                await _cleanup_task
             except asyncio.CancelledError:
                 pass
-            except Exception as e:
-                logger.error(f"Error during cleanup task cancellation: {str(e)}")
-        
-        # Close any other resources if needed
+            
         logger.info("Application shutdown complete")
 
 
@@ -262,6 +244,19 @@ app = FastMCP(
 # -------------------------------------------
 # Natural Language Query Processing
 # -------------------------------------------
+
+# Define common transaction types and their keywords for semantic search
+TRANSACTION_CATEGORIES = {
+    "token_transfer": ["transfer", "send", "receive", "spl-token", "token program"],
+    "nft_mint": ["mint", "nft", "metaplex", "metadata", "master edition"],
+    "nft_sale": ["sale", "marketplace", "auction", "bid", "offer", "purchase"],
+    "swap": ["swap", "exchange", "trade", "jupiter", "orca", "raydium"],
+    "stake": ["stake", "delegate", "staking", "validator", "withdraw stake"],
+    "system_transfer": ["system program", "sol transfer", "lamports"],
+    "vote": ["vote", "voting", "governance"],
+    "program_deploy": ["bpf loader", "deploy", "upgrade", "program"],
+    "failed": ["failed", "error", "rejected"]
+}
 
 # Basic patterns for NL query understanding
 QUERY_PATTERNS = [
@@ -301,8 +296,21 @@ QUERY_PATTERNS = [
         "intent": "get_nft_info",
         "params": lambda match: {"mint": match.group(1)}
     },
+    # Whale queries - Find whales (large holders) for a token
+    {
+        "pattern": r"(?:are there|are there any|do you see|can you find|any) (?:whales|whale|large holder|big investor|big wallet) (?:in|for|holding) (?:this token|this|token|mint)? ?([a-zA-Z0-9]{32,44})",
+        "intent": "get_token_whales",
+        "params": lambda match: {"mint": match.group(1)}
+    },
+    # Fresh wallet queries - Find new/fresh wallets for a token
+    {
+        "pattern": r"(?:are there|are there any|do you see|can you find|any) (?:fresh|new|recent|suspicious) (?:wallets|wallet|holder|holders|account|accounts) (?:in|for|holding) (?:this token|this|token|mint)? ?([a-zA-Z0-9]{32,44})",
+        "intent": "get_fresh_wallets",
+        "params": lambda match: {"mint": match.group(1)}
+    },
 ]
 
+# This function now delegates to the imported implementation
 async def parse_natural_language_query(query: str, solana_client: SolanaClient, session: Session = None) -> Dict[str, Any]:
     """Parse a natural language query into an API call.
     
@@ -314,113 +322,16 @@ async def parse_natural_language_query(query: str, solana_client: SolanaClient, 
     Returns:
         The query results
     """
-    # Input validation
-    if not query:
-        return {
-            "error": "Empty query",
-            "error_explanation": "Please provide a query about Solana blockchain data."
-        }
-    
-    # Normalize query
-    normalized_query = query.lower().strip()
-    
-    # Try to match against patterns
-    for pattern_info in QUERY_PATTERNS:
-        try:
-            match = re.search(pattern_info["pattern"], normalized_query)
-            if match:
-                intent = pattern_info["intent"]
-                params = pattern_info["params"](match)
-                
-                # Execute the intent
-                if intent == "get_balance":
-                    if not params.get("address"):
-                        return {"error": "Missing address", "error_explanation": "A valid Solana address is required."}
-                        
-                    result = await get_account_balance(params["address"], solana_client, format_level="auto")
-                    if session:
-                        session.add_query(query, result)
-                        session.update_context_for_entity("address", params["address"], {"last_balance_check": datetime.datetime.now().isoformat()})
-                    return result
-                
-                elif intent == "get_account_info":
-                    if not params.get("address"):
-                        return {"error": "Missing address", "error_explanation": "A valid Solana address is required."}
-                        
-                    result = await get_account_details(params["address"], solana_client, format_level="auto")
-                    if session:
-                        session.add_query(query, result)
-                        session.update_context_for_entity("address", params["address"], {"last_info_check": datetime.datetime.now().isoformat()})
-                    return result
-                
-                elif intent == "get_token_accounts":
-                    if not params.get("owner"):
-                        return {"error": "Missing owner address", "error_explanation": "A valid Solana address is required."}
-                        
-                    result = await get_token_accounts_for_owner(params["owner"], solana_client, format_level="auto")
-                    if session:
-                        session.add_query(query, result)
-                        session.update_context_for_entity("address", params["owner"], {"last_token_check": datetime.datetime.now().isoformat()})
-                    return result
-                
-                elif intent == "get_token_info":
-                    if not params.get("mint"):
-                        return {"error": "Missing token mint address", "error_explanation": "A valid token mint address is required."}
-                        
-                    result = await get_token_details(params["mint"], solana_client, format_level="auto")
-                    if session:
-                        session.add_query(query, result)
-                        session.update_context_for_entity("token", params["mint"], {"last_check": datetime.datetime.now().isoformat()})
-                    return result
-                
-                elif intent == "get_transactions":
-                    if not params.get("address"):
-                        return {"error": "Missing address", "error_explanation": "A valid Solana address is required."}
-                        
-                    result = await get_transaction_history_for_address(
-                        params["address"], 
-                        solana_client, 
-                        limit=params.get("limit", 20),
-                        format_level="auto"
-                    )
-                    if session:
-                        session.add_query(query, result)
-                        session.update_context_for_entity("address", params["address"], {"last_tx_check": datetime.datetime.now().isoformat()})
-                    return result
-                
-                elif intent == "get_nft_info":
-                    if not params.get("mint"):
-                        return {"error": "Missing NFT mint address", "error_explanation": "A valid NFT mint address is required."}
-                        
-                    result = await get_nft_details(params["mint"], solana_client, format_level="auto")
-                    if session:
-                        session.add_query(query, result)
-                        session.update_context_for_entity("nft", params["mint"], {"last_check": datetime.datetime.now().isoformat()})
-                    return result
-        except Exception as e:
-            # Handle parsing errors for each pattern
-            print(f"Error parsing query with pattern {pattern_info['pattern']}: {str(e)}")
-            continue
-    
-    # If no pattern matched, return error
-    return {
-        "error": "I couldn't understand your query. Please try rephrasing or use a more specific request.",
-        "error_explanation": "The query format wasn't recognized. Try following one of the supported formats.",
-        "supported_queries": [
-            "Get balance of [address]",
-            "Get information about [address]",
-            "Get tokens owned by [address]",
-            "Get information about token [mint]",
-            "Get transactions of [address]",
-            "Get NFT info [mint]"
-        ]
-    }
+    # This function has been moved to solana_mcp/nlp/parser.py
+    # Delegating to the imported implementation
+    return await parse_natural_language_query(query, solana_client, session)
 
 
 # -------------------------------------------
 # Context-Aware Response Formatting
 # -------------------------------------------
 
+# This function now delegates to the imported implementation
 def format_response(data: Any, format_level: str = "standard") -> Dict[str, Any]:
     """Format a response based on the requested detail level.
     
@@ -431,124 +342,9 @@ def format_response(data: Any, format_level: str = "standard") -> Dict[str, Any]
     Returns:
         Formatted response
     """
-    # Handle auto format level
-    if format_level == "auto":
-        # Simple heuristic - if data is large, use minimal
-        if isinstance(data, dict) and len(json.dumps(data)) > 1000:
-            format_level = "minimal"
-        else:
-            format_level = "standard"
-    
-    # Handle different format levels
-    if format_level == "minimal":
-        return create_minimal_format(data)
-    elif format_level == "detailed":
-        return create_detailed_format(data)
-    else:  # standard
-        return data
-
-
-def create_minimal_format(data: Any) -> Dict[str, Any]:
-    """Create a minimal format of the data.
-    
-    Args:
-        data: The data to format
-        
-    Returns:
-        Minimally formatted data
-    """
-    if not isinstance(data, dict):
-        return data
-    
-    # Extract key information based on data type
-    if "lamports" in data and "sol" in data:
-        # Balance data
-        return {
-            "sol": data.get("sol"),
-            "formatted": data.get("formatted")
-        }
-    elif "mint" in data and "supply" in data:
-        # Token data
-        return {
-            "mint": data.get("mint"),
-            "name": data.get("metadata", {}).get("name"),
-            "symbol": data.get("metadata", {}).get("symbol"),
-            "supply": data.get("supply", {}).get("uiAmount")
-        }
-    elif "transactions" in data and isinstance(data["transactions"], list):
-        # Transaction history
-        return {
-            "address": data.get("address"),
-            "transaction_count": len(data.get("transactions", [])),
-            "recent_transactions": [tx.get("signature") for tx in data.get("transactions", [])[:5]]
-        }
-    
-    # Default minimal extraction for any data
-    return {k: v for k, v in data.items() if k in ["address", "signature", "error"]}
-
-
-def create_detailed_format(data: Any) -> Dict[str, Any]:
-    """Create a detailed format of the data with additional information.
-    
-    Args:
-        data: The data to format
-        
-    Returns:
-        Detailed formatted data with explanations
-    """
-    if not isinstance(data, dict):
-        return {"data": data, "explanation": "Simple value returned"}
-    
-    # Add explanations based on data type
-    if "lamports" in data and "sol" in data:
-        # Balance data
-        data["explanation"] = "This shows the account balance in both lamports (smallest unit) and SOL."
-        data["context"] = {
-            "sol_usd_conversion": "Approximate USD value would require current market data."
-        }
-        return data
-    elif "mint" in data and "supply" in data:
-        # Token data
-        data["explanation"] = "This shows details about a Solana token, including its supply and metadata."
-        return data
-    elif "transactions" in data and isinstance(data["transactions"], list):
-        # Transaction history
-        data["explanation"] = f"Transaction history for address {data.get('address')}."
-        if len(data.get("transactions", [])) > 0:
-            data["recent_transaction_explanation"] = explain_transaction(data["transactions"][0])
-        return data
-    
-    # Default detailed format
-    return {
-        "data": data,
-        "explanation": "Detailed data structure returned from the Solana blockchain."
-    }
-
-
-def explain_transaction(tx_data: Dict[str, Any]) -> str:
-    """Create a natural language explanation of a transaction.
-    
-    Args:
-        tx_data: Transaction data
-        
-    Returns:
-        Human-readable explanation
-    """
-    # Extract key information
-    slot = tx_data.get("slot", "unknown")
-    confirmations = tx_data.get("confirmations", "unknown")
-    signature = tx_data.get("signature", "unknown")
-    
-    # Create basic explanation
-    explanation = f"Transaction {signature[:8]}... occurred at slot {slot} with {confirmations} confirmations."
-    
-    # Add status
-    if tx_data.get("confirmationStatus") == "finalized":
-        explanation += " It is finalized on the blockchain."
-    elif tx_data.get("err"):
-        explanation += " It failed with an error."
-    
-    return explanation
+    # This function has been moved to solana_mcp/nlp/formatter.py
+    # Delegating to the imported implementation
+    return format_response(data, format_level)
 
 
 # -------------------------------------------
@@ -568,6 +364,20 @@ async def get_account_balance(address: str, solana_client: SolanaClient, format_
     """
     try:
         balance_lamports = await solana_client.get_balance(address)
+        
+        # Handle case where balance might be returned as a dictionary rather than an integer
+        if isinstance(balance_lamports, dict) and "lamports" in balance_lamports:
+            # Extract the lamports value from the dictionary
+            balance_lamports = balance_lamports["lamports"]
+        elif isinstance(balance_lamports, dict) and "value" in balance_lamports:
+            # Alternative format sometimes returned
+            balance_lamports = balance_lamports["value"]
+            
+        # Ensure balance_lamports is an integer before division
+        if not isinstance(balance_lamports, (int, float)):
+            # If we can't determine the format, return an error
+            return {"error": "Invalid balance format returned", "error_explanation": f"Unexpected balance format: {type(balance_lamports)}"}
+            
         balance_sol = balance_lamports / 1_000_000_000  # Convert lamports to SOL
         
         data = {
@@ -599,17 +409,20 @@ async def get_account_details(address: str, solana_client: SolanaClient, format_
     try:
         account_info = await solana_client.get_account_info(address, encoding="jsonParsed")
         
-        # Add additional information
-        if account_info:
-            account_info["address"] = address
+        # Make sure account_info is a dictionary
+        if account_info is None:
+            account_info = {}
             
-            # Add owner program information if available
-            if "owner" in account_info:
-                owner = account_info["owner"]
-                if owner == TOKEN_PROGRAM_ID:
-                    account_info["owner_program"] = "Token Program"
-                elif owner == METADATA_PROGRAM_ID:
-                    account_info["owner_program"] = "Metadata Program"
+        # Always include the address in the response
+        account_info["address"] = address
+            
+        # Add owner program information if available
+        if "owner" in account_info:
+            owner = account_info["owner"]
+            if owner == TOKEN_PROGRAM_ID:
+                account_info["owner_program"] = "Token Program"
+            elif owner == METADATA_PROGRAM_ID:
+                account_info["owner_program"] = "Metadata Program"
         
         return format_response(account_info, format_level)
     except InvalidPublicKeyError as e:
@@ -712,15 +525,11 @@ async def get_transaction_history_for_address(
         Formatted transaction history
     """
     try:
-        # Get signatures
-        # Create options dictionary
-        options = {"limit": limit}
-        if before:
-            options["before"] = before
-            
+        # Get signatures - directly pass parameters in the correct order rather than using an options dict
         signatures = await solana_client.get_signatures_for_address(
             address,
-            options
+            before=before,  # Pass before parameter directly
+            limit=limit     # Pass limit parameter directly
         )
         
         result = {
@@ -807,7 +616,7 @@ async def rest_nlp_query(request):
         }, status_code=400)
     
     # Get or create session
-    session = get_or_create_session(session_id)
+    session = await get_or_create_session(session_id)
     
     # Check for semantic transaction search patterns
     transaction_search_patterns = [
@@ -1189,7 +998,7 @@ async def rest_chain_analysis(request):
     if analysis_type == "token_flow":
         # Analyze token inflows and outflows
         try:
-            # Get transaction history
+            # Get transaction history - pass parameters directly
             signatures = await solana_client.get_signatures_for_address(address, limit=50)
             
             # Process transactions to find token movements
@@ -1233,7 +1042,7 @@ async def rest_chain_analysis(request):
     elif analysis_type == "activity_pattern":
         # Analyze activity patterns over time
         try:
-            # Get transaction history
+            # Get transaction history - pass parameters directly
             signatures = await solana_client.get_signatures_for_address(address, limit=100)
             
             # Group by day
@@ -2348,181 +2157,224 @@ def explain_solana_error(error_message: str) -> str:
 
 async def api_docs(request):
     """API documentation endpoint"""
-    return JSONResponse({
+    api_paths = {
+        "/api/account/{address}": {
+            "get": {
+                "summary": "Get account information",
+                "parameters": [
+                    {
+                        "name": "address",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "description": "Solana account address"
+                    }
+                ]
+            }
+        },
+        "/api/balance/{address}": {
+            "get": {
+                "summary": "Get account balance",
+                "parameters": [
+                    {
+                        "name": "address",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "description": "Solana account address"
+                    }
+                ]
+            }
+        },
+        "/api/token/{mint}": {
+            "get": {
+                "summary": "Get token information",
+                "parameters": [
+                    {
+                        "name": "mint",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "description": "Token mint address"
+                    }
+                ]
+            }
+        },
+        "/api/transactions/{address}": {
+            "get": {
+                "summary": "Get transaction history",
+                "parameters": [
+                    {
+                        "name": "address",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "description": "Solana account address"
+                    },
+                    {
+                        "name": "limit",
+                        "in": "query",
+                        "schema": {"type": "integer"},
+                        "description": "Maximum number of transactions to return"
+                    },
+                    {
+                        "name": "before",
+                        "in": "query",
+                        "schema": {"type": "string"},
+                        "description": "Signature to search backwards from"
+                    },
+                    {
+                        "name": "search",
+                        "in": "query",
+                        "schema": {"type": "string"},
+                        "description": "Semantic search query for transactions"
+                    }
+                ]
+            }
+        },
+        "/api/nft/{mint}": {
+            "get": {
+                "summary": "Get NFT information",
+                "parameters": [
+                    {
+                        "name": "mint",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "description": "NFT mint address"
+                    }
+                ]
+            }
+        },
+        "/api/nlp/query": {
+            "post": {
+                "summary": "Process natural language queries about Solana",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {"type": "string"},
+                                    "format_level": {"type": "string", "enum": ["minimal", "standard", "detailed", "auto"]},
+                                    "session_id": {"type": "string"}
+                                },
+                                "required": ["query"]
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/session/{session_id}": {
+            "get": {
+                "summary": "Get session history",
+                "parameters": [
+                    {
+                        "name": "session_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "description": "Session ID"
+                    }
+                ]
+            }
+        },
+        "/api/schemas": {
+            "get": {
+                "summary": "Get all available schemas"
+            }
+        },
+        "/api/schemas/{schema}": {
+            "get": {
+                "summary": "Get schema for a specific data type",
+                "parameters": [
+                    {
+                        "name": "schema",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "description": "Schema name"
+                    }
+                ]
+            }
+        },
+        "/api/analysis": {
+            "post": {
+                "summary": "Analyze blockchain patterns",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["token_flow", "activity_pattern"]},
+                                    "address": {"type": "string"}
+                                },
+                                "required": ["type", "address"]
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/whale-detector": {
+            "post": {
+                "summary": "Find whale wallets for a specific token",
+                "description": "Identifies accounts holding significant amounts of a token and having high overall value",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "token_address": {"type": "string", "description": "Solana token mint address"}
+                                },
+                                "required": ["token_address"]
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/fresh-wallet-detector": {
+            "post": {
+                "summary": "Find fresh wallet holders for a specific token",
+                "description": "Identifies newly created wallets or wallets primarily holding only the target token",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "token_address": {"type": "string", "description": "Solana token mint address"}
+                                },
+                                "required": ["token_address"]
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/health": {
+            "get": {
+                "summary": "Health check endpoint"
+            }
+        }
+    }
+    
+    # Build final OpenAPI documentation
+    docs = {
         "openapi": "3.0.0",
         "info": {
             "title": "Solana MCP Server API",
-            "description": "API for interacting with Solana blockchain",
+            "description": "API for interacting with Solana blockchain, includes whale and fresh wallet detection",
             "version": "1.0.0"
         },
-        "paths": {
-            "/api/account/{address}": {
-                "get": {
-                    "summary": "Get account information",
-                    "parameters": [
-                        {
-                            "name": "address",
-                            "in": "path",
-                            "required": True,
-                            "schema": {"type": "string"},
-                            "description": "Solana account address"
-                        }
-                    ]
-                }
-            },
-            "/api/balance/{address}": {
-                "get": {
-                    "summary": "Get account balance",
-                    "parameters": [
-                        {
-                            "name": "address",
-                            "in": "path",
-                            "required": True,
-                            "schema": {"type": "string"},
-                            "description": "Solana account address"
-                        }
-                    ]
-                }
-            },
-            "/api/token/{mint}": {
-                "get": {
-                    "summary": "Get token information",
-                    "parameters": [
-                        {
-                            "name": "mint",
-                            "in": "path",
-                            "required": True,
-                            "schema": {"type": "string"},
-                            "description": "Token mint address"
-                        }
-                    ]
-                }
-            },
-            "/api/transactions/{address}": {
-                "get": {
-                    "summary": "Get transaction history",
-                    "parameters": [
-                        {
-                            "name": "address",
-                            "in": "path",
-                            "required": True,
-                            "schema": {"type": "string"},
-                            "description": "Solana account address"
-                        },
-                        {
-                            "name": "limit",
-                            "in": "query",
-                            "schema": {"type": "integer"},
-                            "description": "Maximum number of transactions to return"
-                        },
-                        {
-                            "name": "before",
-                            "in": "query",
-                            "schema": {"type": "string"},
-                            "description": "Signature to search backwards from"
-                        },
-                        {
-                            "name": "search",
-                            "in": "query",
-                            "schema": {"type": "string"},
-                            "description": "Semantic search query for transactions"
-                        }
-                    ]
-                }
-            },
-            "/api/nft/{mint}": {
-                "get": {
-                    "summary": "Get NFT information",
-                    "parameters": [
-                        {
-                            "name": "mint",
-                            "in": "path",
-                            "required": True,
-                            "schema": {"type": "string"},
-                            "description": "NFT mint address"
-                        }
-                    ]
-                }
-            },
-            "/api/nlp/query": {
-                "post": {
-                    "summary": "Process natural language queries about Solana",
-                    "requestBody": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "query": {"type": "string"},
-                                        "format_level": {"type": "string", "enum": ["minimal", "standard", "detailed", "auto"]},
-                                        "session_id": {"type": "string"}
-                                    },
-                                    "required": ["query"]
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/api/session/{session_id}": {
-                "get": {
-                    "summary": "Get session history",
-                    "parameters": [
-                        {
-                            "name": "session_id",
-                            "in": "path",
-                            "required": True,
-                            "schema": {"type": "string"},
-                            "description": "Session ID"
-                        }
-                    ]
-                }
-            },
-            "/api/schemas": {
-                "get": {
-                    "summary": "Get all available schemas"
-                }
-            },
-            "/api/schemas/{schema}": {
-                "get": {
-                    "summary": "Get schema for a specific data type",
-                    "parameters": [
-                        {
-                            "name": "schema",
-                            "in": "path",
-                            "required": True,
-                            "schema": {"type": "string"},
-                            "description": "Schema name"
-                        }
-                    ]
-                }
-            },
-            "/api/analysis": {
-                "post": {
-                    "summary": "Analyze blockchain patterns",
-                    "requestBody": {
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": {"type": "string", "enum": ["token_flow", "activity_pattern"]},
-                                        "address": {"type": "string"}
-                                    },
-                                    "required": ["type", "address"]
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            "/health": {
-                "get": {
-                    "summary": "Health check endpoint"
-                }
-            }
-        }
-    })
+        "paths": api_paths
+    }
+    
+    return JSONResponse(docs)
 
 
 @click.command()
@@ -2606,6 +2458,10 @@ def run_server(
                 Route("/api/schemas/{schema}", rest_schemas),
                 Route("/api/analysis", rest_chain_analysis, methods=["POST"]),
                 
+                # Whale and fresh wallet detection endpoints
+                Route("/api/whale-detector", rest_whale_detector, methods=["POST"]),
+                Route("/api/fresh-wallet-detector", rest_fresh_wallet_detector, methods=["POST"]),
+                
                 # Service endpoints
                 Route("/health", health_check),
                 Route("/api/docs", api_docs),
@@ -2620,9 +2476,6 @@ def run_server(
                 # Create a Solana client for the application
                 solana_client = await get_solana_client().__aenter__()
                 starlette_app.state.solana_client = solana_client
-                
-                # Start session cleanup task (safe to run in background)
-                asyncio.create_task(periodic_session_cleanup())
                 
                 print("Server startup completed successfully")
             except Exception as e:
@@ -2642,7 +2495,7 @@ def run_server(
             
             # Clean up sessions
             try:
-                with _session_store_lock:
+                with _session_store_async_lock:
                     SESSION_STORE.clear()
             except Exception as e:
                 print(f"Error clearing sessions: {str(e)}")
@@ -2670,6 +2523,65 @@ def run_server(
         #         )
         # 
         # anyio.run(arun)
+
+
+# -------------------------------------------
+# Whale and Fresh Wallet Detection
+# -------------------------------------------
+
+# These functions now delegate to the imported implementations
+async def detect_whale_wallets(token_address: str, solana_client: SolanaClient) -> Dict[str, Any]:
+    """Find whale wallets for a token.
+    
+    Args:
+        token_address: Token mint address
+        solana_client: Solana client
+        
+    Returns:
+        Whale wallet information
+    """
+    # This function has been moved to solana_mcp/services/whale_detector/detector.py
+    # Delegating to the imported implementation
+    return await detect_whale_wallets(token_address, solana_client)
+
+
+async def detect_fresh_wallets(token_address: str, solana_client: SolanaClient) -> Dict[str, Any]:
+    """Find fresh wallets for a token.
+    
+    Args:
+        token_address: Token mint address
+        solana_client: Solana client
+        
+    Returns:
+        Fresh wallet information
+    """
+    # This function has been moved to solana_mcp/services/fresh_wallet/detector.py
+    # Delegating to the imported implementation
+    return await detect_fresh_wallets(token_address, solana_client)
+
+
+# Add a new function for starting the cleanup task
+async def start_session_cleanup_task():
+    """Start a background task to periodically clean up expired sessions."""
+    global _cleanup_task
+    
+    if _cleanup_task is None or _cleanup_task.done():
+        _cleanup_task = asyncio.create_task(_periodic_session_cleanup())
+        logger.info("Session cleanup task started")
+
+
+async def _periodic_session_cleanup():
+    """Periodically clean up expired sessions in the background."""
+    try:
+        while True:
+            await asyncio.sleep(60)  # Check every minute
+            removed_count = await clean_expired_sessions()
+            if removed_count > 0:
+                logger.info(f"Cleaned up {removed_count} expired sessions")
+    except asyncio.CancelledError:
+        logger.info("Session cleanup task cancelled")
+    except Exception as e:
+        logger.error(f"Error in session cleanup task: {str(e)}", exc_info=True)
 
 
 if __name__ == "__main__":

@@ -249,16 +249,27 @@ async def get_token_supply(
         analyzer = TokenAnalyzer(client)
         supply_info = await analyzer.get_token_supply_and_decimals(mint, request_id=request_id)
         
+        # Transform the response to match our TokenSupply model
+        supply_value = supply_info.get("supply", {})
+        token_supply = {
+            "mint_address": mint,
+            "total_supply": supply_value.get("amount", "0"),
+            "circulating_supply": supply_value.get("amount", "0"),  # Default to total supply 
+            "decimals": supply_value.get("decimals", 0),
+            "total_holders": None,  # This would require additional API call
+            "max_supply": None      # This information is not available from RPC
+        }
+        
         log_with_context(
             logger,
             "info",
             f"Token supply completed for: {mint}",
             request_id=request_id,
             mint=mint,
-            supply=supply_info.get("value", {}).get("amount", "0") if "value" in supply_info else "N/A"
+            supply=supply_info.get("supply", {}).get("amount", "0")
         )
         
-        return supply_info
+        return token_supply
 
 
 @router.get("/price/{mint}")

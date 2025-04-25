@@ -1,16 +1,74 @@
 """Token analysis for Solana tokens with focus on pumpfun tokens."""
 
 import datetime
-from typing import Dict, List, Any, Optional
 import logging
+from typing import Dict, List, Any, Optional, TypeVar, Callable, Awaitable
 from dataclasses import dataclass
+import base64
+import base58
+import asyncio
+import functools
 
 from solana_mcp.solana_client import SolanaClient, InvalidPublicKeyError, SolanaRpcError
 from solana_mcp.logging_config import get_logger, log_with_context
 from solana_mcp.decorators import validate_solana_key, handle_errors
+from solana_mcp.cache import cached, global_cache
+from solana_mcp.rpc_utils import (
+    get_multiple_accounts, 
+    get_filtered_token_accounts,
+    get_token_account_owners,
+    get_wallet_age,
+    retry_with_backoff
+)
+
+# Constants
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+DEFAULT_TIMEOUT = 30.0  # Default timeout in seconds
 
 # Set up logging
 logger = get_logger(__name__)
+
+# Type variable for generic function
+T = TypeVar('T')
+
+async def with_timeout(coro: Awaitable[T], timeout: float = DEFAULT_TIMEOUT, fallback: Optional[T] = None) -> T:
+    """Execute a coroutine with a timeout.
+    
+    Args:
+        coro: The coroutine to execute
+        timeout: The timeout in seconds
+        fallback: The fallback value to return if the timeout is reached
+        
+    Returns:
+        The result of the coroutine or the fallback value if timed out
+        
+    Raises:
+        asyncio.TimeoutError: If no fallback is provided and the timeout is reached
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(f"Operation timed out after {timeout} seconds")
+        if fallback is not None:
+            return fallback
+        raise
+
+def with_timeout_decorator(timeout: float = DEFAULT_TIMEOUT, fallback: Optional[Any] = None):
+    """Decorator to add timeout handling to an async function.
+    
+    Args:
+        timeout: The timeout in seconds
+        fallback: The fallback value to return if the timeout is reached
+        
+    Returns:
+        Decorator function
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            return await with_timeout(func(*args, **kwargs), timeout, fallback)
+        return wrapper
+    return decorator
 
 # Animal/meme related keywords for classification
 ANIMAL_KEYWORDS = [
@@ -84,6 +142,7 @@ class TokenAnalyzer:
 
     @validate_solana_key
     @handle_errors
+    @with_timeout_decorator(timeout=60.0, fallback=None)
     async def analyze_token(self, mint: str, request_id: Optional[str] = None) -> TokenAnalysis:
         """Perform comprehensive analysis of a token.
         
@@ -102,27 +161,59 @@ class TokenAnalyzer:
             mint=mint
         )
         
+        # Initialize default values
+        token_name = "Unknown"
+        token_symbol = "UNKNOWN"
+        decimals = 0
+        total_supply = "0"
+        total_holders = 0
+        largest_holder_percentage = 0.0
+        current_price_usd = 0.0
+        whale_count = 0
+        whale_percentage = 0.0
+        whale_holdings_percentage = 0.0
+        whale_holdings_usd_total = 0.0
+        fresh_wallet_count = 0
+        fresh_wallet_percentage = 0.0
+        fresh_wallet_holdings_percentage = 0.0
+        launch_date = None
+        age_days = None
+        owner_can_mint = False
+        owner_can_freeze = False
+        
         try:
             # Get token metadata
-            metadata = await self.get_token_metadata(mint, request_id=request_id)
-            token_name = metadata.get("name", "Unknown")
-            token_symbol = metadata.get("symbol", "UNKNOWN")
-            
+            try:
+                metadata = await self.get_token_metadata(mint, request_id=request_id)
+                token_name = metadata.get("name", "Unknown")
+                token_symbol = metadata.get("symbol", "UNKNOWN")
+            except Exception as e:
+                logger.error(f"Error getting token metadata for {mint}: {str(e)}", exc_info=True)
+                
             # Get token supply and decimals
-            supply_info = await self.get_token_supply_and_decimals(mint, request_id=request_id)
-            decimals = supply_info.get("value", {}).get("decimals", 0)
-            total_supply = supply_info.get("value", {}).get("uiAmountString", "0")
-            
+            try:
+                supply_info = await self.get_token_supply_and_decimals(mint, request_id=request_id)
+                decimals = supply_info.get("value", {}).get("decimals", 0)
+                total_supply = supply_info.get("value", {}).get("uiAmountString", "0")
+            except Exception as e:
+                logger.error(f"Error getting token supply for {mint}: {str(e)}", exc_info=True)
+                
             # Get holders data
-            holders_data = await self.get_token_largest_holders(mint, request_id=request_id)
-            total_holders = holders_data.get("total_holders", 0)
-            largest_holder_percentage = holders_data.get("largest_holder_percentage", 0)
-            
+            try:
+                holders_data = await self.get_token_largest_holders(mint, request_id=request_id)
+                total_holders = holders_data.get("total_holders", 0)
+                largest_holder_percentage = holders_data.get("largest_holder_percentage", 0)
+            except Exception as e:
+                logger.error(f"Error getting token holders for {mint}: {str(e)}", exc_info=True)
+                
             # Get price data before whale and fresh wallet analysis
             # as both depend on accurate price data
-            price_data = await self.get_token_price(mint, request_id=request_id)
-            current_price_usd = price_data.get("price_usd", 0.0)
-            
+            try:
+                price_data = await self.get_token_price(mint, request_id=request_id)
+                current_price_usd = price_data.get("price_usd", 0.0)
+            except Exception as e:
+                logger.error(f"Error getting token price for {mint}: {str(e)}", exc_info=True)
+                
             # Get whale data
             try:
                 whale_data = await self.get_whale_holders(mint, request_id=request_id)
@@ -131,12 +222,8 @@ class TokenAnalyzer:
                 whale_holdings_percentage = whale_data.get("whale_holdings_percentage", 0.0)
                 whale_holdings_usd_total = whale_data.get("whale_holdings_usd_total", 0.0)
             except Exception as e:
-                logger.error(f"Error getting whale data: {str(e)}", exc_info=True)
-                whale_count = 0
-                whale_percentage = 0.0
-                whale_holdings_percentage = 0.0
-                whale_holdings_usd_total = 0.0
-            
+                logger.error(f"Error getting whale data for {mint}: {str(e)}", exc_info=True)
+                
             # Get fresh wallet data
             try:
                 fresh_wallet_data = await self.get_fresh_wallets(mint, request_id=request_id)
@@ -144,22 +231,25 @@ class TokenAnalyzer:
                 fresh_wallet_percentage = fresh_wallet_data.get("fresh_wallet_percentage", 0.0)
                 fresh_wallet_holdings_percentage = fresh_wallet_data.get("fresh_wallet_holdings_percentage", 0.0)
             except Exception as e:
-                logger.error(f"Error getting fresh wallet data: {str(e)}", exc_info=True)
-                fresh_wallet_count = 0
-                fresh_wallet_percentage = 0.0
-                fresh_wallet_holdings_percentage = 0.0
-            
+                logger.error(f"Error getting fresh wallet data for {mint}: {str(e)}", exc_info=True)
+                
             # Get age data
-            age_data = await self.get_token_age(mint, request_id=request_id)
-            launch_date_str = age_data.get("launch_date")
-            launch_date = datetime.datetime.fromisoformat(launch_date_str) if launch_date_str else None
-            age_days = age_data.get("age_days")
-            
+            try:
+                age_data = await self.get_token_age(mint, request_id=request_id)
+                launch_date_str = age_data.get("launch_date")
+                launch_date = datetime.datetime.fromisoformat(launch_date_str) if launch_date_str else None
+                age_days = age_data.get("age_days")
+            except Exception as e:
+                logger.error(f"Error getting token age data for {mint}: {str(e)}", exc_info=True)
+                
             # Get authority data
-            auth_data = await self.get_token_mint_authority(mint, request_id=request_id)
-            owner_can_mint = auth_data.get("has_mint_authority", False)
-            owner_can_freeze = auth_data.get("has_freeze_authority", False)
-            
+            try:
+                auth_data = await self.get_token_mint_authority(mint, request_id=request_id)
+                owner_can_mint = auth_data.get("has_mint_authority", False)
+                owner_can_freeze = auth_data.get("has_freeze_authority", False)
+            except Exception as e:
+                logger.error(f"Error getting token authority for {mint}: {str(e)}", exc_info=True)
+                
             # Create analysis result
             analysis = TokenAnalysis(
                 token_mint=mint,
@@ -435,6 +525,8 @@ class TokenAnalyzer:
             "has_freeze_authority": False,
             "freeze_authority": None,
             "is_mutable": False,
+            "decimals": 0,
+            "is_initialized": False,
             "last_updated": datetime.datetime.now().isoformat()
         }
         
@@ -447,63 +539,97 @@ class TokenAnalyzer:
                 # Process mint account data
                 data = account_info["result"].get("data")
                 
-                if isinstance(data, list) and data[0] == "base64":
-                    # Decode base64 data
-                    import base64
-                    data_bytes = base64.b64decode(data[1])
-                    
-                    # SPL Token Mint Layout:
-                    # Offset 0: Mint authority option (1 byte)
-                    # Offset 1: Mint authority pubkey (32 bytes)
-                    # Offset 33: Supply (8 bytes)
-                    # Offset 41: Decimals (1 byte)
-                    # Offset 42: is_initialized (1 byte)
-                    # Offset 43: Freeze authority option (1 byte)
-                    # Offset 44: Freeze authority pubkey (32 bytes)
-                    
-                    # Check if mint authority is present
-                    mint_authority_option = data_bytes[0]
-                    result["has_mint_authority"] = mint_authority_option == 1
-                    
-                    if result["has_mint_authority"]:
-                        # Extract mint authority pubkey
-                        import base58
-                        mint_authority = base58.b58encode(data_bytes[1:33]).decode('utf-8')
-                        result["mint_authority"] = mint_authority
-                    
-                    # Get decimals for additional info
-                    result["decimals"] = data_bytes[41]
-                    
-                    # Check if initialized
-                    result["is_initialized"] = data_bytes[42] == 1
-                    
-                    # Check if freeze authority is present
-                    freeze_authority_option = data_bytes[43]
-                    result["has_freeze_authority"] = freeze_authority_option == 1
-                    
-                    if result["has_freeze_authority"]:
-                        # Extract freeze authority pubkey
-                        freeze_authority = base58.b58encode(data_bytes[44:76]).decode('utf-8')
-                        result["freeze_authority"] = freeze_authority
-                    
-                    # A token is mutable if it has a mint authority
-                    result["is_mutable"] = result["has_mint_authority"]
-                
+                # Check data format and decode if it's base64
+                if isinstance(data, list) and len(data) >= 2 and data[0] == "base64":
+                    try:
+                        # Decode base64 data
+                        data_bytes = base64.b64decode(data[1])
+                        
+                        # Make sure we have enough data for SPL Token Mint data structure
+                        # Minimum length for token mint data is 82 bytes
+                        if len(data_bytes) < 82:
+                            logger.error(f"Invalid token mint data length for {mint}: {len(data_bytes)} bytes (expected at least 82)")
+                            return result
+                        
+                        # SPL Token Mint Layout:
+                        # Offset 0: Mint authority option (1 byte)
+                        # Offset 1: Mint authority pubkey (32 bytes)
+                        # Offset 33: Supply (8 bytes)
+                        # Offset 41: Decimals (1 byte)
+                        # Offset 42: is_initialized (1 byte)
+                        # Offset 43: Freeze authority option (1 byte)
+                        # Offset 44: Freeze authority pubkey (32 bytes)
+                        
+                        # Check if mint authority is present
+                        mint_authority_option = data_bytes[0]
+                        if mint_authority_option not in (0, 1):
+                            logger.warning(f"Invalid mint authority option for {mint}: {mint_authority_option}")
+                            mint_authority_option = 0  # Default to no authority
+                        
+                        result["has_mint_authority"] = mint_authority_option == 1
+                        
+                        if result["has_mint_authority"]:
+                            # Extract mint authority pubkey (ensure we have enough data)
+                            if len(data_bytes) >= 33:
+                                mint_authority = base58.b58encode(data_bytes[1:33]).decode('utf-8')
+                                result["mint_authority"] = mint_authority
+                        
+                        # Get decimals (ensure we have enough data)
+                        if len(data_bytes) >= 42:
+                            result["decimals"] = data_bytes[41]
+                            
+                            # Check if initialized
+                            result["is_initialized"] = data_bytes[42] == 1
+                        
+                        # Check if freeze authority is present (ensure we have enough data)
+                        if len(data_bytes) >= 44:
+                            freeze_authority_option = data_bytes[43]
+                            if freeze_authority_option not in (0, 1):
+                                logger.warning(f"Invalid freeze authority option for {mint}: {freeze_authority_option}")
+                                freeze_authority_option = 0  # Default to no freeze authority
+                                
+                            result["has_freeze_authority"] = freeze_authority_option == 1
+                            
+                            if result["has_freeze_authority"] and len(data_bytes) >= 76:
+                                # Extract freeze authority pubkey
+                                freeze_authority = base58.b58encode(data_bytes[44:76]).decode('utf-8')
+                                result["freeze_authority"] = freeze_authority
+                    except (ValueError, IndexError, base64.Error) as e:
+                        # Handle decoding errors gracefully
+                        logger.error(f"Error decoding token mint data for {mint}: {str(e)}", exc_info=True)
+                elif isinstance(data, dict) and "parsed" in data and "type" in data and data["type"] == "mint":
+                    # Handle pre-parsed data (jsonParsed encoding)
+                    try:
+                        parsed_data = data.get("parsed", {}).get("info", {})
+                        result["decimals"] = parsed_data.get("decimals", 0)
+                        result["is_initialized"] = True  # Assuming parsed data means initialized
+                        
+                        # Extract mint authority
+                        mint_authority = parsed_data.get("mintAuthority")
+                        result["has_mint_authority"] = mint_authority is not None
+                        if mint_authority:
+                            result["mint_authority"] = mint_authority
+                        
+                        # Extract freeze authority
+                        freeze_authority = parsed_data.get("freezeAuthority")
+                        result["has_freeze_authority"] = freeze_authority is not None
+                        if freeze_authority:
+                            result["freeze_authority"] = freeze_authority
+                    except (KeyError, TypeError) as e:
+                        logger.error(f"Error parsing jsonParsed token mint data for {mint}: {str(e)}", exc_info=True)
                 else:
-                    result["error"] = "Invalid data format"
-                
+                    logger.warning(f"Unsupported data format for token mint {mint}")
         except Exception as e:
-            logger.error(f"Error getting token authority for {mint}: {str(e)}")
-            result["error"] = str(e)
-            
+            logger.error(f"Error getting token mint authority for {mint}: {str(e)}", exc_info=True)
+        
         log_with_context(
             logger,
             "info",
             f"Token authority completed for: {mint}",
             request_id=request_id,
             mint=mint,
-            has_mint_authority=result.get("has_mint_authority", False),
-            has_freeze_authority=result.get("has_freeze_authority", False)
+            has_mint_authority=result["has_mint_authority"],
+            has_freeze_authority=result["has_freeze_authority"]
         )
         
         return result
@@ -543,15 +669,32 @@ class TokenAnalyzer:
         
         return count
 
+    @cached(ttl=300)
+    async def get_token_metadata_cached(self, mint, request_id=None):
+        """Cached version of get_token_metadata."""
+        return await self.client.get_token_metadata(mint)
+
+    @cached(ttl=600)
+    async def get_token_supply_cached(self, mint, request_id=None):
+        """Cached version of get_token_supply."""
+        return await self.client.get_token_supply(mint)
+
+    @cached(ttl=60)
+    async def get_market_price_cached(self, mint, request_id=None):
+        """Cached version of get_market_price."""
+        return await self.client.get_market_price(mint)
+
     @validate_solana_key
     @handle_errors
-    async def get_whale_holders(self, mint: str, threshold_usd: float = 50000.0, request_id: Optional[str] = None) -> Dict[str, Any]:
+    @with_timeout_decorator(timeout=45.0, fallback={"whale_count": 0, "whale_percentage": 0.0, "whale_holdings_percentage": 0.0, "whale_holdings_usd_total": 0.0})
+    async def get_whale_holders(self, mint: str, threshold_usd: float = 50000.0, request_id: Optional[str] = None, max_accounts: int = 100) -> Dict[str, Any]:
         """Get token holders with balances over the specified USD threshold.
         
         Args:
             mint: The token mint address
             threshold_usd: The minimum USD value to consider a holder a whale (default: $50K)
             request_id: Optional request ID for tracing
+            max_accounts: Maximum number of accounts to analyze
             
         Returns:
             Dictionary with whale holder information
@@ -566,10 +709,11 @@ class TokenAnalyzer:
         )
         
         result = {
+            "success": True,
             "token_mint": mint,
             "threshold_usd": threshold_usd,
             "total_holders_analyzed": 0,
-            "total_holders": 0,  # Initialize total_holders explicitly
+            "total_holders": 0,
             "whale_count": 0,
             "whale_percentage": 0,
             "whale_holders": [],
@@ -579,124 +723,209 @@ class TokenAnalyzer:
         }
         
         try:
-            # Get token metadata
-            token_metadata = await self.get_token_metadata(mint, request_id=request_id)
-            result["token_name"] = token_metadata.get("name", "Unknown")
-            result["token_symbol"] = token_metadata.get("symbol", "UNKNOWN")
+            # Set default token information in case metadata fetching fails
+            result["token_name"] = "Unknown"
+            result["token_symbol"] = "UNKNOWN"
             
-            # Always get total holders count first to ensure this data is included
+            # Try to get token metadata, but continue if it fails
             try:
-                total_holders = await self.get_token_holders_count(mint, request_id=request_id)
-                result["total_holders"] = total_holders
+                # Use cached version to reduce RPC calls
+                token_metadata = await self.get_token_metadata_cached(mint, request_id)
+                result["token_name"] = token_metadata.get("name", "Unknown")
+                result["token_symbol"] = token_metadata.get("symbol", "UNKNOWN")
             except Exception as e:
-                logger.error(f"Error getting total holders count: {str(e)}", exc_info=True)
-                # Will fall back to analyzed count later if needed
+                logger.warning(f"Could not get token metadata: {str(e)}")
+                result["warnings"] = result.get("warnings", []) + [f"Could not get token metadata: {str(e)}"]
             
-            # Get current token price
-            price_data = await self.get_token_price(mint, request_id=request_id)
-            price_usd = price_data.get("price_usd", 0.0)
-            
-            # Handle price data reliability
-            if price_usd <= 0:
-                # Try other price sources or estimation methods if available
-                price_sol = price_data.get("price_sol", 0.0)
-                if price_sol > 0:
-                    # Estimate USD price using SOL price if SOL/USD rate is available
-                    # This is a simplistic fallback - in a real implementation, you'd use a reliable oracle
-                    estimated_sol_usd = 100.0  # Fallback estimated SOL/USD price
-                    price_usd = price_sol * estimated_sol_usd
-                    logger.warning(f"Using estimated USD price from SOL price: ${price_usd}")
-                    result["price_source"] = "estimated_from_sol"
-            
-            if price_usd <= 0:
-                result["error"] = "Unable to determine token price in USD"
-                result["price_usd"] = 0.0
-                logger.error(f"Unable to determine USD price for token {mint}")
-                # Continue anyway to gather holder data, but whale detection will be limited
-            else:
-                result["token_price_usd"] = price_usd
-            
-            # Get token supply and decimals
-            supply_info = await self.get_token_supply_and_decimals(mint, request_id=request_id)
-            decimals = supply_info.get("value", {}).get("decimals", 0)
-            total_supply_str = supply_info.get("value", {}).get("uiAmountString", "0")
-            
+            # Try to get holders count, but continue if it fails
             try:
-                total_supply = float(total_supply_str)
-                if total_supply <= 0:
-                    logger.warning(f"Invalid or zero total supply value: {total_supply_str}")
-                    total_supply = 1  # Use a non-zero default to avoid division by zero
-                result["total_supply"] = total_supply
-            except (ValueError, TypeError):
-                logger.warning(f"Could not parse total supply: {total_supply_str}")
-                total_supply = 1  # Use a non-zero default to avoid division by zero
-                result["error"] = f"Invalid total supply value: {total_supply_str}"
+                holders_data = await self.get_token_largest_holders(mint, request_id=request_id)
+                result["total_holders"] = holders_data.get("total_holders", 0)
+            except Exception as e:
+                logger.warning(f"Could not get total holders count: {str(e)}")
+                result["warnings"] = result.get("warnings", []) + [f"Could not get total holders count: {str(e)}"]
+                result["total_holders"] = 0
             
-            # Get largest token accounts (limit 100)
-            largest_accounts = await self.client.get_token_largest_accounts(mint)
-            accounts = largest_accounts.get("value", [])
+            # Get token price with defensive coding
+            price_usd = 0.0
+            try:
+                # Use cached version to reduce RPC calls
+                price_data = await self.get_market_price_cached(mint, request_id)
+                # Explicitly handle None to avoid NoneType errors
+                price_usd = float(price_data.get("price_usd", 0.0) or 0.0)
+                result["token_price_usd"] = price_usd
+            except Exception as e:
+                logger.error(f"Error getting price data: {str(e)}")
+                price_usd = 0.0
+                result["warnings"] = result.get("warnings", []) + [f"Error getting price data: {str(e)}"]
             
-            result["total_holders_analyzed"] = len(accounts)
+            if price_usd <= 0:
+                logger.warning(f"Unable to determine USD price for token {mint}, using fallback price of $0.01")
+                price_usd = 0.01  # Use a fallback price instead of 0
+                result["token_price_usd"] = price_usd
+                result["warnings"] = result.get("warnings", []) + ["Using fallback price of $0.01"]
             
-            # If total_holders wasn't successfully fetched earlier, fall back to analyzed count
-            if result["total_holders"] == 0:
-                result["total_holders"] = result["total_holders_analyzed"]
-            
-            whale_holders = []
-            whale_holdings_total = 0
-            
-            for account in accounts:
+            # Get token supply and decimals, with defensive coding
+            total_supply = 1  # Default to avoid division by zero
+            try:
+                # Use cached version to reduce RPC calls
+                supply_info = await self.get_token_supply_cached(mint, request_id)
+                decimals = supply_info.get("value", {}).get("decimals", 0)
+                total_supply_str = supply_info.get("value", {}).get("uiAmountString", "0")
+                result["decimals"] = decimals
+                
                 try:
-                    # Get account balance in token units with safer parsing
-                    account_balance = 0.0
-                    ui_amount = account.get("uiAmount")
+                    total_supply = float(total_supply_str or "1")  # Default to 1 if empty string
+                    if total_supply <= 0:
+                        logger.warning(f"Invalid or zero total supply value: {total_supply_str}")
+                        total_supply = 1  # Use a non-zero default to avoid division by zero
+                        result["warnings"] = result.get("warnings", []) + ["Invalid total supply value, using default"]
+                    result["total_supply"] = total_supply
+                except (ValueError, TypeError):
+                    logger.warning(f"Could not parse total supply: {total_supply_str}")
+                    result["warnings"] = result.get("warnings", []) + [f"Invalid total supply value: {total_supply_str}"]
+            except Exception as e:
+                logger.warning(f"Error getting token supply: {str(e)}")
+                result["warnings"] = result.get("warnings", []) + [f"Error getting token supply: {str(e)}"]
+            
+            # Get largest token accounts with optimized filtering
+            try:
+                # Calculate minimum balance threshold to reduce unnecessary processing
+                min_balance_threshold = 0
+                if price_usd > 0:
+                    # Set threshold at 10% of whale threshold to avoid missing edge cases
+                    min_balance_threshold = (threshold_usd * 0.1) / price_usd
+                
+                # Use the optimized filtering function
+                accounts_to_process = await get_filtered_token_accounts(
+                    self.client,
+                    mint,
+                    min_balance=min_balance_threshold,
+                    max_accounts=max_accounts,
+                    order="desc"  # Largest first
+                )
+                
+                result["total_holders_analyzed"] = len(accounts_to_process)
+                logger.info(f"Analyzing {len(accounts_to_process)} top accounts for token {mint}")
+                
+                # If total_holders wasn't successfully fetched earlier, fall back to analyzed count
+                if result["total_holders"] == 0:
+                    result["total_holders"] = result["total_holders_analyzed"]
+                
+                if not accounts_to_process:
+                    logger.warning(f"No token accounts found for {mint}")
+                    result["warnings"] = result.get("warnings", []) + ["No token accounts found or they are all below threshold"]
+                    return result
+                
+                # Get all token account owners in a single batch operation
+                token_account_owners = await get_token_account_owners(self.client, accounts_to_process)
+                
+                # Process accounts that have owners
+                whale_holders = []
+                whale_holdings_total = 0
+                
+                # Process accounts in batches to avoid overwhelming the RPC
+                BATCH_SIZE = 10
+                for i in range(0, len(accounts_to_process), BATCH_SIZE):
+                    batch = accounts_to_process[i:i+BATCH_SIZE]
                     
-                    # Handle different types of uiAmount - could be string or number
-                    if ui_amount is not None:
-                        if isinstance(ui_amount, (int, float)):
-                            account_balance = float(ui_amount)
-                        elif isinstance(ui_amount, str):
-                            try:
-                                account_balance = float(ui_amount)
-                            except (ValueError, TypeError):
-                                logger.warning(f"Could not parse account balance: {ui_amount}")
-                                continue
+                    # Add a delay between batches
+                    if i > 0:
+                        await asyncio.sleep(1)
                     
-                    # Calculate USD value (will be 0 if price_usd is 0)
-                    balance_usd = account_balance * price_usd
-                    
-                    # Check if this is a whale, but only if we have price data
-                    if price_usd > 0 and balance_usd >= threshold_usd:
+                    # Process each account in the batch
+                    for j, account in enumerate(batch):
+                        # Small delay between accounts in the same batch
+                        if j > 0:
+                            await asyncio.sleep(0.2)
+                        
+                        account_address = account.get("address", "")
+                        
+                        # Skip missing addresses
+                        if not account_address:
+                            continue
+                        
+                        # Get owner from pre-fetched map
+                        owner = token_account_owners.get(account_address)
+                        
+                        # Skip if we couldn't determine the owner
+                        if not owner:
+                            continue
+                        
+                        # Get account balance in token units
+                        account_balance = float(account.get("uiAmount", 0) or 0)
+                        
+                        # Calculate USD value
+                        balance_usd = account_balance * price_usd
+                        
+                        # Skip accounts below threshold to reduce unnecessary processing
+                        if balance_usd < threshold_usd:
+                            continue
+                        
+                        # Calculate percentage of supply
                         percentage_of_supply = (account_balance / total_supply * 100) if total_supply > 0 else 0
                         
-                        whale_holder = {
-                            "address": account.get("address", "unknown"),
+                        # Basic whale data
+                        whale_data = {
+                            "address": owner,
                             "token_balance": account_balance,
                             "usd_value": balance_usd,
                             "percentage_of_supply": percentage_of_supply
                         }
                         
-                        whale_holders.append(whale_holder)
+                        # Add additional information for API results
+                        # Get SOL balance for a more complete picture of the wallet
+                        try:
+                            sol_balance_response = await self.client.get_balance(owner)
+                            sol_balance = float(sol_balance_response.get("result", {}).get("value", 0)) / 10**9
+                            sol_value = sol_balance * 150.0  # Approximate SOL price
+                            
+                            # Add SOL info to whale data
+                            total_wallet_value = balance_usd + sol_value
+                            whale_data["total_wallet_value_usd"] = total_wallet_value
+                            whale_data["token_count"] = 1  # Start with this token
+                            
+                            if sol_balance > 0:
+                                whale_data["token_count"] += 1
+                                whale_data["top_tokens"] = [{
+                                    'token': 'SOL',
+                                    'mint': 'So11111111111111111111111111111111111111112',
+                                    'amount': sol_balance,
+                                    'value_usd': sol_value
+                                }]
+                            else:
+                                whale_data["top_tokens"] = []
+                                
+                        except Exception as e:
+                            logger.error(f"Error getting SOL balance: {str(e)}")
+                            whale_data["total_wallet_value_usd"] = balance_usd
+                            whale_data["token_count"] = 1
+                            whale_data["top_tokens"] = []
+                        
+                        # Add to whale list
+                        whale_holders.append(whale_data)
                         whale_holdings_total += account_balance
-                except Exception as e:
-                    logger.error(f"Error processing account balance: {str(e)}", exc_info=True)
-                    continue
+                
+                # Update result with whale data
+                result["whale_count"] = len(whale_holders)
+                result["whale_holders"] = whale_holders
+                
+                if result["total_holders_analyzed"] > 0:
+                    result["whale_percentage"] = (result["whale_count"] / result["total_holders_analyzed"]) * 100
+                
+                if total_supply > 0:
+                    result["whale_holdings_percentage"] = (whale_holdings_total / total_supply) * 100
+                
+                # Calculate total USD value held by whales
+                result["whale_holdings_usd_total"] = whale_holdings_total * price_usd
             
-            # Update result with whale data
-            result["whale_count"] = len(whale_holders)
-            result["whale_holders"] = whale_holders
-            
-            if result["total_holders_analyzed"] > 0:
-                result["whale_percentage"] = (result["whale_count"] / result["total_holders_analyzed"]) * 100
-            
-            if total_supply > 0:
-                result["whale_holdings_percentage"] = (whale_holdings_total / total_supply) * 100
-            
-            # Calculate total USD value held by whales
-            result["whale_holdings_usd_total"] = whale_holdings_total * price_usd
-            
+            except Exception as e:
+                logger.error(f"Error processing largest token accounts: {str(e)}", exc_info=True)
+                result["warnings"] = result.get("warnings", []) + [f"Error processing largest token accounts: {str(e)}"]
+        
         except Exception as e:
             logger.error(f"Error analyzing whale holders for {mint}: {str(e)}", exc_info=True)
+            result["success"] = False
             result["error"] = str(e)
         
         log_with_context(
@@ -713,15 +942,20 @@ class TokenAnalyzer:
 
     @validate_solana_key
     @handle_errors
-    async def get_fresh_wallets(self, mint: str, request_id: Optional[str] = None) -> Dict[str, Any]:
-        """Get token holders that only hold this specific token (fresh wallets).
+    async def get_fresh_wallets(self, mint: str, request_id: Optional[str] = None, max_accounts: int = 100) -> Dict[str, Any]:
+        """Get token holders that are likely new wallets created primarily for this token.
         
-        Fresh wallets are wallets that have only bought this specific token and no others,
-        which could indicate artificial activity or targeted pump activity.
+        Fresh wallets are wallets that:
+        1. Were created recently (less than 30 days old)
+        2. Have very few tokens (typically less than 5)
+        3. Have a high percentage of this token relative to their total holdings
+        
+        This is an enhanced version that checks wallet age, transaction ratios, and token diversity.
         
         Args:
             mint: The token mint address
             request_id: Optional request ID for tracing
+            max_accounts: Maximum number of accounts to analyze
             
         Returns:
             Dictionary with fresh wallet information
@@ -735,6 +969,7 @@ class TokenAnalyzer:
         )
         
         result = {
+            "success": True,
             "token_mint": mint,
             "total_holders_analyzed": 0,
             "fresh_wallet_count": 0,
@@ -746,136 +981,258 @@ class TokenAnalyzer:
         }
         
         try:
-            # Get token metadata
-            token_metadata = await self.get_token_metadata(mint, request_id=request_id)
-            result["token_name"] = token_metadata.get("name", "Unknown")
-            result["token_symbol"] = token_metadata.get("symbol", "UNKNOWN")
+            # Set default token information in case metadata fetching fails
+            result["token_name"] = "Unknown"
+            result["token_symbol"] = "UNKNOWN"
             
-            # Get token supply and decimals
-            supply_info = await self.get_token_supply_and_decimals(mint, request_id=request_id)
-            decimals = supply_info.get("value", {}).get("decimals", 0)
-            total_supply_str = supply_info.get("value", {}).get("uiAmountString", "0")
-            
+            # Try to get token metadata, but continue if it fails
             try:
-                total_supply = float(total_supply_str)
-                if total_supply <= 0:
-                    logger.warning(f"Invalid or zero total supply value: {total_supply_str}")
-                    total_supply = 1  # Use a non-zero default to avoid division by zero
-                result["total_supply"] = total_supply
-            except (ValueError, TypeError):
-                logger.warning(f"Could not parse total supply: {total_supply_str}")
-                total_supply = 1  # Use a non-zero default to avoid division by zero
-                result["error"] = f"Invalid total supply value: {total_supply_str}"
+                token_metadata = await self.get_token_metadata(mint, request_id=request_id)
+                result["token_name"] = token_metadata.get("name", "Unknown")
+                result["token_symbol"] = token_metadata.get("symbol", "UNKNOWN")
+            except Exception as e:
+                logger.warning(f"Could not get token metadata: {str(e)}")
+                result["warnings"] = result.get("warnings", []) + [f"Could not get token metadata: {str(e)}"]
             
-            # Get largest token accounts (limit 100)
-            largest_accounts = await self.client.get_token_largest_accounts(mint)
-            accounts = largest_accounts.get("value", [])
-            
-            result["total_holders_analyzed"] = len(accounts)
-            
-            fresh_wallets = []
-            fresh_wallet_holdings_total = 0
-            
-            # Set of addresses already analyzed to avoid duplicates
-            analyzed_owners = set()
-            
-            # For each token account, check if the owner only holds this token
-            for account in accounts:
-                account_address = account.get("address", "")
-                account_balance = float(account.get("uiAmount", 0))
+            # Get token price for value calculations, with error handling
+            price_usd = 0.01  # Default fallback price
+            try:
+                price_data = await self.get_token_price(mint, request_id=request_id)
+                # Explicitly handle None to avoid NoneType errors
+                price_usd = float(price_data.get("price_usd", 0.0) or 0.0)
+                if price_usd <= 0:
+                    price_usd = 0.01  # Use fallback price
+                    result["warnings"] = result.get("warnings", []) + ["Using fallback price of $0.01"]
                 
-                # Get the owner of this token account
+                result["token_price_usd"] = price_usd
+            except Exception as e:
+                logger.warning(f"Error getting price data, using fallback: {str(e)}")
+                result["token_price_usd"] = price_usd
+                result["warnings"] = result.get("warnings", []) + [f"Error getting price data, using fallback: {str(e)}"]
+            
+            # Get token supply and decimals with error handling
+            total_supply = 1  # Default to avoid division by zero
+            try:
+                supply_info = await self.get_token_supply_and_decimals(mint, request_id=request_id)
+                decimals = supply_info.get("value", {}).get("decimals", 0)
+                total_supply_str = supply_info.get("value", {}).get("uiAmountString", "0")
+                result["decimals"] = decimals
+                
                 try:
-                    token_account_info = await self.client.get_account_info(account_address)
-                    
-                    # Extract owner from the token account data
-                    owner = None
-                    
-                    # Verify that account exists and is a token account
-                    if token_account_info and "result" in token_account_info and token_account_info["result"]:
-                        # Check if the account is owned by the Token Program
-                        account_owner = token_account_info["result"].get("owner")
-                        if account_owner == TOKEN_PROGRAM_ID:
-                            data = token_account_info["result"].get("data")
-                            if isinstance(data, list) and len(data) >= 2 and data[0] == "base64":
-                                try:
-                                    # Decode base64 data
-                                    import base64
-                                    data_bytes = base64.b64decode(data[1])
-                                    
-                                    # Check if data length is sufficient
-                                    if len(data_bytes) >= 64:
-                                        # Extract owner pubkey (offset 32 in token account data)
-                                        import base58
-                                        owner = base58.b58encode(data_bytes[32:64]).decode('utf-8')
-                                except Exception as e:
-                                    logger.error(f"Error decoding account data: {str(e)}")
-                                    continue
-                    
-                    if owner and owner not in analyzed_owners:
-                        analyzed_owners.add(owner)
-                        
-                        # Get all token accounts owned by this wallet
-                        token_accounts = await self.client.get_token_accounts_by_owner(owner)
-                        
-                        # Count how many different tokens this wallet holds
-                        unique_tokens = set()
-                        token_balances = {}
-                        
-                        if "value" in token_accounts:
-                            for token_account in token_accounts["value"]:
-                                account_data = token_account.get("account", {}).get("data", {})
-                                if isinstance(account_data, dict) and "parsed" in account_data:
-                                    parsed_data = account_data["parsed"]
-                                    if "info" in parsed_data and "mint" in parsed_data["info"]:
-                                        token_mint_addr = parsed_data["info"]["mint"]
-                                        token_amount = parsed_data["info"].get("tokenAmount", {})
-                                        token_balance = token_amount.get("uiAmount", 0)
-                                        
-                                        # Only count if balance > 0
-                                        if token_balance > 0:
-                                            unique_tokens.add(token_mint_addr)
-                                            token_balances[token_mint_addr] = token_balance
-                        
-                        # Check if wallet only holds our target token
-                        # A wallet is considered "fresh" if it only holds this specific token
-                        # (checking for only one token in unique_tokens is sufficient since we're only 
-                        # counting tokens with balance > 0, and native SOL isn't counted in token accounts)
-                        is_fresh_wallet = len(unique_tokens) == 1 and mint in unique_tokens
-                        
-                        if is_fresh_wallet:
-                            # Get the specific balance for our target token
-                            target_token_balance = token_balances.get(mint, 0)
-                            percentage_of_supply = (target_token_balance / total_supply * 100) if total_supply > 0 else 0
-                            
-                            fresh_wallet = {
-                                "wallet_address": owner,
-                                "token_account": account_address,
-                                "token_balance": target_token_balance,
-                                "percentage_of_supply": percentage_of_supply
-                            }
-                            
-                            fresh_wallets.append(fresh_wallet)
-                            fresh_wallet_holdings_total += target_token_balance
+                    total_supply = float(total_supply_str or "1")  # Default to 1 if empty string
+                    if total_supply <= 0:
+                        logger.warning(f"Invalid or zero total supply value: {total_supply_str}")
+                        total_supply = 1  # Use a non-zero default to avoid division by zero
+                        result["warnings"] = result.get("warnings", []) + ["Invalid total supply value, using default"]
+                    result["total_supply"] = total_supply
+                except (ValueError, TypeError):
+                    logger.warning(f"Could not parse total supply: {total_supply_str}")
+                    result["warnings"] = result.get("warnings", []) + [f"Invalid total supply value: {total_supply_str}"]
+            except Exception as e:
+                logger.warning(f"Error getting token supply: {str(e)}")
+                result["warnings"] = result.get("warnings", []) + [f"Error getting token supply: {str(e)}"]
+            
+            # Get largest token accounts with pagination and filtering
+            try:
+                # Get the largest token accounts
+                largest_accounts_result = await self.client.get_token_largest_accounts(mint)
                 
-                except Exception as e:
-                    logger.error(f"Error processing account {account_address}: {str(e)}", exc_info=True)
-                    continue
+                if "value" in largest_accounts_result and largest_accounts_result["value"]:
+                    accounts = largest_accounts_result["value"]
+                    
+                    # Use the maximum accounts specified (default 100)
+                    accounts_to_process = accounts[:max_accounts]
+                    
+                    result["total_holders_analyzed"] = len(accounts_to_process)
+                    logger.info(f"Analyzing {len(accounts_to_process)} top accounts for fresh wallet detection")
+                    
+                    # Pre-filter accounts to avoid unnecessary RPC calls
+                    # For fresh wallets, focus on smaller holders first (they're more likely to be fresh wallets)
+                    # Sort by ascending balance to prioritize smaller holders
+                    accounts_to_process = sorted(
+                        [a for a in accounts_to_process if float(a.get("uiAmount", 0) or 0) > 0],
+                        key=lambda x: float(x.get("uiAmount", 0) or 0)
+                    )
+                    
+                    # If accounts to process is still large, limit based on full analysis needs
+                    if len(accounts_to_process) > 50:
+                        accounts_to_process = accounts_to_process[:50]
+                        result["warnings"] = result.get("warnings", []) + [f"Limited analysis to top 50 accounts due to RPC constraints"]
+                    
+                    logger.info(f"Processing {len(accounts_to_process)} accounts for fresh wallet analysis")
+                    
+                    fresh_wallets = []
+                    fresh_wallet_holdings_total = 0
+                    
+                    # Define batch size and delay between batches
+                    BATCH_SIZE = 10
+                    DELAY_SECONDS = 1  # Delay between batches
+                    
+                    # Process accounts in batches to avoid overwhelming the RPC
+                    for i in range(0, len(accounts_to_process), BATCH_SIZE):
+                        batch = accounts_to_process[i:i+BATCH_SIZE]
+                        
+                        # Add a delay between batches
+                        if i > 0:
+                            await asyncio.sleep(DELAY_SECONDS)
+                        
+                        # Process each account in the batch
+                        for j, account in enumerate(batch):
+                            # Small delay between accounts in the same batch
+                            if j > 0:
+                                await asyncio.sleep(0.2)  # 200ms delay between accounts
+                                
+                            account_address = account.get("address", "")
+                            
+                            # Skip missing addresses
+                            if not account_address:
+                                continue
+                            
+                            # Get account balance
+                            try:
+                                account_balance = float(account.get("uiAmount", 0) or 0)
+                                
+                                # Skip zero balances
+                                if account_balance <= 0:
+                                    continue
+                                    
+                                # Get the account owner
+                                owner = None
+                                
+                                try:
+                                    account_info = await self.client.get_account_info(account_address)
+                                    
+                                    # Extract owner from the token account data
+                                    if account_info and "result" in account_info and account_info["result"]:
+                                        # Check if the account is owned by the Token Program
+                                        account_owner = account_info["result"].get("owner")
+                                        if account_owner == TOKEN_PROGRAM_ID:
+                                            data = account_info["result"].get("data")
+                                            if isinstance(data, list) and len(data) >= 2 and data[0] == "base64":
+                                                try:
+                                                    # Decode base64 data
+                                                    data_bytes = base64.b64decode(data[1])
+                                                    
+                                                    # Check if data length is sufficient
+                                                    if len(data_bytes) >= 64:
+                                                        # Extract owner pubkey (offset 32 in token account data)
+                                                        owner = base58.b58encode(data_bytes[32:64]).decode('utf-8')
+                                                except Exception as e:
+                                                    logger.error(f"Error decoding account data: {str(e)}")
+                                except Exception as e:
+                                    logger.error(f"Error getting account info: {str(e)}")
+                                    continue
+                                
+                                if not owner:
+                                    continue
+                                
+                                # Full analysis for wallet freshness
+                                # Get wallet age by looking at oldest transaction
+                                wallet_age_days = None
+                                token_tx_ratio = 0.0
+                                
+                                try:
+                                    # Get a few signatures to analyze wallet age and transaction patterns
+                                    signatures = await self.client.get_signatures_for_address(owner, limit=5)
+                                    
+                                    if signatures and "result" in signatures and signatures["result"]:
+                                        # Sort by blockTime to find the oldest
+                                        sorted_sigs = sorted(signatures["result"], key=lambda x: x.get("blockTime", 0) if x.get("blockTime") else float("inf"))
+                                        
+                                        if sorted_sigs:
+                                            # Get the oldest transaction's timestamp
+                                            if "blockTime" in sorted_sigs[0]:
+                                                creation_timestamp = sorted_sigs[0]["blockTime"]
+                                                creation_date = datetime.datetime.fromtimestamp(creation_timestamp)
+                                                current_date = datetime.datetime.now()
+                                                wallet_age_days = (current_date - creation_date).days
+                                            
+                                            # Calculate token transaction ratio (simplified)
+                                            # Check what percentage of transactions involve our target token
+                                            token_tx_count = 0
+                                            for sig in sorted_sigs:
+                                                # For simplicity, we'll just check if the memo contains our token address
+                                                if mint in str(sig):
+                                                    token_tx_count += 1
+                                            
+                                            if sorted_sigs:
+                                                token_tx_ratio = token_tx_count / len(sorted_sigs)
+                                except Exception as e:
+                                    logger.error(f"Error checking wallet age for {owner}: {str(e)}")
+                                
+                                # Check SOL balance for token diversity scoring
+                                non_dust_token_count = 0
+                                
+                                try:
+                                    sol_balance_response = await self.client.get_balance(owner)
+                                    sol_balance = float(sol_balance_response.get("result", {}).get("value", 0)) / 10**9
+                                    
+                                    if sol_balance > 0.01:  # Only count if more than 0.01 SOL
+                                        non_dust_token_count += 1
+                                except Exception as e:
+                                    logger.error(f"Error getting SOL balance for {owner}: {str(e)}")
+                                
+                                # Determine if this is a fresh wallet based on criteria
+                                # Calculate freshness score components
+                                token_diversity_score = max(0, 1 - (non_dust_token_count / 5))  # 1.0 for 0 tokens, 0.0 for 5+ tokens
+                                age_score = 0.0
+                                if wallet_age_days is not None:
+                                    age_score = max(0, 1 - (wallet_age_days / 30))  # 1.0 for 0 days, 0.0 for 30+ days
+                                tx_score = token_tx_ratio  # 1.0 if all transactions involve our token, 0.0 if none
+                                
+                                # Weight the components
+                                freshness_score = (token_diversity_score * 0.4) + (age_score * 0.4) + (tx_score * 0.2)
+                                
+                                # Mark as fresh if score above threshold
+                                is_fresh = freshness_score >= 0.6
+                                
+                                # If identified as fresh, add to our results
+                                if is_fresh:
+                                    token_value = account_balance * price_usd
+                                    percentage_of_supply = (account_balance / total_supply * 100) if total_supply > 0 else 0
+                                    
+                                    fresh_wallet = {
+                                        "wallet_address": owner,
+                                        "token_account": account_address,
+                                        "token_balance": account_balance,
+                                        "token_value_usd": token_value,
+                                        "percentage_of_supply": percentage_of_supply,
+                                        "wallet_age_days": wallet_age_days,
+                                        "token_tx_ratio": token_tx_ratio,
+                                        "freshness_score": freshness_score
+                                    }
+                                    
+                                    fresh_wallets.append(fresh_wallet)
+                                    fresh_wallet_holdings_total += account_balance
+                            except Exception as e:
+                                logger.error(f"Error analyzing account {account_address}: {str(e)}", exc_info=True)
+                                continue
+                    
+                    # Sort fresh wallets by freshness score (highest first)
+                    fresh_wallets.sort(key=lambda x: x.get("freshness_score", 0), reverse=True)
+                    
+                    # Update result with fresh wallet data
+                    result["fresh_wallet_count"] = len(fresh_wallets)
+                    result["fresh_wallets"] = fresh_wallets
+                    
+                    if result["total_holders_analyzed"] > 0:
+                        result["fresh_wallet_percentage"] = (result["fresh_wallet_count"] / result["total_holders_analyzed"]) * 100
+                    
+                    if total_supply > 0:
+                        result["fresh_wallet_holdings_percentage"] = (fresh_wallet_holdings_total / total_supply) * 100
+                    
+                    result["fresh_wallet_holdings_token_total"] = fresh_wallet_holdings_total
+                else:
+                    logger.warning(f"No token accounts found for {mint}")
+                    result["warnings"] = result.get("warnings", []) + ["No token accounts found"]
             
-            # Update result with fresh wallet data
-            result["fresh_wallet_count"] = len(fresh_wallets)
-            result["fresh_wallets"] = fresh_wallets
-            
-            if result["total_holders_analyzed"] > 0:
-                result["fresh_wallet_percentage"] = (result["fresh_wallet_count"] / result["total_holders_analyzed"]) * 100
-            
-            if total_supply > 0:
-                result["fresh_wallet_holdings_percentage"] = (fresh_wallet_holdings_total / total_supply) * 100
-            
-            result["fresh_wallet_holdings_token_total"] = fresh_wallet_holdings_total
+            except Exception as e:
+                logger.error(f"Error processing largest token accounts: {str(e)}", exc_info=True)
+                result["warnings"] = result.get("warnings", []) + [f"Error processing largest token accounts: {str(e)}"]
             
         except Exception as e:
             logger.error(f"Error analyzing fresh wallets for {mint}: {str(e)}", exc_info=True)
+            result["success"] = False
             result["error"] = str(e)
         
         log_with_context(

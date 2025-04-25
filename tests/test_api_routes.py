@@ -38,9 +38,19 @@ def test_token_metadata_endpoint():
         
         assert response.status_code == 200, f"Expected 200 OK but got {response.status_code}"
         data = response.json()
-        assert "mint" in data, "Expected mint in response"
         
+        # Print the response for debugging
         print(f"Token metadata response: {json.dumps(data, indent=2)}")
+        
+        # Check expected fields
+        assert "name" in data, "Expected 'name' in response"
+        assert "symbol" in data, "Expected 'symbol' in response"
+        assert "mint" in data, "Expected 'mint' in response"
+        
+        # Check values for USDC token
+        assert data["mint"] == usdc_mint, "Mint address doesn't match"
+        assert data["name"] == "USD Coin", "Expected name to be 'USD Coin'"
+        assert data["symbol"] == "USDC", "Expected symbol to be 'USDC'"
     except Exception as e:
         print(f"Test failed with error: {str(e)}")
         # Continue with other tests even if this one fails
@@ -57,7 +67,20 @@ def test_token_supply_endpoint():
         assert response.status_code == 200, f"Expected 200 OK but got {response.status_code}"
         data = response.json()
         
+        # Print raw response for debugging
         print(f"Token supply response: {json.dumps(data, indent=2)}")
+        
+        # Check response structure against TokenSupply model
+        assert "mint_address" in data, "Response missing 'mint_address' field"
+        assert "total_supply" in data, "Response missing 'total_supply' field"
+        assert "circulating_supply" in data, "Response missing 'circulating_supply' field"
+        assert "decimals" in data, "Response missing 'decimals' field"
+        assert "total_holders" in data, "Response missing 'total_holders' field"
+        assert "max_supply" in data, "Response missing 'max_supply' field"
+        
+        # Check the address matches
+        assert data["mint_address"] == usdc_mint, "Mint address doesn't match request"
+        
     except Exception as e:
         print(f"Test failed with error: {str(e)}")
 
