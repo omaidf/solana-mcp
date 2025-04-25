@@ -11,9 +11,40 @@ import traceback
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Type, TypeVar, cast
 
-from fastapi import HTTPException, Request, status
+# Remove FastAPI dependencies
+# from fastapi import HTTPException, Request, status
 from pydantic import BaseModel
-from starlette.responses import JSONResponse
+
+# Create minimal replacements for FastAPI dependencies
+class HttpStatus:
+    """Replacement for FastAPI status codes."""
+    HTTP_400_BAD_REQUEST = 400
+    HTTP_401_UNAUTHORIZED = 401
+    HTTP_403_FORBIDDEN = 403
+    HTTP_404_NOT_FOUND = 404
+    HTTP_500_INTERNAL_SERVER_ERROR = 500
+    HTTP_502_BAD_GATEWAY = 502
+    HTTP_503_SERVICE_UNAVAILABLE = 503
+    HTTP_504_GATEWAY_TIMEOUT = 504
+
+status = HttpStatus
+
+class HTTPException(Exception):
+    """Replacement for FastAPI HTTPException."""
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"HTTP {status_code}: {detail}")
+
+class Request:
+    """Minimal placeholder for FastAPI Request."""
+    pass
+
+class JSONResponse:
+    """Minimal placeholder for Starlette JSONResponse."""
+    def __init__(self, status_code: int, content: Dict[str, Any]):
+        self.status_code = status_code
+        self.content = content
 
 # Type variable for function return type
 T = TypeVar('T')

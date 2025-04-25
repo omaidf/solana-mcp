@@ -16,7 +16,6 @@ import threading
 import logging
 import time
 from decimal import Decimal
-import random
 import requests
 
 from mcp.server.fastmcp import Context, FastMCP

@@ -7,7 +7,7 @@ from decimal import Decimal
 from solana_mcp.solana_client import SolanaClient, InvalidPublicKeyError
 from solana_mcp.services.whale_detector.models import TokenInfo, WhaleWallet, WhaleDetectionResult
 from solana_mcp.services.whale_detector.helpers import (
-    get_token_price, get_token_prices, calculate_wallet_value, determine_whale_threshold
+    get_token_prices, calculate_wallet_value, determine_whale_threshold
 )
 
 logger = logging.getLogger(__name__)
@@ -152,7 +152,7 @@ async def detect_whale_wallets(token_address: str, solana_client: SolanaClient) 
             name = metadata.get("name", "Unknown Token")
             
             # Get token price - use improved pricing method
-            price_data = await solana_client.get_token_price(token_address)
+            price_data = await solana_client.get_market_price(token_address)
             price_usd = Decimal(str(price_data.get("price", 0.01)))
             
             # Create token info object

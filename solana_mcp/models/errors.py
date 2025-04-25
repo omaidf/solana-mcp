@@ -24,6 +24,9 @@ warnings.warn(
     stacklevel=2
 )
 
+# Import from solana_client for backward compatibility
+from solana_mcp.solana_client import SolanaRpcError, InvalidPublicKeyError
+
 # Re-export for backward compatibility
 __all__ = [
     'ErrorCode',
@@ -44,11 +47,10 @@ __all__ = [
     'TaskCompletedError',
     'handle_api_errors',
     'global_exception_handler',
-    'explain_solana_error'
+    'explain_solana_error',
+    'SolanaRpcError',
+    'InvalidPublicKeyError'
 ]
-
-# Import from solana_client for backward compatibility
-from solana_mcp.solana_client import SolanaRpcError, InvalidPublicKeyError
 
 # Legacy implementation for backward compatibility
 def explain_solana_error(error_message: str) -> str:

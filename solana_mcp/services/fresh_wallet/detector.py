@@ -9,7 +9,6 @@ from solana_mcp.services.fresh_wallet.models import TokenInfo, FreshWallet, Fres
 from solana_mcp.services.fresh_wallet.helpers import (
     get_wallet_age_days, get_transaction_count, calculate_freshness_score, FRESH_WALLET_AGE_DAYS
 )
-from solana_mcp.services.whale_detector.helpers import get_token_price
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +159,8 @@ async def detect_fresh_wallets(token_address: str, solana_client: SolanaClient) 
             symbol = metadata.get("symbol", token_address[:6])
             
             # Get token price
-            price_usd = get_token_price(token_address)
+            price_data = await solana_client.get_market_price(token_address)
+            price_usd = Decimal(str(price_data.get("price", 0.01)))
             
             # Create token info object
             token_info = TokenInfo(
