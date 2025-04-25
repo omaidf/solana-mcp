@@ -28,26 +28,19 @@ async def get_token_holders(token_address: str, solana_client: SolanaClient, lim
         List of token holders with their balances
     """
     try:
-        # Get all token accounts for the mint
-        filters = [
-            {"dataSize": 165},  # Size of token account data
-            {"memcmp": {"offset": 0, "bytes": token_address}}
-        ]
+        # Use the new direct method to get token holders
+        holder_data = await solana_client.get_token_holders(token_address, limit)
         
-        accounts = await solana_client.get_program_accounts(
-            TOKEN_PROGRAM_ID,
-            filters=filters,
-            encoding="jsonParsed"
-        )
+        if "holders" not in holder_data or not holder_data["holders"]:
+            logger.warning(f"No holders found for {token_address}")
+            return []
         
-        # Process the accounts
+        # Convert to our expected format
         holders = []
-        
-        for account in accounts:
+        for holder in holder_data["holders"]:
             try:
-                parsed_info = account.get('account', {}).get('data', {}).get('parsed', {}).get('info', {})
-                owner = parsed_info.get('owner')
-                amount_str = parsed_info.get('tokenAmount', {}).get('amount', '0')
+                owner = holder.get("address", "")
+                amount_str = holder.get("amount", "0")
                 
                 # Skip empty accounts
                 if amount_str == '0':
@@ -59,12 +52,11 @@ async def get_token_holders(token_address: str, solana_client: SolanaClient, lim
                     'owner': owner,
                     'amount': amount
                 })
-            except (KeyError, TypeError) as e:
+            except (KeyError, TypeError, ValueError) as e:
+                logger.warning(f"Error processing holder: {str(e)}")
                 continue
                 
-        # Sort holders by amount (descending) and limit to top holders
-        holders.sort(key=lambda x: x['amount'], reverse=True)
-        return holders[:limit]
+        return holders
         
     except Exception as e:
         logger.error(f"Error fetching token holders: {str(e)}")
@@ -149,17 +141,19 @@ async def detect_whale_wallets(token_address: str, solana_client: SolanaClient) 
         
         # Get token info
         try:
-            # Get token supply
-            supply_data = await solana_client._make_request("getTokenSupply", [token_address])
-            decimals = supply_data.get("value", {}).get("decimals", 0)
-            total_supply = Decimal(supply_data.get("value", {}).get("amount", "0")) / Decimal(10 ** decimals)
+            # Get token supply - use improved method
+            supply_data = await solana_client.get_token_supply(token_address)
+            decimals = supply_data.get("decimals", 0)
+            total_supply = Decimal(supply_data.get("amount", "0")) / Decimal(10 ** decimals)
             
-            # Get token metadata
+            # Get token metadata - use improved method
             metadata = await solana_client.get_token_metadata(token_address)
             symbol = metadata.get("symbol", token_address[:6])
+            name = metadata.get("name", "Unknown Token")
             
-            # Get token price
-            price_usd = get_token_price(token_address)
+            # Get token price - use improved pricing method
+            price_data = await solana_client.get_token_price(token_address)
+            price_usd = Decimal(str(price_data.get("price", 0.01)))
             
             # Create token info object
             token_info = TokenInfo(
@@ -238,15 +232,33 @@ async def detect_whale_wallets(token_address: str, solana_client: SolanaClient) 
             # Create the result object
             result = WhaleDetectionResult(
                 token_address=token_address,
-                token_symbol=token_info.symbol,
-                token_price_usd=float(token_info.price_usd),
+                token_symbol=symbol,
+                token_price_usd=float(price_usd),
                 whale_threshold_usd=float(whale_threshold),
                 whale_count=len(whale_wallets),
                 whales=whale_wallets
             )
             
+            # Add additional fields for improved response
+            result_dict = vars(result)
+            result_dict["token_name"] = name
+            result_dict["decimals"] = decimals
+            result_dict["total_supply"] = float(total_supply)
+            result_dict["total_holders_analyzed"] = len(processed_wallets)
+            result_dict["total_holders"] = len(holders)
+            
+            # Add warnings if we're using fallback values
+            warnings = []
+            if price_data.get("source") == "fallback":
+                warnings.append(f"Using fallback price of ${price_usd}")
+            if total_supply <= 1:
+                warnings.append("Invalid total supply value, using default")
+                
+            if warnings:
+                result_dict["warnings"] = warnings
+                
             # Convert to dictionary for API response
-            return vars(result)
+            return result_dict
                 
         except InvalidPublicKeyError as e:
             logger.error(f"Invalid public key: {str(e)}")

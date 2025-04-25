@@ -1,9 +1,9 @@
 """Helper functions for whale detection."""
 
 import logging
-import requests
 from typing import Dict, List, Any, Optional
 from decimal import Decimal
+import asyncio
 
 from solana_mcp.services.whale_detector.models import TokenInfo, TokenValue, WalletValue
 
@@ -11,43 +11,6 @@ logger = logging.getLogger(__name__)
 
 # Constants
 SIGNIFICANT_VALUE_USD = 50000  # Minimum USD value to consider significant
-
-
-def get_token_price(token_address: str) -> Decimal:
-    """Get token price from Jupiter API.
-    
-    Args:
-        token_address: Token mint address
-        
-    Returns:
-        Token price in USD
-    """
-    try:
-        # First try Jupiter API
-        jupiter_url = f"https://price.jup.ag/v4/price?ids={token_address}"
-        response = requests.get(jupiter_url)
-        data = response.json()
-        
-        if data.get("data") and token_address in data["data"]:
-            price = data["data"][token_address]["price"]
-            return Decimal(str(price))
-            
-        # If Jupiter doesn't have it, try Birdeye API
-        birdeye_url = f"https://public-api.birdeye.so/public/price?address={token_address}"
-        headers = {"X-API-KEY": "5c88c2dddead4a1094fbcc5f2d86d6fe"}
-        response = requests.get(birdeye_url, headers=headers)
-        data = response.json()
-        
-        if data.get("success") and data.get("data", {}).get("value"):
-            price = data["data"]["value"]
-            return Decimal(str(price))
-            
-        logger.info(f"Could not find price for token {token_address}, using default price of $0.01")
-        return Decimal("0.01")  # Default fallback price
-    except Exception as e:
-        logger.warning(f"Error fetching token price: {str(e)}")
-        logger.info("Using default price of $0.01")
-        return Decimal("0.01")  # Default fallback price
 
 
 def get_token_prices(token_mints: List[str]) -> Dict[str, Decimal]:
@@ -63,25 +26,21 @@ def get_token_prices(token_mints: List[str]) -> Dict[str, Decimal]:
     
     # Add default prices for common tokens
     default_prices = {
-        "So11111111111111111111111111111111111111112": Decimal("150"),  # SOL - hardcoded estimate
+        "So11111111111111111111111111111111111111112": Decimal("100"),  # SOL - hardcoded estimate
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": Decimal("1"),   # USDC
         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": Decimal("1"),   # USDT
         "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj": Decimal("1"),   # stUSDC
-        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": Decimal("30"),  # BONK
+        "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263": Decimal("0.000025"),  # BONK
     }
     
     # Use the default prices
     prices.update(default_prices)
     
-    # For token mints not in defaults, try to get prices
+    # For other tokens, we'll use a default low price
+    # The actual price lookups happen through the SolanaClient.get_token_price method
     for mint in token_mints:
         if mint not in prices:
-            try:
-                price = get_token_price(mint)
-                prices[mint] = price
-            except:
-                # If we can't get price, use a very low default
-                prices[mint] = Decimal("0.0001")
+            prices[mint] = Decimal("0.01")  # Default fallback price
     
     return prices
 
@@ -106,7 +65,7 @@ def calculate_wallet_value(token_balances: List[Dict[str, Any]],
     for token in token_balances:
         mint = token['mint']
         amount = token['amount']
-        price = prices.get(mint, Decimal("0.0001"))  # Default very low price if unknown
+        price = prices.get(mint, Decimal("0.01"))  # Default price if unknown
         
         value = amount * price
         total_value += value
