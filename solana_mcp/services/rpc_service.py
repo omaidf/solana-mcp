@@ -319,33 +319,18 @@ class RPCService(BaseService):
         if not self._validate_public_key(mint):
             raise ValidationError(f"Invalid mint address: {mint}")
         
-        # This is a simplified implementation that would be replaced with actual Metaplex 
-        # metadata account lookup and parsing in a real implementation
+        # Import TokenClient to use the centralized implementation
+        from solana_mcp.clients.token_client import TokenClient
         
-        # First try to get the metadata account PDA
-        metadata_pda = self._find_metadata_pda(mint)
+        # Create a TokenClient with appropriate configuration
+        token_client = TokenClient(rpc_url=self.rpc_url, timeout=self.timeout)
         
         try:
-            # Get the metadata account
-            metadata_account = await self.get_account_info(metadata_pda, encoding="base64")
-            
-            # In a real implementation, we would parse the metadata account data
-            # Here we'll just return a placeholder
-            return {
-                "name": f"Token {mint[:8]}",
-                "symbol": mint[:4].upper(),
-                "uri": f"https://metadata.example.com/{mint}",
-                "mint": mint,
-                "is_nft": False
-            }
-        except (RpcError, ResourceNotFoundError):
-            # If metadata account not found, return minimal info
-            return {
-                "name": f"Unknown Token {mint[:8]}",
-                "symbol": "UNKN",
-                "mint": mint,
-                "is_nft": False
-            }
+            # Delegate to the TokenClient implementation
+            return await token_client.get_token_metadata(mint)
+        finally:
+            # Clean up the client
+            await token_client.close()
     
     @handle_errors()
     async def get_program_accounts(

@@ -1730,6 +1730,7 @@ async def get_token_metadata(ctx: Context, mint: str) -> str:
     """
     solana_client = ctx.request_context.lifespan_context.solana_client
     try:
+        # This calls the centralized implementation in solana_client which delegates to TokenClient
         metadata = await solana_client.get_token_metadata(mint)
         return json.dumps(metadata, indent=2)
     except InvalidPublicKeyError as e:

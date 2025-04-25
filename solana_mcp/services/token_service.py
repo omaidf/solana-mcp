@@ -259,6 +259,7 @@ class TokenService(BaseService):
         if not token_address or len(token_address) < 32:
             raise ValidationError(f"Invalid token address: {token_address}")
             
+        # Simply delegate to RPC service which has been updated to use TokenClient
         try:
             return await self.with_timeout(
                 self.rpc_service.get_token_metadata(token_address)

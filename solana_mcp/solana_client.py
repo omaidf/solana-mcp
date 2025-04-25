@@ -723,116 +723,14 @@ class SolanaClient:
         Raises:
             InvalidPublicKeyError: If the mint address is invalid
         """
-        if not validate_public_key(mint):
-            raise InvalidPublicKeyError(mint)
+        # Import here to avoid circular import issues
+        from solana_mcp.clients.token_client import TokenClient
         
-        # Known tokens for fast lookup
-        known_tokens = {
-            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": {
-                "name": "USD Coin",
-                "symbol": "USDC",
-                "decimals": 6,
-                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-            },
-            "So11111111111111111111111111111111111111112": {
-                "name": "Wrapped SOL",
-                "symbol": "SOL",
-                "decimals": 9,
-                "mint": "So11111111111111111111111111111111111111112"
-            },
-            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB": {
-                "name": "USDT", 
-                "symbol": "USDT",
-                "decimals": 6,
-                "mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
-            }
-        }
+        # Create a TokenClient instance with the same config
+        token_client = TokenClient(self.config)
         
-        # Check if this is a known token for fast path
-        if mint in known_tokens:
-            logger.debug(f"Using known token metadata for {mint}")
-            return known_tokens[mint]
-        
-        # Default metadata with mint included
-        default_metadata = {
-            "name": "Unknown Token",
-            "symbol": "UNKNOWN",
-            "decimals": 0,
-            "mint": mint
-        }
-        
-        try:
-            logger.debug(f"Fetching token metadata for mint: {mint}")
-            
-            # Get account info with jsonParsed encoding for direct metadata access
-            response = await self._make_request(
-                "getAccountInfo",
-                [
-                    mint,
-                    {"encoding": "jsonParsed"}
-                ]
-            )
-            
-            # Check if we got a valid response
-            if not response or "value" not in response:
-                logger.warning(f"No account info found for mint: {mint}")
-                return default_metadata
-            
-            account_info = response["value"]
-            if not account_info:
-                logger.warning(f"Empty account info for mint: {mint}")
-                return default_metadata
-            
-            # Check if this is a token account (owner is Token Program)
-            if account_info.get("owner") != TOKEN_PROGRAM_ID:
-                logger.warning(f"Account {mint} is not a token account")
-                
-                # Try to get metadata via the Metaplex account instead
-                try:
-                    # There are many tokens created by other token programs, especially those using SPL Token 2022
-                    # Try to get token metadata from the tokenExtensions data field
-                    if "data" in account_info and "parsed" in account_info["data"]:
-                        parsed_data = account_info["data"]["parsed"]
-                        if "type" in parsed_data and "info" in parsed_data:
-                            # Check if this is a token account with a different program
-                            info = parsed_data["info"]
-                            if "name" in info or "symbol" in info:
-                                return {
-                                    "name": info.get("name", default_metadata["name"]),
-                                    "symbol": info.get("symbol", default_metadata["symbol"]),
-                                    "decimals": info.get("decimals", default_metadata["decimals"]),
-                                    "mint": mint
-                                }
-                except Exception as e:
-                    logger.warning(f"Error parsing alternative token data for {mint}: {str(e)}")
-                    
-                return default_metadata
-            
-            # Extract token info from the parsed data
-            if "data" in account_info and "parsed" in account_info["data"]:
-                parsed_data = account_info["data"]["parsed"]
-                
-                if "type" in parsed_data and parsed_data["type"] == "mint" and "info" in parsed_data:
-                    token_info = parsed_data["info"]
-                    
-                    # Extract relevant fields
-                    metadata = {
-                        "name": token_info.get("name", default_metadata["name"]),
-                        "symbol": token_info.get("symbol", default_metadata["symbol"]),
-                        "decimals": token_info.get("decimals", default_metadata["decimals"]),
-                        "mint": mint
-                    }
-                    
-                    logger.debug(f"Successfully parsed metadata for {mint}: {metadata}")
-                    return metadata
-            
-            # Fall back to default if we couldn't parse the data
-            logger.warning(f"Could not parse token info from account data for {mint}")
-            return default_metadata
-            
-        except Exception as e:
-            logger.error(f"Error fetching token metadata for {mint}: {str(e)}")
-            return default_metadata
+        # Delegate to the TokenClient implementation
+        return await token_client.get_token_metadata(mint)
     
     async def get_token_price_birdeye(self, token_mint: str) -> Dict[str, Any]:
         """Get token price data from Birdeye API.
