@@ -95,6 +95,50 @@ class SolanaAnalyzer:
             await self.session.close()
             self.session = None
 
+    async def _rpc_request(self, payload: Dict) -> Dict:
+        """
+        Make a JSON-RPC request to the Solana API endpoint
+        
+        Args:
+            payload: The JSON-RPC payload to send
+            
+        Returns:
+            The JSON response from the server
+        """
+        # Ensure we have an active session
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+            
+        retries = 0
+        backoff = self.base_backoff
+        
+        while retries <= self.max_retries:
+            try:
+                async with self.session.post(self.rpc_endpoint, json=payload) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    elif response.status == 429:  # Rate limited
+                        logger.warning(f"Rate limited by RPC provider. Retrying in {backoff} seconds...")
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"RPC Error (HTTP {response.status}): {error_text}")
+                        
+                        # If it's a server error, retry. Otherwise, raise exception
+                        if response.status < 500:
+                            raise ValueError(f"RPC request failed with status {response.status}: {error_text}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"Network error during RPC request: {str(e)}")
+            
+            # Exponential backoff
+            retries += 1
+            if retries <= self.max_retries:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, self.max_backoff)
+            else:
+                raise ValueError(f"RPC request failed after {self.max_retries} retries")
+        
+        raise ValueError("RPC request failed")
+
     # Core RPC Methods ========================================================
 
     async def get_account_info(self, account_address: str, encoding: str = "jsonParsed") -> AccountInfo:
