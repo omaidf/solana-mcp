@@ -609,7 +609,19 @@ class SolanaAnalyzer:
             # Identify intent using pre-computed flags
             if has_balance_keyword:
                 await self._handle_balance_query(addresses, result)
-                    
+            
+            # Prioritize token-related intents when "token" is explicitly mentioned
+            elif "token" in prompt_lower and addresses:
+                # First check if it's a token info query
+                if has_token_info_keyword or "info" in prompt_lower:
+                    await self._handle_token_info_query(addresses, prompt, prompt_lower, result)
+                # Then check if it's a token holdings query
+                elif has_token_holdings_keyword and has_token_ownership_keyword:
+                    await self._handle_token_holdings_query(addresses, result)
+                else:
+                    # Default to token info if just asking about a "token" with an address
+                    await self._handle_token_info_query(addresses, prompt, prompt_lower, result)
+            
             elif has_token_holdings_keyword and has_token_ownership_keyword:
                 await self._handle_token_holdings_query(addresses, result)
                 
@@ -815,9 +827,34 @@ class SolanaAnalyzer:
             # If we have a mint address, use it to find holders
             if mint_address:
                 if not candidate_addresses:
-                    result["error"] = "Looking for whales requires providing multiple addresses or using a specific API endpoint."
-                    return
-                    
+                    # Instead of returning an error, fetch top holders for this token
+                    try:
+                        # Use Helius API to fetch top holders for this token
+                        url = f"https://api.helius.xyz/v0/tokens/top-holders?api-key={self.helius_api_key}"
+                        payload = {"mint": mint_address}
+                        
+                        async with self.session.post(url, json=payload) as response:
+                            if response.status == 200:
+                                holders_data = await response.json()
+                                
+                                # Extract holder addresses
+                                candidate_addresses = [holder['owner'] for holder in holders_data][:max_holders]
+                                
+                                if not candidate_addresses:
+                                    result["error"] = "Could not find any holder data for this token."
+                                    return
+                                
+                                # Continue with whale analysis using these addresses
+                                logger.info(f"Fetched {len(candidate_addresses)} top holders for token {mint_address}")
+                            else:
+                                # Fallback message if the API doesn't support this
+                                result["error"] = "Could not automatically fetch top holders. Please provide specific wallet addresses to analyze."
+                                return
+                    except Exception as e:
+                        logger.error(f"Error fetching top token holders: {str(e)}")
+                        result["error"] = f"Error fetching top holders: {str(e)}"
+                        return
+                
                 # Use the candidate addresses for whale detection
                 whale_results = await self.find_whales(
                     candidate_addresses, 
