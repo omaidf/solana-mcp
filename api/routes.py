@@ -37,6 +37,10 @@ class ContextResponse(BaseModel):
     model_type: str
     timestamp: int
 
+class RpcHealthRequest(BaseModel):
+    network: Optional[str] = "mainnet"
+    custom_url: Optional[str] = None
+
 # Endpoints
 @api_router.get("/status")
 async def get_status():
@@ -47,39 +51,98 @@ async def get_status():
         "blockchain": "solana"
     }
 
+@api_router.post("/health")
+async def check_rpc_health(request: RpcHealthRequest = RpcHealthRequest()):
+    """
+    Check the health and responsiveness of the Solana RPC endpoint
+    
+    Args:
+        request: Optional network or custom URL to check
+        
+    Returns:
+        Dict containing health status and metrics
+    """
+    try:
+        async with SolanaClient(network=request.network, custom_url=request.custom_url) as client:
+            health_data = await client.health_check()
+            return health_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
+
 @api_router.post("/account")
 async def get_account_info(request: BlockchainRequest):
-    """Get Solana account information"""
+    """
+    Get detailed information about a Solana account
+    
+    Args:
+        request: The blockchain request containing address and network
+        
+    Returns:
+        Dict containing detailed account information including lamports, owner, executable status, and data
+        
+    Raises:
+        HTTPException: If the account information cannot be retrieved
+    """
     try:
-        client = SolanaClient(network=request.network)
-        account_info = await client.get_account_info(request.address)
-        return account_info
+        async with SolanaClient(network=request.network) as client:
+            account_info = await client.get_account_info(request.address)
+            return account_info
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.post("/transaction")
 async def get_transaction(request: TransactionRequest):
-    """Get transaction information"""
+    """
+    Get detailed information about a Solana transaction
+    
+    Args:
+        request: The transaction request containing signature and network
+        
+    Returns:
+        Dict containing transaction details including status, fees, and involved accounts
+        
+    Raises:
+        HTTPException: If the transaction information cannot be retrieved
+    """
     try:
-        client = SolanaClient(network=request.network)
-        tx_info = await client.get_transaction(request.signature)
-        return tx_info
+        async with SolanaClient(network=request.network) as client:
+            tx_info = await client.get_transaction(request.signature)
+            return tx_info
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.post("/context", response_model=ContextResponse)
 async def generate_context(request: ContextRequest):
-    """Generate model context for a Solana address"""
+    """
+    Generate model context for a Solana address
+    
+    This endpoint processes blockchain data to create context information
+    for different model types like transaction history or token holdings.
+    
+    Args:
+        request: The context request with address, model type, and optional parameters
+        
+    Returns:
+        ContextResponse: A structured context response with model-specific data
+        
+    Raises:
+        HTTPException: If context generation fails
+    """
     try:
-        context = ModelContext(model_type=request.model_type)
-        result = await context.generate(request.address, request.parameters)
-        return result
+        async with ModelContext(model_type=request.model_type) as context:
+            result = await context.generate(request.address, request.parameters)
+            return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/models")
 async def list_available_models():
-    """List all available models for context generation"""
+    """
+    List all available models for context generation
+    
+    Returns:
+        Dict containing a list of available models with their descriptions
+    """
     return {
         "models": [
             {

@@ -6,6 +6,8 @@ import json
 import base64
 import asyncio
 import logging
+import time
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Union, cast
 from decimal import Decimal
 
@@ -222,17 +224,63 @@ class SolanaClient:
             logger.exception(f"Error fetching token accounts for {address}")
             raise Exception(f"Error fetching token accounts: {str(e)}")
     
-    def _process_transaction_message(self, transaction: VersionedTransaction) -> Dict[str, Any]:
-        """Process transaction message data"""
-        # This is a simplified implementation
-        # In a production environment, you would want to fully decode the transaction
-        if hasattr(transaction, 'message'):
-            return {
-                "accounts": [str(pk) for pk in transaction.message.account_keys],
-                "instructions": len(transaction.message.instructions),
-                # Additional message processing would go here
-            }
-        return {}
+    def _process_transaction_message(self, transaction: Any) -> Dict[str, Any]:
+        """
+        Process transaction message data with proper handling of different versions
+        
+        Args:
+            transaction: The transaction object from RPC response
+            
+        Returns:
+            Dict[str, Any]: Processed transaction message data
+        """
+        result = {
+            "accounts": [],
+            "instructions": 0,
+            "version": "legacy"
+        }
+        
+        try:
+            # Handle versioned transactions (0.14.0+ Solana)
+            if hasattr(transaction, "version"):
+                result["version"] = str(transaction.version)
+                
+            # Extract message from different transaction types
+            message = None
+            if hasattr(transaction, 'message'):
+                message = transaction.message
+            elif hasattr(transaction, 'compiled_message'):
+                message = transaction.compiled_message
+                
+            if message:
+                # Extract account keys based on available properties
+                if hasattr(message, 'account_keys'):
+                    result["accounts"] = [str(pk) for pk in message.account_keys]
+                elif hasattr(message, 'static_account_keys'):
+                    result["accounts"] = [str(pk) for pk in message.static_account_keys]
+                    # Add address lookup table accounts if available
+                    if hasattr(message, 'address_table_lookups'):
+                        result["address_table_lookups"] = len(message.address_table_lookups)
+                
+                # Extract instructions
+                if hasattr(message, 'instructions'):
+                    result["instructions"] = len(message.instructions)
+                    
+                    # For detailed instruction parsing in v0/v1 transactions
+                    instructions_data = []
+                    for idx, instr in enumerate(message.instructions):
+                        instr_data = {
+                            "program_idx": instr.program_id_index if hasattr(instr, 'program_id_index') else None,
+                            "accounts": instr.accounts if hasattr(instr, 'accounts') else [],
+                            "data_len": len(instr.data) if hasattr(instr, 'data') else 0
+                        }
+                        instructions_data.append(instr_data)
+                    result["instructions_data"] = instructions_data
+        except Exception as e:
+            logger.warning(f"Error processing transaction message: {str(e)}")
+            result["error"] = str(e)
+            
+        return result
         
     @staticmethod
     def lamports_to_sol(lamports: Union[int, float]) -> float:
@@ -246,4 +294,46 @@ class SolanaClient:
         # Convert to Decimal for higher precision in financial calculations
         if not isinstance(sol, Decimal):
             sol = Decimal(str(sol))  # Use string to avoid precision issues
-        return int(sol * 1_000_000_000) 
+        return int(sol * 1_000_000_000)
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """
+        Check if the RPC endpoint is responsive and functioning properly
+        
+        Returns:
+            Dict[str, Any]: Health status information including response time
+        """
+        try:
+            start_time = time.time()
+            
+            # Make a simple getVersion request to check if RPC is responsive
+            response = await self.client.get_version()
+            
+            # Calculate response time
+            response_time = (time.time() - start_time) * 1000  # in milliseconds
+            
+            # Get additional genesis hash to confirm we're connected to the expected network
+            genesis_response = await self.client.get_genesis_hash()
+            
+            health_data = {
+                "status": "healthy",
+                "rpc_endpoint": self.endpoint.split("?")[0],  # Remove API key
+                "network": self.network,
+                "solana_version": response.value.solana_core if hasattr(response.value, "solana_core") else "unknown",
+                "feature_set": response.value.feature_set if hasattr(response.value, "feature_set") else None,
+                "genesis_hash": str(genesis_response.value) if genesis_response.value else "unknown",
+                "response_time_ms": round(response_time, 2),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            
+            return health_data
+            
+        except Exception as e:
+            logger.error(f"Health check failed: {str(e)}")
+            return {
+                "status": "unhealthy",
+                "error": str(e),
+                "rpc_endpoint": self.endpoint.split("?")[0],  # Remove API key
+                "network": self.network,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            } 

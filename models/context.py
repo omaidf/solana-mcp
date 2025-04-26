@@ -31,9 +31,13 @@ class ModelContext:
         self.network = network
         self._solana_client = None
         
-    @property
-    async def solana_client(self) -> SolanaClient:
-        """Get or create a SolanaClient instance with proper lifecycle management"""
+    async def get_solana_client(self) -> SolanaClient:
+        """
+        Get or create a SolanaClient instance with proper lifecycle management
+        
+        Returns:
+            SolanaClient: A properly initialized Solana client
+        """
         if self._solana_client is None:
             self._solana_client = SolanaClient(network=self.network)
             await self._solana_client.__aenter__()
@@ -47,14 +51,28 @@ class ModelContext:
             
     async def __aenter__(self):
         """Async context manager entry"""
+        self._in_context_manager = True
         return self
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit"""
+        self._in_context_manager = False
         await self.close()
         
     async def generate(self, address: str, parameters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Generate model context for a given address"""
+        """
+        Generate model context for a given address
+        
+        Args:
+            address: The Solana address to generate context for
+            parameters: Optional parameters to customize the context generation
+            
+        Returns:
+            Dict[str, Any]: The generated context data with metadata
+            
+        Raises:
+            ValueError: If the model type is unsupported or if context generation fails
+        """
         if parameters is None:
             parameters = {}
             
@@ -62,8 +80,9 @@ class ModelContext:
         context_id = str(uuid.uuid4())
         timestamp = int(time.time())
         
-        # Generate data based on model type
+        client_created_here = False
         try:
+            # Generate data based on model type
             if self.model_type == "transaction-history":
                 data = await self._generate_transaction_history(address, parameters)
             elif self.model_type == "token-holdings":
@@ -81,16 +100,20 @@ class ModelContext:
             }
             
             return response
+        except Exception as e:
+            # Re-raise with context
+            raise ValueError(f"Context generation failed: {str(e)}") from e
         finally:
-            # Clean up resources
-            if not isinstance(self._solana_client, property):
+            # Only close the client if we're not in a context manager
+            # If this ModelContext instance is used with async with, let __aexit__ handle it
+            if not hasattr(self, "_in_context_manager") or not self._in_context_manager:
                 await self.close()
         
     async def _generate_transaction_history(self, address: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """Generate transaction history context for an address"""
         try:
             # Get account info
-            account_info = await self.solana_client.get_account_info(address)
+            account_info = await self.get_solana_client().get_account_info(address)
             
             # Get recent transactions
             # Note: For a complete implementation, you would need to use a
@@ -98,7 +121,7 @@ class ModelContext:
             # This is a simplified placeholder
             
             # Get basic account balance
-            balance = await self.solana_client.get_balance(address)
+            balance = await self.get_solana_client().get_balance(address)
             
             context = {
                 "summary": {
@@ -124,10 +147,10 @@ class ModelContext:
         """Generate token holdings context for an address"""
         try:
             # Get SOL balance
-            balance = await self.solana_client.get_balance(address)
+            balance = await self.get_solana_client().get_balance(address)
             
             # Get token accounts with proper decimal handling
-            token_accounts = await self.solana_client.get_token_accounts(address)
+            token_accounts = await self.get_solana_client().get_token_accounts(address)
             
             # Process token holdings
             tokens = []
