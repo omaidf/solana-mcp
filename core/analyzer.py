@@ -5,12 +5,30 @@ This module contains the SolanaAnalyzer class and related functionality
 import os
 import asyncio
 import aiohttp
+from aiohttp import ClientError, ClientResponseError, ClientTimeout
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, TypedDict, Any, cast
 from dataclasses import dataclass
+from decimal import Decimal
 import json
 import logging
 import re
+from dotenv import load_dotenv
+import structlog
+
+# Try to import Solana-specific libraries, with fallback if not available
+try:
+    from solders.pubkey import Pubkey
+except ImportError:
+    # Define a placeholder for development without Solana libs
+    class Pubkey:
+        @staticmethod
+        def from_string(s: str):
+            return s
+
+# Load environment variables
+load_dotenv()
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -53,9 +71,9 @@ class TransactionInfo:
 
 class SolanaAnalyzer:
     def __init__(self):
-        # API configuration
-        self.helius_api_key = "4ffc1228-f093-4974-ad2d-3edd8e5f7c03"
-        self.birdeye_api_key = "03ea781299dd4b8cbe356eea90c7219e"
+        # API configuration from environment variables with fallbacks
+        self.helius_api_key = os.getenv("HELIUS_API_KEY", "4ffc1228-f093-4974-ad2d-3edd8e5f7c03")
+        self.birdeye_api_key = os.getenv("BIRDEYE_API_KEY", "03ea781299dd4b8cbe356eea90c7219e")
         self.rpc_endpoint = f"https://mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
         logger.info(f"Using RPC endpoint: {self.rpc_endpoint}")
         
@@ -77,16 +95,21 @@ class SolanaAnalyzer:
         
         # Session management
         self.session = None
+        self.timeout = ClientTimeout(total=30, connect=10)  # Add timeout configuration
         
         # Request backoff parameters for rate limiting
         self.base_backoff = 0.5  # Starting backoff time in seconds
         self.max_backoff = 10    # Maximum backoff time in seconds
         self.max_retries = 3     # Maximum number of retry attempts
+        
+        # Cache management limits
+        self.max_cache_items = 1000  # Maximum items per cache category
 
     async def __aenter__(self):
         """Initialize aiohttp session when used in async context"""
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            self.session = aiohttp.ClientSession(timeout=self.timeout)
+            logger.debug("Created new aiohttp session")
         return self
         
     async def __aexit__(self, exc_type, exc, tb):
@@ -94,6 +117,16 @@ class SolanaAnalyzer:
         if self.session and not self.session.closed:
             await self.session.close()
             self.session = None
+            logger.debug("Closed aiohttp session")
+
+    async def close(self):
+        """Explicit method to close resources"""
+        if self.session and not self.session.closed:
+            await self.session.close()
+            self.session = None
+            logger.debug("Explicitly closed aiohttp session")
+        # Clear caches to free memory
+        self.clear_cache()
 
     async def _rpc_request(self, payload: Dict) -> Dict:
         """
@@ -107,7 +140,7 @@ class SolanaAnalyzer:
         """
         # Ensure we have an active session
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            self.session = aiohttp.ClientSession(timeout=self.timeout)
             
         retries = 0
         backoff = self.base_backoff
@@ -119,25 +152,37 @@ class SolanaAnalyzer:
                         return await response.json()
                     elif response.status == 429:  # Rate limited
                         logger.warning(f"Rate limited by RPC provider. Retrying in {backoff} seconds...")
+                        # Increment retries and apply backoff for rate limiting
+                        retries += 1
+                        if retries <= self.max_retries:
+                            await asyncio.sleep(backoff)
+                            backoff = min(backoff * 2, self.max_backoff)
+                        else:
+                            raise ValueError(f"RPC request failed after {self.max_retries} retries due to rate limiting")
                     else:
                         error_text = await response.text()
                         logger.error(f"RPC Error (HTTP {response.status}): {error_text}")
                         
                         # If it's a server error, retry. Otherwise, raise exception
-                        if response.status < 500:
+                        if response.status >= 500:
+                            retries += 1
+                            if retries <= self.max_retries:
+                                await asyncio.sleep(backoff)
+                                backoff = min(backoff * 2, self.max_backoff)
+                            else:
+                                raise ValueError(f"RPC request failed with status {response.status} after {self.max_retries} retries: {error_text}")
+                        else:
                             raise ValueError(f"RPC request failed with status {response.status}: {error_text}")
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 logger.warning(f"Network error during RPC request: {str(e)}")
-            
-            # Exponential backoff
-            retries += 1
-            if retries <= self.max_retries:
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, self.max_backoff)
-            else:
-                raise ValueError(f"RPC request failed after {self.max_retries} retries")
+                retries += 1
+                if retries <= self.max_retries:
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, self.max_backoff)
+                else:
+                    raise ValueError(f"RPC request failed after {self.max_retries} retries due to network error: {str(e)}")
         
-        raise ValueError("RPC request failed")
+        raise ValueError("RPC request failed: maximum retries exceeded")
 
     # Core RPC Methods ========================================================
 
@@ -754,45 +799,71 @@ class SolanaAnalyzer:
         result["intent"] = "find_whales"
         
         # Extract candidate addresses for whale analysis
-        if len(addresses) > 1:
-            min_usd = 50000  # Default
+        if not addresses:
+            result["error"] = "No wallet addresses found for whale analysis. Please include at least one Solana address."
+            return
             
-            # Compile value patterns for better performance
-            value_patterns = [
-                re.compile(r'(\d+(?:\.\d+)?)\s*(?:k|thousand)'),
-                re.compile(r'(\d+(?:\.\d+)?)\s*(?:m|million)'),
-                re.compile(r'(\d+(?:\.\d+)?)\s*(?:dollars|usd)'),
-                re.compile(r'(?:usd|dollars|value|threshold)\s*(?:of|is|=|:)?\s*(\d+(?:\.\d+)?(?:k|m)?)')
-            ]
+        # Use the provided address as the token mint if only one is given
+        mint_address = addresses[0] if len(addresses) == 1 else None
+        candidate_addresses = addresses[1:] if len(addresses) > 1 else []
+        
+        # Default settings
+        min_usd = 50000
+        max_holders = 20
             
-            # Re-use the USD units check
-            has_usd_units = any(unit in prompt_lower for unit in ["dollar", "usd", "$"])
-            
-            for pattern in value_patterns:
-                value_match = pattern.search(prompt_lower)
-                if value_match:
-                    value_str = value_match.group(1).upper()
+        # Extract threshold values from prompt
+        # Compile value patterns for better performance
+        value_patterns = [
+            re.compile(r'(\d+(?:\.\d+)?)\s*(?:k|thousand)'),
+            re.compile(r'(\d+(?:\.\d+)?)\s*(?:m|million)'),
+            re.compile(r'(\d+(?:\.\d+)?)\s*(?:dollars|usd)'),
+            re.compile(r'(?:usd|dollars|value|threshold)\s*(?:of|is|=|:)?\s*(\d+(?:\.\d+)?(?:k|m)?)')
+        ]
+        
+        # Check for USD units in the query
+        has_usd_units = any(unit in prompt_lower for unit in ["dollar", "usd", "$"])
+        
+        # Extract value threshold from prompt
+        for pattern in value_patterns:
+            value_match = pattern.search(prompt_lower)
+            if value_match:
+                value_str = value_match.group(1).upper()
+                
+                # Handle k/m suffixes in the value
+                if 'K' in value_str:
+                    min_usd = float(value_str.replace('K', '')) * 1000
+                elif 'M' in value_str:
+                    min_usd = float(value_str.replace('M', '')) * 1000000
+                else:
+                    min_usd = float(value_str)
+                
+                # If we're not explicitly using dollars and no dollar terms in the query
+                if pattern != value_patterns[2] and not has_usd_units:
+                    # Assume it's in SOL, convert to USD with estimate
+                    sol_price_estimate = 150
+                    min_usd = min_usd * sol_price_estimate
+                
+                break
+        
+        try:
+            # If we have a mint address, use it to find holders
+            if mint_address:
+                if not candidate_addresses:
+                    result["error"] = "Looking for whales requires providing multiple addresses or using a specific API endpoint."
+                    return
                     
-                    # Handle k/m suffixes in the value
-                    if 'K' in value_str:
-                        min_usd = float(value_str.replace('K', '')) * 1000
-                    elif 'M' in value_str:
-                        min_usd = float(value_str.replace('M', '')) * 1000000
-                    else:
-                        min_usd = float(value_str)
-                    
-                    # If we're not explicitly using dollars and no dollar terms in the query
-                    if pattern != value_patterns[2] and not has_usd_units:
-                        # Assume it's in SOL, convert to USD with estimate
-                        sol_price_estimate = 150
-                        min_usd = min_usd * sol_price_estimate
-                    
-                    break
-            
-            whale_results = await self.find_whales(addresses, min_usd_value=min_usd)
-            result["data"] = whale_results
-        else:
-            result["error"] = "Not enough wallet addresses found for whale analysis. Please provide multiple wallet addresses."
+                # Use the candidate addresses for whale detection
+                whale_results = await self.find_whales(
+                    candidate_addresses, 
+                    min_usd_value=min_usd,
+                    max_wallets=max_holders
+                )
+                result["data"] = whale_results
+            else:
+                result["error"] = "Unable to determine token address for whale detection. Please specify a token address followed by potential whale addresses."
+        except Exception as e:
+            logger.error(f"Error in whale detection: {str(e)}")
+            result["error"] = f"Error processing whale detection: {str(e)}"
 
     async def _handle_account_info_query(self, addresses: List[str], result: Dict) -> None:
         """Helper method to handle account info queries"""
@@ -960,25 +1031,55 @@ class SolanaAnalyzer:
             if key in self.cache.get(cache_type, {}):
                 cached = self.cache[cache_type][key]
                 if datetime.now() - cached['timestamp'] < self.cache_expiry.get(cache_type, timedelta(minutes=10)):
+                    # Update the timestamp to keep frequently used items fresh
+                    self.cache[cache_type][key]['timestamp'] = datetime.now()
                     return cached['data']
+                else:
+                    # Remove expired item
+                    del self.cache[cache_type][key]
         except Exception as e:
             logger.warning(f"Error retrieving from cache: {str(e)}")
         return None
 
     async def _set_cache(self, key: str, data: object, cache_type: str):
-        """Store data in cache with improved error handling"""
+        """Store data in cache with improved error handling and size management"""
         try:
             if cache_type not in self.cache:
                 self.cache[cache_type] = {}
                 
-            # Use a more efficient approach to avoid potential memory leaks
-            # Limit cache size per type (future optimization)
+            # Check cache size and remove oldest items if needed
+            cache_dict = self.cache[cache_type]
+            if len(cache_dict) >= self.max_cache_items:
+                # Sort by timestamp and remove oldest 10% of items
+                items_to_remove = int(self.max_cache_items * 0.1)
+                oldest_keys = sorted(
+                    cache_dict.keys(), 
+                    key=lambda k: cache_dict[k]['timestamp']
+                )[:items_to_remove]
+                
+                for old_key in oldest_keys:
+                    del cache_dict[old_key]
+                
+                logger.debug(f"Cache pruning: removed {len(oldest_keys)} old items from {cache_type} cache")
+                
+            # Add the new item to cache
             self.cache[cache_type][key] = {
                 'data': data,
                 'timestamp': datetime.now()
             }
         except Exception as e:
             logger.warning(f"Error setting cache: {str(e)}")
+            
+    def clear_cache(self, cache_type: Optional[str] = None):
+        """Clear cache data, either all or a specific type"""
+        if cache_type:
+            if cache_type in self.cache:
+                self.cache[cache_type] = {}
+                logger.info(f"Cleared {cache_type} cache")
+        else:
+            for cache_key in self.cache:
+                self.cache[cache_key] = {}
+            logger.info("Cleared all cache data")
 
     @staticmethod
     def lamports_to_sol(lamports: int) -> float:
