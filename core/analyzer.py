@@ -562,12 +562,6 @@ class SolanaAnalyzer:
             addresses = address_pattern.findall(prompt)
             result["entities"]["addresses"] = addresses
             
-            # Extract transaction signatures (longer than regular addresses)
-            # Use list comprehension for better performance
-            tx_signatures = [addr for addr in addresses if len(addr) > 44]
-            if tx_signatures:
-                result["entities"]["transaction_signatures"] = tx_signatures
-            
             # Define keyword sets as frozen sets for faster lookup
             # In a real optimization, these would be defined at the module level
             balance_keywords = frozenset([
@@ -592,12 +586,6 @@ class SolanaAnalyzer:
                 "statistics", "metrics", "token stats", "token supply", "circulation"
             ])
             
-            transaction_keywords = frozenset([
-                "transaction", "tx", "signature", "transaction details", "tx history",
-                "blockchain tx", "payment", "transfer", "recent tx", "transaction status",
-                "tx hash", "transaction hash", "tx signature"
-            ])
-            
             whale_keywords = frozenset([
                 "whale", "whales", "large holder", "big wallet", "rich wallet", "big player",
                 "major holder", "significant holder", "large investor", "large balance",
@@ -615,7 +603,6 @@ class SolanaAnalyzer:
             has_token_holdings_keyword = any(kw in prompt_lower for kw in token_holdings_keywords)
             has_token_ownership_keyword = any(kw in prompt_lower for kw in token_ownership_keywords)
             has_token_info_keyword = any(kw in prompt_lower for kw in token_info_keywords)
-            has_transaction_keyword = any(kw in prompt_lower for kw in transaction_keywords)
             has_whale_keyword = any(kw in prompt_lower for kw in whale_keywords)
             has_account_keyword = any(kw in prompt_lower for kw in account_keywords)
             
@@ -628,9 +615,6 @@ class SolanaAnalyzer:
                 
             elif has_token_info_keyword:
                 await self._handle_token_info_query(addresses, prompt, prompt_lower, result)
-            
-            elif has_transaction_keyword:
-                await self._handle_transaction_query(tx_signatures, prompt_lower, result)
             
             elif has_whale_keyword:
                 await self._handle_whale_query(addresses, prompt_lower, result)
@@ -775,31 +759,6 @@ class SolanaAnalyzer:
                 result["error"] = f"Found references to tokens: {', '.join(specific_tokens)}. Please provide a token address for more details."
             else:
                 result["error"] = "No token address or symbol found in the prompt. Please include a valid token address."
-
-    async def _handle_transaction_query(self, tx_signatures: List[str], prompt_lower: str, result: Dict) -> None:
-        """Helper method to handle transaction queries"""
-        result["intent"] = "get_transaction"
-        
-        if tx_signatures:
-            tx_info = await self.get_transaction(tx_signatures[0])
-            result["data"] = {
-                "signature": tx_info.signature,
-                "timestamp": tx_info.timestamp,
-                "status": tx_info.status,
-                "fee": tx_info.fee,
-                "accounts_involved": len(tx_info.accounts),
-                "first_5_accounts": tx_info.accounts[:5] if tx_info.accounts else []
-            }
-        else:
-            # Compile regex for better performance
-            short_tx_pattern = re.compile(r'tx\s*[:=]?\s*([A-Za-z0-9]{10,25})')
-            short_tx = short_tx_pattern.search(prompt_lower)
-            
-            if short_tx:
-                result["entities"]["short_tx"] = short_tx.group(1)
-                result["error"] = f"Found partial transaction signature: {short_tx.group(1)}. Please provide the complete signature."
-            else:
-                result["error"] = "No transaction signature found in the prompt. Please include a valid transaction signature."
 
     async def _handle_whale_query(self, addresses: List[str], prompt_lower: str, result: Dict) -> None:
         """Helper method to handle whale queries"""
