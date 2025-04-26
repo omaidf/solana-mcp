@@ -6,7 +6,8 @@ import json
 import base64
 import asyncio
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union, cast
+from decimal import Decimal
 
 from solana.rpc.async_api import AsyncClient
 from solders.pubkey import Pubkey
@@ -43,6 +44,20 @@ class SolanaClient:
             
         self.client = AsyncClient(self.endpoint)
         self.network = network
+        
+    async def __aenter__(self):
+        """Async context manager entry"""
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit with cleanup"""
+        await self.close()
+        
+    async def close(self):
+        """Close the client and release resources"""
+        if hasattr(self.client, 'close') and callable(self.client.close):
+            await self.client.close()
+        logger.debug("Closed Solana client")
         
     async def get_account_info(self, address: str) -> Dict[str, Any]:
         """Get account information for a Solana address"""
@@ -220,11 +235,15 @@ class SolanaClient:
         return {}
         
     @staticmethod
-    def lamports_to_sol(lamports: int) -> float:
+    def lamports_to_sol(lamports: Union[int, float]) -> float:
         """Convert lamports to SOL with proper precision"""
-        return lamports / 1_000_000_000
+        # Ensure lamports is treated as an integer to avoid precision issues
+        return int(lamports) / 1_000_000_000
         
     @staticmethod
-    def sol_to_lamports(sol: float) -> int:
+    def sol_to_lamports(sol: Union[float, Decimal]) -> int:
         """Convert SOL to lamports with proper precision"""
+        # Convert to Decimal for higher precision in financial calculations
+        if not isinstance(sol, Decimal):
+            sol = Decimal(str(sol))  # Use string to avoid precision issues
         return int(sol * 1_000_000_000) 

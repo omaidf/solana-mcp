@@ -6,6 +6,8 @@ import uuid
 import json
 import logging
 from typing import Dict, Any, Optional, List
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from core.solana import SolanaClient
 
 # Setup logger
@@ -27,7 +29,29 @@ class ModelContext:
             
         self.model_type = model_type
         self.network = network
-        self.solana_client = SolanaClient(network=network)
+        self._solana_client = None
+        
+    @property
+    async def solana_client(self) -> SolanaClient:
+        """Get or create a SolanaClient instance with proper lifecycle management"""
+        if self._solana_client is None:
+            self._solana_client = SolanaClient(network=self.network)
+            await self._solana_client.__aenter__()
+        return self._solana_client
+        
+    async def close(self):
+        """Close resources when done"""
+        if self._solana_client is not None:
+            await self._solana_client.__aexit__(None, None, None)
+            self._solana_client = None
+            
+    async def __aenter__(self):
+        """Async context manager entry"""
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        await self.close()
         
     async def generate(self, address: str, parameters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Generate model context for a given address"""
@@ -39,23 +63,28 @@ class ModelContext:
         timestamp = int(time.time())
         
         # Generate data based on model type
-        if self.model_type == "transaction-history":
-            data = await self._generate_transaction_history(address, parameters)
-        elif self.model_type == "token-holdings":
-            data = await self._generate_token_holdings(address, parameters)
-        else:
-            raise ValueError(f"Unsupported model type: {self.model_type}")
+        try:
+            if self.model_type == "transaction-history":
+                data = await self._generate_transaction_history(address, parameters)
+            elif self.model_type == "token-holdings":
+                data = await self._generate_token_holdings(address, parameters)
+            else:
+                raise ValueError(f"Unsupported model type: {self.model_type}")
+                
+            # Compile response
+            response = {
+                "context_id": context_id,
+                "address": address,
+                "model_type": self.model_type,
+                "timestamp": timestamp,
+                "data": data
+            }
             
-        # Compile response
-        response = {
-            "context_id": context_id,
-            "address": address,
-            "model_type": self.model_type,
-            "timestamp": timestamp,
-            "data": data
-        }
-        
-        return response
+            return response
+        finally:
+            # Clean up resources
+            if not isinstance(self._solana_client, property):
+                await self.close()
         
     async def _generate_transaction_history(self, address: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """Generate transaction history context for an address"""

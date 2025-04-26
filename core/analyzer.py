@@ -7,7 +7,7 @@ import asyncio
 import aiohttp
 from aiohttp import ClientError, ClientResponseError, ClientTimeout
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Union, TypedDict, Any, cast
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,6 +16,7 @@ import logging
 import re
 from dotenv import load_dotenv
 import structlog
+import pytz
 
 # Try to import Solana-specific libraries, with fallback if not available
 try:
@@ -86,7 +87,7 @@ class SolanaAnalyzer:
             'transactions': {}
         }
         self.cache_expiry = {
-            'metadata': timedelta(hours=1),
+            'token_metadata': timedelta(hours=1),
             'holders': timedelta(minutes=15),
             'prices': timedelta(minutes=5),
             'accounts': timedelta(minutes=10),
@@ -387,16 +388,20 @@ class SolanaAnalyzer:
         self,
         candidate_wallets: List[str],
         min_usd_value: float = 50000,
-        max_wallets: int = 20
+        max_wallets: int = 20,
+        batch_size: int = 100,
+        concurrency: int = 5
     ) -> Dict:
         """
         Find whale wallets based on their total token holdings value.
-        Instead of focusing on holders of a specific token, this looks at total wallet value.
+        Analyzes wallets to identify those with high-value token holdings.
         
         Args:
             candidate_wallets: List of wallet addresses to analyze
             min_usd_value: Minimum USD value threshold to be considered a whale
             max_wallets: Maximum number of wallets to analyze
+            batch_size: Number of wallets to process in a batch
+            concurrency: Maximum number of concurrent requests
             
         Returns:
             Dictionary with whale detection results
@@ -405,98 +410,100 @@ class SolanaAnalyzer:
         
         # Cache for token prices to avoid duplicate requests
         prices_cache = {}
-        results = []
         
         # Process wallets in parallel for efficiency
-        # We'll use asyncio.gather instead of ThreadPoolExecutor for compatibility
+        # We'll use asyncio.gather with semaphore to control concurrency
+        sem = asyncio.Semaphore(concurrency)
+        
         async def calculate_wallet_value(wallet_address):
-            try:
-                # Get all token holdings (including fungible tokens)
-                url = self.rpc_endpoint
-                payload = {
-                    "jsonrpc": "2.0",
-                    "id": "helius-wallet-analysis",
-                    "method": "getAssetsByOwner",
-                    "params": {
-                        "ownerAddress": wallet_address,
-                        "page": 1,
-                        "limit": 1000,
-                        "displayOptions": {
-                            "showFungible": True,
-                            "showNativeBalance": True
+            async with sem:  # Control concurrency
+                try:
+                    # Get all token holdings (including fungible tokens)
+                    url = self.rpc_endpoint
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "id": "helius-wallet-analysis",
+                        "method": "getAssetsByOwner",
+                        "params": {
+                            "ownerAddress": wallet_address,
+                            "page": 1,
+                            "limit": 1000,
+                            "displayOptions": {
+                                "showFungible": True,
+                                "showNativeBalance": True
+                            }
                         }
                     }
-                }
-                
-                async with self.session.post(url, json=payload) as response:
-                    data = await response.json()
-                    assets = data.get('result', {}).get('items', [])
-                
-                # Calculate total value across all tokens
-                total_value = 0.0
-                token_details = []
-                
-                for asset in assets:
-                    if asset.get('token_info', {}).get('balance'):
-                        balance = float(asset['token_info']['balance'])
-                        token_address = asset['id']
-                        token_symbol = asset.get('token_info', {}).get('symbol', 'UNKNOWN')
-                        
-                        # Get price from cache or fetch if missing
-                        if token_address not in prices_cache:
-                            # Need to fetch the price
-                            price_payload = {
-                                "jsonrpc": "2.0",
-                                "id": "helius-price-fetch",
-                                "method": "getAssetBatch",
-                                "params": {
-                                    "ids": [token_address]
-                                }
-                            }
+                    
+                    async with self.session.post(url, json=payload) as response:
+                        data = await response.json()
+                        assets = data.get('result', {}).get('items', [])
+                    
+                    # Calculate total value across all tokens
+                    total_value = 0.0
+                    token_details = []
+                    
+                    for asset in assets:
+                        if asset.get('token_info', {}).get('balance'):
+                            balance = float(asset['token_info']['balance'])
+                            token_address = asset['id']
+                            token_symbol = asset.get('token_info', {}).get('symbol', 'UNKNOWN')
                             
-                            async with self.session.post(url, json=price_payload) as price_response:
-                                price_data = await price_response.json()
-                                price_items = price_data.get('result', [])
+                            # Get price from cache or fetch if missing
+                            if token_address not in prices_cache:
+                                # Need to fetch the price
+                                price_payload = {
+                                    "jsonrpc": "2.0",
+                                    "id": "helius-price-fetch",
+                                    "method": "getAssetBatch",
+                                    "params": {
+                                        "ids": [token_address]
+                                    }
+                                }
                                 
-                                # Extract price if available
-                                price = 0
-                                for item in price_items:
-                                    if item.get('id') == token_address and item.get('token_info', {}).get('price_info'):
-                                        price = float(item['token_info']['price_info'].get('price_per_token', 0))
-                                        break
-                                
-                                prices_cache[token_address] = price
-                        
-                        token_price = prices_cache.get(token_address, 0)
-                        token_value = balance * token_price
-                        total_value += token_value
-                        
-                        # Only add tokens with non-zero value to the details
-                        if token_value > 0:
-                            token_details.append({
-                                "mint": token_address,
-                                "symbol": token_symbol,
-                                "balance": balance,
-                                "price": token_price,
-                                "value": token_value
-                            })
+                                async with self.session.post(url, json=price_payload) as price_response:
+                                    price_data = await price_response.json()
+                                    price_items = price_data.get('result', [])
+                                    
+                                    # Extract price if available
+                                    price = 0
+                                    for item in price_items:
+                                        if item.get('id') == token_address and item.get('token_info', {}).get('price_info'):
+                                            price = float(item['token_info']['price_info'].get('price_per_token', 0))
+                                            break
+                                    
+                                    prices_cache[token_address] = price
+                            
+                            token_price = prices_cache.get(token_address, 0)
+                            token_value = balance * token_price
+                            total_value += token_value
+                            
+                            # Only add tokens with non-zero value to the details
+                            if token_value > 0:
+                                token_details.append({
+                                    "mint": token_address,
+                                    "symbol": token_symbol,
+                                    "balance": balance,
+                                    "price": token_price,
+                                    "value": token_value
+                                })
+                    
+                    return {
+                        "address": wallet_address,
+                        "total_value": total_value,
+                        "is_whale": total_value >= min_usd_value,
+                        "token_holdings": sorted(token_details, key=lambda x: x["value"], reverse=True)
+                    }
                 
-                return {
-                    "address": wallet_address,
-                    "total_value": total_value,
-                    "is_whale": total_value >= min_usd_value,
-                    "token_holdings": sorted(token_details, key=lambda x: x["value"], reverse=True)
-                }
-            
-            except Exception as e:
-                logger.error(f"Error analyzing wallet {wallet_address}: {str(e)}")
-                return {
-                    "address": wallet_address,
-                    "total_value": 0,
-                    "is_whale": False,
-                    "token_holdings": [],
-                    "error": str(e)
-                }
+                except Exception as e:
+                    logger.error(f"Error analyzing wallet {wallet_address}: {str(e)}")
+                    return {
+                        "address": wallet_address,
+                        "total_value": 0,
+                        "is_whale": False,
+                        "token_holdings": [],
+                        "error": str(e)
+                    }
         
         # Process wallets in parallel (with a limit on concurrency)
         wallets_to_check = candidate_wallets[:max_wallets]
@@ -508,7 +515,7 @@ class SolanaAnalyzer:
         whales.sort(key=lambda x: x["total_value"], reverse=True)
         
         # Create summary statistics
-        timestamp = datetime.now().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         
         return {
             "whales": whales,
@@ -545,7 +552,7 @@ class SolanaAnalyzer:
             "entities": {"addresses": []},
             "data": None,
             "error": None,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
         
         try:
@@ -1030,9 +1037,10 @@ class SolanaAnalyzer:
         try:
             if key in self.cache.get(cache_type, {}):
                 cached = self.cache[cache_type][key]
-                if datetime.now() - cached['timestamp'] < self.cache_expiry.get(cache_type, timedelta(minutes=10)):
+                now = datetime.now(timezone.utc)
+                if now - cached['timestamp'] < self.cache_expiry.get(cache_type, timedelta(minutes=10)):
                     # Update the timestamp to keep frequently used items fresh
-                    self.cache[cache_type][key]['timestamp'] = datetime.now()
+                    self.cache[cache_type][key]['timestamp'] = now
                     return cached['data']
                 else:
                     # Remove expired item
@@ -1065,7 +1073,7 @@ class SolanaAnalyzer:
             # Add the new item to cache
             self.cache[cache_type][key] = {
                 'data': data,
-                'timestamp': datetime.now()
+                'timestamp': datetime.now(timezone.utc)
             }
         except Exception as e:
             logger.warning(f"Error setting cache: {str(e)}")
