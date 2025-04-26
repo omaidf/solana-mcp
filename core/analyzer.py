@@ -310,41 +310,66 @@ class SolanaAnalyzer:
         if cached:
             return cached
 
-        # Get basic token info from RPC
-        supply_data = await self._rpc_request({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenSupply",
-            "params": [mint_address]
-        })
+        # Initialize default values
+        symbol = "UNKNOWN"
+        name = "Unknown Token"
+        decimals = 0
+        price = 0
+        market_cap = None
+        volume_24h = None
+        supply = None
         
-        if 'error' in supply_data:
-            logger.error(f"Could not get token supply: {supply_data['error']}")
-            raise ValueError(f"Could not get token supply: {supply_data['error']}")
-            
-        supply = supply_data['result']['value']
-        
-        # Get enhanced metadata from Helius
-        metadata_url = f"https://api.helius.xyz/v0/tokens/metadata?api-key={self.helius_api_key}"
-        payload = {"mintAccounts": [mint_address]}
-        
+        # Get enhanced metadata from Helius first (more reliable for non-standard tokens)
+        metadata = {}
         try:
+            metadata_url = f"https://api.helius.xyz/v0/tokens/metadata?api-key={self.helius_api_key}"
+            payload = {"mintAccounts": [mint_address]}
+            
             async with self.session.post(metadata_url, json=payload) as response:
                 metadata_resp = await response.json()
-                metadata = {}
                 
                 if isinstance(metadata_resp, list) and len(metadata_resp) > 0:
                     metadata = metadata_resp[0]
+                    
+                    # Extract basic info from metadata
+                    if metadata.get('symbol'):
+                        symbol = metadata.get('symbol')
+                    if metadata.get('name'):
+                        name = metadata.get('name')
+                    if metadata.get('decimals') is not None:
+                        decimals = metadata.get('decimals')
+                    
+                    logger.info(f"Retrieved metadata for {mint_address}: {symbol}")
                 elif 'error' in metadata_resp:
                     logger.warning(f"Error getting token metadata from Helius: {metadata_resp['error']}")
         except Exception as e:
             logger.warning(f"Error fetching metadata from Helius: {str(e)}")
-            metadata = {}
+        
+        # Try to get token supply info if we have decimals
+        if decimals == 0:  # If we still don't have decimals, try to get token supply
+            try:
+                supply_data = await self._rpc_request({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getTokenSupply",
+                    "params": [mint_address]
+                })
+                
+                if 'error' not in supply_data:
+                    supply_info = supply_data['result']['value']
+                    decimals = supply_info['decimals']
+                    supply = supply_info['uiAmount']
+                    logger.info(f"Got supply info for {mint_address}: {supply} tokens")
+                else:
+                    logger.warning(f"Could not get token supply: {supply_data.get('error')}")
+                    # We'll continue with default values
+            except Exception as e:
+                logger.warning(f"Error getting token supply: {str(e)}")
         
         # Get price data from Birdeye
-        price_url = f"https://public-api.birdeye.so/public/price?address={mint_address}"
-        headers = {"x-chain": "solana", "X-API-KEY": self.birdeye_api_key}
         try:
+            price_url = f"https://public-api.birdeye.so/public/price?address={mint_address}"
+            headers = {"x-chain": "solana", "X-API-KEY": self.birdeye_api_key}
             async with self.session.get(price_url, headers=headers) as response:
                 price_data = await response.json()
                 if price_data.get('success'):
@@ -362,22 +387,20 @@ class SolanaAnalyzer:
                         price = 0.50  # Example price
                         logger.info(f"Using hardcoded price for JUP: ${price}")
                     else:
-                        price = 0
                         logger.warning(f"Failed to get price from Birdeye for {mint_address}: {price_data.get('message', 'Unknown error')}")
         except Exception as e:
             logger.warning(f"Error getting price from Birdeye: {str(e)}")
-            # Default to 0
-            price = 0
         
+        # Create and return the token info object with whatever data we could gather
         result = TokenInfo(
-            symbol=metadata.get('symbol', 'UNKNOWN'),
-            name=metadata.get('name', 'Unknown Token'),
-            decimals=supply['decimals'],
+            symbol=symbol,
+            name=name,
+            decimals=decimals,
             price=price,
             mint=mint_address,
-            market_cap=metadata.get('marketCap'),
-            volume_24h=metadata.get('volume', {}).get('value24h'),
-            supply=supply['uiAmount']
+            market_cap=market_cap,
+            volume_24h=volume_24h,
+            supply=supply
         )
         
         logger.info(f"Retrieved token info for {mint_address}: {result.symbol}")
@@ -827,33 +850,15 @@ class SolanaAnalyzer:
             # If we have a mint address, use it to find holders
             if mint_address:
                 if not candidate_addresses:
-                    # Instead of returning an error, fetch top holders for this token
-                    try:
-                        # Use Helius API to fetch top holders for this token
-                        url = f"https://api.helius.xyz/v0/tokens/top-holders?api-key={self.helius_api_key}"
-                        payload = {"mint": mint_address}
-                        
-                        async with self.session.post(url, json=payload) as response:
-                            if response.status == 200:
-                                holders_data = await response.json()
-                                
-                                # Extract holder addresses
-                                candidate_addresses = [holder['owner'] for holder in holders_data][:max_holders]
-                                
-                                if not candidate_addresses:
-                                    result["error"] = "Could not find any holder data for this token."
-                                    return
-                                
-                                # Continue with whale analysis using these addresses
-                                logger.info(f"Fetched {len(candidate_addresses)} top holders for token {mint_address}")
-                            else:
-                                # Fallback message if the API doesn't support this
-                                result["error"] = "Could not automatically fetch top holders. Please provide specific wallet addresses to analyze."
-                                return
-                    except Exception as e:
-                        logger.error(f"Error fetching top token holders: {str(e)}")
-                        result["error"] = f"Error fetching top holders: {str(e)}"
+                    # Fetch the token holders
+                    holders = await self._fetch_token_holders(mint_address, max_count=100)
+                    if not holders:
+                        result["error"] = f"Could not find any holders for token: {mint_address}"
                         return
+                    
+                    # Extract just the addresses for whale analysis
+                    candidate_addresses = [holder["address"] for holder in holders]
+                    logger.info(f"Found {len(candidate_addresses)} holder addresses for {mint_address}")
                 
                 # Use the candidate addresses for whale detection
                 whale_results = await self.find_whales(
@@ -863,10 +868,160 @@ class SolanaAnalyzer:
                 )
                 result["data"] = whale_results
             else:
-                result["error"] = "Unable to determine token address for whale detection. Please specify a token address followed by potential whale addresses."
+                result["error"] = "Unable to determine token address for whale detection. Please specify a token address."
         except Exception as e:
             logger.error(f"Error in whale detection: {str(e)}")
             result["error"] = f"Error processing whale detection: {str(e)}"
+
+    async def _fetch_token_holders(self, mint_address: str, max_count: int = 100) -> List[Dict]:
+        """
+        Fetch top holders for a token using multiple methods, with fallbacks.
+        
+        Args:
+            mint_address: The token mint address
+            max_count: Maximum number of holders to return
+            
+        Returns:
+            List of holder information dictionaries with address and balance
+        """
+        holders = []
+        
+        # Try multiple methods to find holders, in order of preference
+        
+        # Method 1: Jupiter API
+        try:
+            jupiter_url = f"https://quote-api.jup.ag/v6/tokens/holders?address={mint_address}"
+            async with self.session.get(jupiter_url, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if "holders" in data:
+                        # Format: {address, amount, percentage, ...}
+                        for holder in data["holders"][:max_count]:
+                            holders.append({
+                                "address": holder["address"],
+                                "balance": float(holder["amount"]),
+                                "percentage": float(holder["percentage"])
+                            })
+                        logger.info(f"Successfully fetched {len(holders)} holders from Jupiter API")
+                        return holders
+        except Exception as e:
+            logger.warning(f"Jupiter API holder fetch failed: {str(e)}")
+        
+        # Method 2: Try Birdeye API
+        try:
+            birdeye_url = f"https://public-api.birdeye.so/public/tokenHolder?address={mint_address}&offset=0&limit={max_count}"
+            headers = {"x-chain": "solana", "X-API-KEY": self.birdeye_api_key}
+            
+            async with self.session.get(birdeye_url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("success") and "data" in data and "items" in data["data"]:
+                        for holder in data["data"]["items"]:
+                            holders.append({
+                                "address": holder["owner"],
+                                "balance": float(holder["balance"]),
+                                "percentage": float(holder["percentage"]) if "percentage" in holder else 0
+                            })
+                        logger.info(f"Successfully fetched {len(holders)} holders from Birdeye API")
+                        return holders
+        except Exception as e:
+            logger.warning(f"Birdeye API holder fetch failed: {str(e)}")
+        
+        # Method 3: Try Helius DAS API
+        try:
+            # This is the correct DAS-compliant API format for Helius
+            payload = {
+                "jsonrpc": "2.0",
+                "id": "helius-holders",
+                "method": "searchAssets",
+                "params": {
+                    "ownerAddress": "",  # Empty means we're not filtering by owner
+                    "grouping": ["mint", mint_address],
+                    "limit": max_count,
+                    "page": 1,
+                    "displayOptions": {
+                        "showOwnerAddress": True
+                    }
+                }
+            }
+            
+            async with self.session.post(self.rpc_endpoint, json=payload, timeout=15) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    items = data.get("result", {}).get("items", [])
+                    
+                    # Extract unique owners
+                    for item in items:
+                        if "ownership" in item and "owner" in item["ownership"]:
+                            owner = item["ownership"]["owner"]
+                            amount = float(item["ownership"].get("amount", "1"))
+                            
+                            holders.append({
+                                "address": owner,
+                                "balance": amount,
+                                "percentage": 0  # We don't have percentage from this API
+                            })
+                    
+                    logger.info(f"Successfully fetched {len(holders)} holders from Helius DAS API")
+                    return holders
+        except Exception as e:
+            logger.warning(f"Helius DAS API holder fetch failed: {str(e)}")
+        
+        # Method 4: Try the legacy token accounts method as a last resort
+        try:
+            # Use the more reliable getProgramAccounts method
+            payload = {
+                "jsonrpc": "2.0",
+                "id": "2",
+                "method": "getProgramAccounts",
+                "params": [
+                    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token Program
+                    {
+                        "encoding": "jsonParsed",
+                        "filters": [
+                            {
+                                "dataSize": 165  # Size of token accounts
+                            },
+                            {
+                                "memcmp": {
+                                    "offset": 0,
+                                    "bytes": mint_address
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+            
+            async with self.session.post(self.rpc_endpoint, json=payload, timeout=30) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if "result" in data:
+                        accounts = data["result"]
+                        
+                        for account in accounts:
+                            try:
+                                parsed_data = account["account"]["data"]["parsed"]["info"]
+                                owner = parsed_data["owner"]
+                                amount = int(parsed_data["tokenAmount"]["amount"])
+                                
+                                if amount > 0:
+                                    holders.append({
+                                        "address": owner,
+                                        "balance": amount,
+                                        "percentage": 0  # We don't know the total supply here
+                                    })
+                            except (KeyError, TypeError) as e:
+                                continue
+                        
+                        logger.info(f"Successfully fetched {len(holders)} holders using getProgramAccounts")
+                        return holders
+        except Exception as e:
+            logger.warning(f"getProgramAccounts holder fetch failed: {str(e)}")
+        
+        # If we get here, all methods failed
+        logger.error(f"All methods to fetch token holders for {mint_address} failed")
+        return holders
 
     async def _handle_account_info_query(self, addresses: List[str], result: Dict) -> None:
         """Helper method to handle account info queries"""
