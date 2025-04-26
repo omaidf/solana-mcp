@@ -1,8 +1,0 @@
--r requirements.txt
-black
-isort
-mypy
-pytest
-pytest-asyncio
-pytest-cov
-ruff 

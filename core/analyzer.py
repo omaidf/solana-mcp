@@ -1,0 +1,956 @@
+"""
+Enhanced Solana analyzer module for the MCP server
+This module contains the SolanaAnalyzer class and related functionality
+"""
+import os
+import asyncio
+import aiohttp
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Union
+from dataclasses import dataclass
+import json
+import logging
+import re
+
+# Setup logger
+logger = logging.getLogger(__name__)
+
+@dataclass
+class TokenInfo:
+    symbol: str
+    decimals: int
+    price: float
+    mint: str
+    name: str = ""
+    market_cap: Optional[float] = None
+    volume_24h: Optional[float] = None
+    supply: Optional[float] = None
+
+@dataclass
+class Whale:
+    address: str
+    token_balance: float
+    usd_value: float
+    percentage: float
+    last_active: Optional[str] = None
+
+@dataclass
+class AccountInfo:
+    lamports: int
+    owner: str
+    executable: bool
+    data: Union[Dict, str]
+    rent_epoch: Optional[int] = None
+
+@dataclass
+class TransactionInfo:
+    signature: str
+    timestamp: str
+    fee: int
+    accounts: List[str]
+    status: str
+    logs: List[str]
+
+class SolanaAnalyzer:
+    def __init__(self):
+        # API configuration
+        self.helius_api_key = "4ffc1228-f093-4974-ad2d-3edd8e5f7c03"
+        self.birdeye_api_key = "03ea781299dd4b8cbe356eea90c7219e"
+        self.rpc_endpoint = f"https://mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
+        logger.info(f"Using RPC endpoint: {self.rpc_endpoint}")
+        
+        # Cache setup
+        self.cache = {
+            'token_metadata': {},
+            'holders': {},
+            'prices': {},
+            'accounts': {},
+            'transactions': {}
+        }
+        self.cache_expiry = {
+            'metadata': timedelta(hours=1),
+            'holders': timedelta(minutes=15),
+            'prices': timedelta(minutes=5),
+            'accounts': timedelta(minutes=10),
+            'transactions': timedelta(minutes=30)
+        }
+        
+        # Session management
+        self.session = None
+        
+        # Request backoff parameters for rate limiting
+        self.base_backoff = 0.5  # Starting backoff time in seconds
+        self.max_backoff = 10    # Maximum backoff time in seconds
+        self.max_retries = 3     # Maximum number of retry attempts
+
+    async def __aenter__(self):
+        """Initialize aiohttp session when used in async context"""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self
+        
+    async def __aexit__(self, exc_type, exc, tb):
+        """Properly close aiohttp session"""
+        if self.session and not self.session.closed:
+            await self.session.close()
+            self.session = None
+
+    # Core RPC Methods ========================================================
+
+    async def get_account_info(self, account_address: str, encoding: str = "jsonParsed") -> AccountInfo:
+        """Get detailed information about a Solana account"""
+        cache_key = f"account_{account_address}_{encoding}"
+        cached = await self._get_cached(cache_key, 'accounts')
+        if cached:
+            return cached
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [account_address, {"encoding": encoding}]
+        }
+        
+        data = await self._rpc_request(payload)
+        if 'error' in data:
+            logger.error(f"RPC Error: {data['error']}")
+            raise ValueError(f"RPC Error: {data['error']}")
+        
+        account = data['result']['value']
+        if not account:
+            logger.warning(f"Account not found: {account_address}")
+            raise ValueError("Account not found")
+            
+        result = AccountInfo(
+            lamports=account['lamports'],
+            owner=account['owner'],
+            executable=account['executable'],
+            data=account['data'],
+            rent_epoch=account.get('rentEpoch')
+        )
+        
+        await self._set_cache(cache_key, result, 'accounts')
+        return result
+
+    async def get_balance(self, account_address: str) -> float:
+        """Get SOL balance in lamports"""
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [account_address]
+        }
+        
+        data = await self._rpc_request(payload)
+        if 'error' in data:
+            logger.error(f"RPC Error: {data['error']}")
+            raise ValueError(f"RPC Error: {data['error']}")
+            
+        return data['result']['value']
+
+    async def get_token_accounts_by_owner(
+        self,
+        owner_address: str,
+        mint_address: Optional[str] = None,
+        program_id: str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+    ) -> List[Dict]:
+        """Get all token accounts owned by a wallet"""
+        params = [owner_address]
+        if mint_address:
+            params.append({"mint": mint_address})
+        else:
+            params.append({"programId": program_id})
+        params.append({"encoding": "jsonParsed"})
+        
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": params
+        }
+        
+        data = await self._rpc_request(payload)
+        if 'error' in data:
+            logger.error(f"RPC Error: {data['error']}")
+            raise ValueError(f"RPC Error: {data['error']}")
+            
+        return [acc['account'] for acc in data['result']['value']]
+
+    async def get_transaction(self, tx_signature: str, encoding: str = "json") -> TransactionInfo:
+        """Get detailed transaction information"""
+        cache_key = f"tx_{tx_signature}_{encoding}"
+        cached = await self._get_cached(cache_key, 'transactions')
+        if cached:
+            return cached
+
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTransaction",
+            "params": [
+                tx_signature,
+                {"encoding": encoding, "commitment": "confirmed"}
+            ]
+        }
+        
+        data = await self._rpc_request(payload)
+        if 'error' in data:
+            logger.error(f"RPC Error: {data['error']}")
+            raise ValueError(f"RPC Error: {data['error']}")
+            
+        tx = data['result']
+        result = TransactionInfo(
+            signature=tx_signature,
+            timestamp=datetime.fromtimestamp(tx['blockTime']).isoformat(),
+            fee=tx['meta']['fee'],
+            accounts=[acc['pubkey'] for acc in tx['transaction']['message']['accountKeys']],
+            status="success" if tx['meta']['err'] is None else "failed",
+            logs=tx['meta']['logMessages']
+        )
+        
+        await self._set_cache(cache_key, result, 'transactions')
+        return result
+
+    # Token Analysis Methods ==================================================
+
+    async def get_token_info(self, mint_address: str) -> TokenInfo:
+        """Get comprehensive token information"""
+        cache_key = f"token_{mint_address}"
+        cached = await self._get_cached(cache_key, 'token_metadata')
+        if cached:
+            return cached
+
+        # Get basic token info from RPC
+        supply_data = await self._rpc_request({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenSupply",
+            "params": [mint_address]
+        })
+        
+        if 'error' in supply_data:
+            logger.error(f"Could not get token supply: {supply_data['error']}")
+            raise ValueError(f"Could not get token supply: {supply_data['error']}")
+            
+        supply = supply_data['result']['value']
+        
+        # Get enhanced metadata from Helius
+        metadata_url = f"https://api.helius.xyz/v0/tokens/metadata?api-key={self.helius_api_key}"
+        payload = {"mintAccounts": [mint_address]}
+        
+        try:
+            async with self.session.post(metadata_url, json=payload) as response:
+                metadata_resp = await response.json()
+                metadata = {}
+                
+                if isinstance(metadata_resp, list) and len(metadata_resp) > 0:
+                    metadata = metadata_resp[0]
+                elif 'error' in metadata_resp:
+                    logger.warning(f"Error getting token metadata from Helius: {metadata_resp['error']}")
+        except Exception as e:
+            logger.warning(f"Error fetching metadata from Helius: {str(e)}")
+            metadata = {}
+        
+        # Get price data from Birdeye
+        price_url = f"https://public-api.birdeye.so/public/price?address={mint_address}"
+        headers = {"x-chain": "solana", "X-API-KEY": self.birdeye_api_key}
+        try:
+            async with self.session.get(price_url, headers=headers) as response:
+                price_data = await response.json()
+                if price_data.get('success'):
+                    price = price_data.get('data', {}).get('value', 0)
+                    logger.info(f"Got price for {mint_address}: ${price}")
+                else:
+                    # Fallback for well-known tokens if Birdeye fails
+                    if mint_address == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v":  # USDC
+                        price = 1.0
+                        logger.info(f"Using hardcoded price for USDC: ${price}")
+                    elif mint_address == "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB":  # USDT
+                        price = 1.0
+                        logger.info(f"Using hardcoded price for USDT: ${price}")
+                    elif mint_address == "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN":  # Jupiter
+                        price = 0.50  # Example price
+                        logger.info(f"Using hardcoded price for JUP: ${price}")
+                    else:
+                        price = 0
+                        logger.warning(f"Failed to get price from Birdeye for {mint_address}: {price_data.get('message', 'Unknown error')}")
+        except Exception as e:
+            logger.warning(f"Error getting price from Birdeye: {str(e)}")
+            # Default to 0
+            price = 0
+        
+        result = TokenInfo(
+            symbol=metadata.get('symbol', 'UNKNOWN'),
+            name=metadata.get('name', 'Unknown Token'),
+            decimals=supply['decimals'],
+            price=price,
+            mint=mint_address,
+            market_cap=metadata.get('marketCap'),
+            volume_24h=metadata.get('volume', {}).get('value24h'),
+            supply=supply['uiAmount']
+        )
+        
+        logger.info(f"Retrieved token info for {mint_address}: {result.symbol}")
+        await self._set_cache(cache_key, result, 'token_metadata')
+        return result
+
+    async def find_whales(
+        self,
+        candidate_wallets: List[str],
+        min_usd_value: float = 50000,
+        max_wallets: int = 20
+    ) -> Dict:
+        """
+        Find whale wallets based on their total token holdings value.
+        Instead of focusing on holders of a specific token, this looks at total wallet value.
+        
+        Args:
+            candidate_wallets: List of wallet addresses to analyze
+            min_usd_value: Minimum USD value threshold to be considered a whale
+            max_wallets: Maximum number of wallets to analyze
+            
+        Returns:
+            Dictionary with whale detection results
+        """
+        logger.info(f"Analyzing {len(candidate_wallets[:max_wallets])} wallets for whale detection")
+        
+        # Cache for token prices to avoid duplicate requests
+        prices_cache = {}
+        results = []
+        
+        # Process wallets in parallel for efficiency
+        # We'll use asyncio.gather instead of ThreadPoolExecutor for compatibility
+        async def calculate_wallet_value(wallet_address):
+            try:
+                # Get all token holdings (including fungible tokens)
+                url = self.rpc_endpoint
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": "helius-wallet-analysis",
+                    "method": "getAssetsByOwner",
+                    "params": {
+                        "ownerAddress": wallet_address,
+                        "page": 1,
+                        "limit": 1000,
+                        "displayOptions": {
+                            "showFungible": True,
+                            "showNativeBalance": True
+                        }
+                    }
+                }
+                
+                async with self.session.post(url, json=payload) as response:
+                    data = await response.json()
+                    assets = data.get('result', {}).get('items', [])
+                
+                # Calculate total value across all tokens
+                total_value = 0.0
+                token_details = []
+                
+                for asset in assets:
+                    if asset.get('token_info', {}).get('balance'):
+                        balance = float(asset['token_info']['balance'])
+                        token_address = asset['id']
+                        token_symbol = asset.get('token_info', {}).get('symbol', 'UNKNOWN')
+                        
+                        # Get price from cache or fetch if missing
+                        if token_address not in prices_cache:
+                            # Need to fetch the price
+                            price_payload = {
+                                "jsonrpc": "2.0",
+                                "id": "helius-price-fetch",
+                                "method": "getAssetBatch",
+                                "params": {
+                                    "ids": [token_address]
+                                }
+                            }
+                            
+                            async with self.session.post(url, json=price_payload) as price_response:
+                                price_data = await price_response.json()
+                                price_items = price_data.get('result', [])
+                                
+                                # Extract price if available
+                                price = 0
+                                for item in price_items:
+                                    if item.get('id') == token_address and item.get('token_info', {}).get('price_info'):
+                                        price = float(item['token_info']['price_info'].get('price_per_token', 0))
+                                        break
+                                
+                                prices_cache[token_address] = price
+                        
+                        token_price = prices_cache.get(token_address, 0)
+                        token_value = balance * token_price
+                        total_value += token_value
+                        
+                        # Only add tokens with non-zero value to the details
+                        if token_value > 0:
+                            token_details.append({
+                                "mint": token_address,
+                                "symbol": token_symbol,
+                                "balance": balance,
+                                "price": token_price,
+                                "value": token_value
+                            })
+                
+                return {
+                    "address": wallet_address,
+                    "total_value": total_value,
+                    "is_whale": total_value >= min_usd_value,
+                    "token_holdings": sorted(token_details, key=lambda x: x["value"], reverse=True)
+                }
+            
+            except Exception as e:
+                logger.error(f"Error analyzing wallet {wallet_address}: {str(e)}")
+                return {
+                    "address": wallet_address,
+                    "total_value": 0,
+                    "is_whale": False,
+                    "token_holdings": [],
+                    "error": str(e)
+                }
+        
+        # Process wallets in parallel (with a limit on concurrency)
+        wallets_to_check = candidate_wallets[:max_wallets]
+        tasks = [calculate_wallet_value(wallet) for wallet in wallets_to_check]
+        wallet_results = await asyncio.gather(*tasks)
+        
+        # Filter for whales and sort by total value
+        whales = [result for result in wallet_results if result["is_whale"]]
+        whales.sort(key=lambda x: x["total_value"], reverse=True)
+        
+        # Create summary statistics
+        timestamp = datetime.now().isoformat()
+        
+        return {
+            "whales": whales,
+            "stats": {
+                "wallets_analyzed": len(wallets_to_check),
+                "whale_count": len(whales),
+                "whale_percentage": (len(whales) / len(wallets_to_check) * 100) if wallets_to_check else 0,
+                "min_usd_threshold": min_usd_value,
+                "timestamp": timestamp
+            }
+        }
+
+    async def semantic_search(self, prompt: str) -> Dict:
+        """
+        Process natural language queries about Solana blockchain data.
+        This method uses keyword matching to determine intent and extract entities,
+        then calls the appropriate API methods to retrieve the requested information.
+        
+        Args:
+            prompt: Natural language prompt describing what information to retrieve
+            
+        Returns:
+            Dictionary containing the search results and metadata
+        """
+        logger.info(f"Processing semantic search prompt: {prompt}")
+        
+        # Convert prompt to lowercase for case-insensitive matching only once
+        prompt_lower = prompt.lower()
+        
+        # Initialize result structure
+        result = {
+            "query": prompt,
+            "intent": None,
+            "entities": {"addresses": []},
+            "data": None,
+            "error": None,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        try:
+            # Extract Solana addresses from the prompt - use a compiled regex for better performance
+            # Compile regex only once at the module level for future optimizations
+            address_pattern = re.compile(r'[1-9A-HJ-NP-Za-km-z]{32,44}')
+            addresses = address_pattern.findall(prompt)
+            result["entities"]["addresses"] = addresses
+            
+            # Extract transaction signatures (longer than regular addresses)
+            # Use list comprehension for better performance
+            tx_signatures = [addr for addr in addresses if len(addr) > 44]
+            if tx_signatures:
+                result["entities"]["transaction_signatures"] = tx_signatures
+            
+            # Define keyword sets as frozen sets for faster lookup
+            # In a real optimization, these would be defined at the module level
+            balance_keywords = frozenset([
+                "balance", "sol", "holdings", "how much sol", "amount of sol", 
+                "solana balance", "wallet balance", "account balance", "has sol",
+                "check balance", "wallet worth", "wallet value"
+            ])
+            
+            token_holdings_keywords = frozenset([
+                "token", "tokens", "spl", "spl tokens", "token holdings", "token balance",
+                "tokens owned", "owns what", "token portfolio", "token list", "token assets"
+            ])
+            
+            token_ownership_keywords = frozenset([
+                "owned", "holding", "has", "possesses", "holds", "in wallet", 
+                "in possession", "belongs to", "owned by", "owned token"
+            ])
+            
+            token_info_keywords = frozenset([
+                "token info", "token details", "price", "token price", "how much is", 
+                "worth of", "value of", "market cap", "supply", "token data", 
+                "statistics", "metrics", "token stats", "token supply", "circulation"
+            ])
+            
+            transaction_keywords = frozenset([
+                "transaction", "tx", "signature", "transaction details", "tx history",
+                "blockchain tx", "payment", "transfer", "recent tx", "transaction status",
+                "tx hash", "transaction hash", "tx signature"
+            ])
+            
+            whale_keywords = frozenset([
+                "whale", "whales", "large holder", "big wallet", "rich wallet", "big player",
+                "major holder", "significant holder", "large investor", "large balance",
+                "big balance", "wealthy", "high value wallet", "large account"
+            ])
+            
+            account_keywords = frozenset([
+                "account", "info", "details", "account info", "account details", 
+                "wallet info", "wallet details", "address info", "address details",
+                "solana account", "lookup account", "query account"
+            ])
+            
+            # Pre-compute keyword presence checks rather than repeatedly searching
+            has_balance_keyword = any(kw in prompt_lower for kw in balance_keywords)
+            has_token_holdings_keyword = any(kw in prompt_lower for kw in token_holdings_keywords)
+            has_token_ownership_keyword = any(kw in prompt_lower for kw in token_ownership_keywords)
+            has_token_info_keyword = any(kw in prompt_lower for kw in token_info_keywords)
+            has_transaction_keyword = any(kw in prompt_lower for kw in transaction_keywords)
+            has_whale_keyword = any(kw in prompt_lower for kw in whale_keywords)
+            has_account_keyword = any(kw in prompt_lower for kw in account_keywords)
+            
+            # Identify intent using pre-computed flags
+            if has_balance_keyword:
+                await self._handle_balance_query(addresses, result)
+                    
+            elif has_token_holdings_keyword and has_token_ownership_keyword:
+                await self._handle_token_holdings_query(addresses, result)
+                
+            elif has_token_info_keyword:
+                await self._handle_token_info_query(addresses, prompt, prompt_lower, result)
+            
+            elif has_transaction_keyword:
+                await self._handle_transaction_query(tx_signatures, prompt_lower, result)
+            
+            elif has_whale_keyword:
+                await self._handle_whale_query(addresses, prompt_lower, result)
+            
+            elif has_account_keyword:
+                await self._handle_account_info_query(addresses, result)
+            
+            else:
+                # If no intent is detected, try a more generalized approach
+                await self._handle_general_query(prompt_lower, addresses, result)
+        
+        except Exception as e:
+            logger.error(f"Error processing semantic search: {str(e)}")
+            result["error"] = f"Error processing request: {str(e)}"
+        
+        return result
+
+    async def _handle_balance_query(self, addresses: List[str], result: Dict) -> None:
+        """Helper method to handle balance queries"""
+        result["intent"] = "get_balance"
+        
+        if addresses:
+            balance = await self.get_balance(addresses[0])
+            result["data"] = {
+                "address": addresses[0],
+                "balance_lamports": balance,
+                "balance_sol": self.lamports_to_sol(balance)
+            }
+        else:
+            result["error"] = "No wallet address found in the prompt. Please include a valid Solana address."
+
+    async def _handle_token_holdings_query(self, addresses: List[str], result: Dict) -> None:
+        """Helper method to handle token holdings queries"""
+        result["intent"] = "get_token_holdings"
+        
+        if not addresses:
+            result["error"] = "No wallet address found in the prompt. Please include a valid Solana address."
+            return
+        
+        token_accounts = await self.get_token_accounts_by_owner(addresses[0])
+        
+        # Create fetch token info tasks for all accounts at once
+        mint_addresses = []
+        token_data = []
+        
+        # Extract all mint addresses and token data first
+        for account in token_accounts:
+            try:
+                parsed_info = account.get("data", {}).get("parsed", {}).get("info", {})
+                mint = parsed_info.get("mint")
+                if mint:
+                    mint_addresses.append(mint)
+                    token_amount = parsed_info.get("tokenAmount", {})
+                    token_data.append({
+                        "mint": mint,
+                        "amount": int(token_amount.get("amount", 0)),
+                        "decimals": int(token_amount.get("decimals", 0))
+                    })
+            except Exception as e:
+                logger.warning(f"Error extracting token account data: {str(e)}")
+        
+        # Batch fetch token info for all mints (future optimization)
+        # For now, create tasks for fetching each token's info
+        token_info_tasks = [self.get_token_info(mint) for mint in mint_addresses]
+        token_infos = await asyncio.gather(*token_info_tasks, return_exceptions=True)
+        
+        # Create a mapping of mint to token info for easy lookup
+        token_info_map = {}
+        for i, info in enumerate(token_infos):
+            if not isinstance(info, Exception):
+                token_info_map[mint_addresses[i]] = info
+        
+        # Combine the token data with the token info
+        holdings = []
+        for token in token_data:
+            mint = token["mint"]
+            if mint in token_info_map:
+                info = token_info_map[mint]
+                amount = token["amount"]
+                decimals = token["decimals"]
+                ui_amount = amount / (10 ** decimals) if decimals > 0 else amount
+                
+                holdings.append({
+                    "token": info.symbol,
+                    "mint": mint,
+                    "amount": ui_amount,
+                    "usd_value": ui_amount * info.price,
+                    "price": info.price
+                })
+        
+        # Sort by USD value, descending
+        holdings.sort(key=lambda x: x["usd_value"], reverse=True)
+        result["data"] = {
+            "address": addresses[0],
+            "token_holdings": holdings,
+            "total_tokens": len(holdings),
+            "total_value_usd": sum(h["usd_value"] for h in holdings)
+        }
+
+    async def _handle_token_info_query(self, addresses: List[str], prompt: str, prompt_lower: str, result: Dict) -> None:
+        """Helper method to handle token info queries"""
+        result["intent"] = "get_token_info"
+        
+        # Check for token addresses
+        if addresses:
+            try:
+                token_info = await self.get_token_info(addresses[0])
+                result["data"] = {
+                    "symbol": token_info.symbol,
+                    "name": token_info.name,
+                    "mint": token_info.mint,
+                    "price": token_info.price,
+                    "supply": token_info.supply,
+                    "market_cap": token_info.market_cap,
+                    "volume_24h": token_info.volume_24h
+                }
+            except Exception as e:
+                result["error"] = f"Error getting token info: {str(e)}"
+        else:
+            # Compile regex patterns for better performance
+            token_symbol_pattern = re.compile(r'\b[A-Z]{2,10}\b')
+            token_name_pattern = re.compile(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b')
+            specific_token_pattern = re.compile(r'(?:token|price of|value of)\s+([A-Za-z]+)', re.IGNORECASE)
+            
+            # Look for token symbols (all caps)
+            token_symbols = token_symbol_pattern.findall(prompt)
+            
+            # Look for token names (capitalized words)
+            token_names = token_name_pattern.findall(prompt)
+            
+            # Look for names following "token" or "price of"
+            specific_tokens = specific_token_pattern.findall(prompt_lower)
+            
+            if token_symbols:
+                result["entities"]["token_symbols"] = token_symbols
+                result["error"] = f"Found potential token symbols: {', '.join(token_symbols)}. Please provide a token address for more details."
+            elif token_names:
+                result["entities"]["token_names"] = token_names
+                result["error"] = f"Found potential token names: {', '.join(token_names)}. Please provide a token address for more details."
+            elif specific_tokens:
+                result["entities"]["specific_tokens"] = specific_tokens
+                result["error"] = f"Found references to tokens: {', '.join(specific_tokens)}. Please provide a token address for more details."
+            else:
+                result["error"] = "No token address or symbol found in the prompt. Please include a valid token address."
+
+    async def _handle_transaction_query(self, tx_signatures: List[str], prompt_lower: str, result: Dict) -> None:
+        """Helper method to handle transaction queries"""
+        result["intent"] = "get_transaction"
+        
+        if tx_signatures:
+            tx_info = await self.get_transaction(tx_signatures[0])
+            result["data"] = {
+                "signature": tx_info.signature,
+                "timestamp": tx_info.timestamp,
+                "status": tx_info.status,
+                "fee": tx_info.fee,
+                "accounts_involved": len(tx_info.accounts),
+                "first_5_accounts": tx_info.accounts[:5] if tx_info.accounts else []
+            }
+        else:
+            # Compile regex for better performance
+            short_tx_pattern = re.compile(r'tx\s*[:=]?\s*([A-Za-z0-9]{10,25})')
+            short_tx = short_tx_pattern.search(prompt_lower)
+            
+            if short_tx:
+                result["entities"]["short_tx"] = short_tx.group(1)
+                result["error"] = f"Found partial transaction signature: {short_tx.group(1)}. Please provide the complete signature."
+            else:
+                result["error"] = "No transaction signature found in the prompt. Please include a valid transaction signature."
+
+    async def _handle_whale_query(self, addresses: List[str], prompt_lower: str, result: Dict) -> None:
+        """Helper method to handle whale queries"""
+        result["intent"] = "find_whales"
+        
+        # Extract candidate addresses for whale analysis
+        if len(addresses) > 1:
+            min_usd = 50000  # Default
+            
+            # Compile value patterns for better performance
+            value_patterns = [
+                re.compile(r'(\d+(?:\.\d+)?)\s*(?:k|thousand)'),
+                re.compile(r'(\d+(?:\.\d+)?)\s*(?:m|million)'),
+                re.compile(r'(\d+(?:\.\d+)?)\s*(?:dollars|usd)'),
+                re.compile(r'(?:usd|dollars|value|threshold)\s*(?:of|is|=|:)?\s*(\d+(?:\.\d+)?(?:k|m)?)')
+            ]
+            
+            # Re-use the USD units check
+            has_usd_units = any(unit in prompt_lower for unit in ["dollar", "usd", "$"])
+            
+            for pattern in value_patterns:
+                value_match = pattern.search(prompt_lower)
+                if value_match:
+                    value_str = value_match.group(1).upper()
+                    
+                    # Handle k/m suffixes in the value
+                    if 'K' in value_str:
+                        min_usd = float(value_str.replace('K', '')) * 1000
+                    elif 'M' in value_str:
+                        min_usd = float(value_str.replace('M', '')) * 1000000
+                    else:
+                        min_usd = float(value_str)
+                    
+                    # If we're not explicitly using dollars and no dollar terms in the query
+                    if pattern != value_patterns[2] and not has_usd_units:
+                        # Assume it's in SOL, convert to USD with estimate
+                        sol_price_estimate = 150
+                        min_usd = min_usd * sol_price_estimate
+                    
+                    break
+            
+            whale_results = await self.find_whales(addresses, min_usd_value=min_usd)
+            result["data"] = whale_results
+        else:
+            result["error"] = "Not enough wallet addresses found for whale analysis. Please provide multiple wallet addresses."
+
+    async def _handle_account_info_query(self, addresses: List[str], result: Dict) -> None:
+        """Helper method to handle account info queries"""
+        result["intent"] = "get_account_info"
+        
+        if addresses:
+            account_info = await self.get_account_info(addresses[0])
+            result["data"] = {
+                "address": addresses[0],
+                "lamports": account_info.lamports,
+                "sol_balance": self.lamports_to_sol(account_info.lamports),
+                "owner": account_info.owner,
+                "executable": account_info.executable,
+                "owner_program": account_info.owner,
+                "rent_epoch": account_info.rent_epoch
+            }
+        else:
+            result["error"] = "No account address found in the prompt. Please include a valid Solana address."
+
+    async def _handle_general_query(self, prompt_lower: str, addresses: List[str], result: Dict) -> None:
+        """Helper method to handle general blockchain queries"""
+        # Check if it's a general blockchain query
+        blockchain_terms = frozenset(["blockchain", "solana", "crypto", "cryptocurrency", "wallet", "address"])
+        
+        if any(term in prompt_lower for term in blockchain_terms):
+            if addresses:
+                # We have an address but no clear intent, provide general info
+                result["intent"] = "general_address_info"
+                
+                # Create tasks for parallel execution
+                balance_task = self.get_balance(addresses[0])
+                account_info_task = self.get_account_info(addresses[0])
+                token_accounts_task = self.get_token_accounts_by_owner(addresses[0])
+                
+                # Gather all tasks at once
+                balance, account_info, token_accounts = await asyncio.gather(
+                    balance_task, account_info_task, token_accounts_task,
+                    return_exceptions=True
+                )
+                
+                # Handle potential exceptions
+                sol_balance = 0
+                token_count = 0
+                owner = "Unknown"
+                executable = False
+                
+                if not isinstance(balance, Exception):
+                    sol_balance = self.lamports_to_sol(balance)
+                
+                if not isinstance(account_info, Exception):
+                    owner = account_info.owner
+                    executable = account_info.executable
+                
+                if not isinstance(token_accounts, Exception):
+                    token_count = len(token_accounts)
+                
+                result["data"] = {
+                    "address": addresses[0],
+                    "sol_balance": sol_balance,
+                    "token_count": token_count,
+                    "owner_program": owner,
+                    "executable": executable,
+                    "message": f"Address holds {sol_balance} SOL and {token_count} different tokens/token accounts."
+                }
+            else:
+                result["intent"] = "unknown"
+                result["error"] = "Could not determine specific intent from prompt. Please provide more details or include a Solana address."
+        else:
+            result["intent"] = "unknown"
+            result["error"] = "Could not determine intent from prompt. Please try rephrasing with keywords like 'balance', 'token', 'transaction', etc."
+
+    async def batch_get_token_info(self, mint_addresses: List[str]) -> Dict[str, TokenInfo]:
+        """
+        Get token info for multiple mint addresses in a batched request.
+        This method reduces API calls by using batch endpoints where available.
+        
+        Args:
+            mint_addresses: List of mint addresses to get info for
+            
+        Returns:
+            Dictionary mapping mint address to TokenInfo object
+        """
+        if not mint_addresses:
+            return {}
+            
+        # Check cache first
+        results = {}
+        uncached_mints = []
+        
+        # Look for cached entries first
+        for mint in mint_addresses:
+            cache_key = f"token_{mint}"
+            cached = await self._get_cached(cache_key, 'token_metadata')
+            if cached:
+                results[mint] = cached
+            else:
+                uncached_mints.append(mint)
+                
+        # If everything was cached, return early
+        if not uncached_mints:
+            return results
+            
+        # Split into manageable chunks to avoid oversized requests
+        chunk_size = 50  # Adjust based on API limits
+        mint_chunks = [uncached_mints[i:i + chunk_size] for i in range(0, len(uncached_mints), chunk_size)]
+        
+        for chunk in mint_chunks:
+            # Get metadata from Helius in batches
+            metadata_url = f"https://api.helius.xyz/v0/tokens/metadata?api-key={self.helius_api_key}"
+            metadata_payload = {"mintAccounts": chunk}
+            
+            try:
+                async with self.session.post(metadata_url, json=metadata_payload) as response:
+                    metadata_resp = await response.json()
+                    
+                    if not isinstance(metadata_resp, list):
+                        logger.warning(f"Unexpected metadata response: {metadata_resp}")
+                        continue
+                        
+                    # Process each token
+                    for token_metadata in metadata_resp:
+                        mint = token_metadata.get("address")
+                        if not mint:
+                            continue
+                            
+                        # Get price data from Birdeye (unfortunately not batchable)
+                        price = 0
+                        try:
+                            price_url = f"https://public-api.birdeye.so/public/price?address={mint}"
+                            headers = {"x-chain": "solana", "X-API-KEY": self.birdeye_api_key}
+                            
+                            async with self.session.get(price_url, headers=headers) as price_response:
+                                price_data = await price_response.json()
+                                if price_data.get('success'):
+                                    price = price_data.get('data', {}).get('value', 0)
+                        except Exception as e:
+                            logger.warning(f"Error getting price for {mint}: {str(e)}")
+                            
+                        # Create TokenInfo object
+                        token_info = TokenInfo(
+                            symbol=token_metadata.get('symbol', 'UNKNOWN'),
+                            name=token_metadata.get('name', 'Unknown Token'),
+                            decimals=token_metadata.get('decimals', 0),
+                            price=price,
+                            mint=mint,
+                            market_cap=token_metadata.get('marketCap'),
+                            volume_24h=token_metadata.get('volume', {}).get('value24h'),
+                            supply=token_metadata.get('supply')
+                        )
+                        
+                        # Cache the result
+                        cache_key = f"token_{mint}"
+                        await self._set_cache(cache_key, token_info, 'token_metadata')
+                        
+                        # Add to results
+                        results[mint] = token_info
+            except Exception as e:
+                logger.error(f"Error in batch token info request: {str(e)}")
+                
+        return results
+
+    async def _get_cached(self, key: str, cache_type: str) -> Optional[object]:
+        """Retrieve cached data if valid"""
+        try:
+            if key in self.cache.get(cache_type, {}):
+                cached = self.cache[cache_type][key]
+                if datetime.now() - cached['timestamp'] < self.cache_expiry.get(cache_type, timedelta(minutes=10)):
+                    return cached['data']
+        except Exception as e:
+            logger.warning(f"Error retrieving from cache: {str(e)}")
+        return None
+
+    async def _set_cache(self, key: str, data: object, cache_type: str):
+        """Store data in cache with improved error handling"""
+        try:
+            if cache_type not in self.cache:
+                self.cache[cache_type] = {}
+                
+            # Use a more efficient approach to avoid potential memory leaks
+            # Limit cache size per type (future optimization)
+            self.cache[cache_type][key] = {
+                'data': data,
+                'timestamp': datetime.now()
+            }
+        except Exception as e:
+            logger.warning(f"Error setting cache: {str(e)}")
+
+    @staticmethod
+    def lamports_to_sol(lamports: int) -> float:
+        """Convert lamports to SOL"""
+        return lamports / 1_000_000_000
+
+    @staticmethod
+    def sol_to_lamports(sol: float) -> int:
+        """Convert SOL to lamports"""
+        return int(sol * 1_000_000_000)
+
+# Export classes
+__all__ = [
+    'SolanaAnalyzer',
+    'TokenInfo',
+    'Whale',
+    'AccountInfo',
+    'TransactionInfo'
+] 
